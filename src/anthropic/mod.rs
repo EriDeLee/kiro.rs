@@ -22,12 +22,11 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-pub mod cache_metering;
 mod converter;
 mod handlers;
 mod middleware;
-mod openai;
 mod responses;
+mod responses_support;
 mod router;
 pub mod stream;
 pub mod types;

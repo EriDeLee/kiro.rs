@@ -73,6 +73,12 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// 思考内容展示方式：`summarized` / `omitted`。
+    ///
+    /// 上游 claude-opus-5 缺省 `omitted`（不回传思考文本）；opencode v1.18.5 会主动
+    /// 发 `summarized` 要回来，所以必须接住并透传，否则思考内容会被上游吞掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl Thinking {
@@ -127,6 +133,12 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    /// 顶层 `effort`（非 Anthropic 官方规范，但 opencode v1.18.5 实际这么发）。
+    ///
+    /// 官方规范把档位放在 `output_config.effort`。两处都要接住，否则客户端调档位会
+    /// 被静默丢弃、永远回落默认 high —— 那就是「虚假推理强度」。
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }

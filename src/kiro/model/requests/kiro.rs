@@ -57,9 +57,36 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// Output configuration (including reasoning effort)
+    /// `thinking` 控制（仅 claude-opus-5 接受）。
+    ///
+    /// 实测 schema：`type ∈ {adaptive, disabled}`（**没有 `enabled`**）、
+    /// `display ∈ {summarized, omitted}`，`display` 缺省为 `omitted`（吞掉思考文本）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<KiroThinkingConfig>,
+    /// Claude 系的推理档位路径：`output_config.effort`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    /// GPT 系的推理档位路径：`reasoning.effort`。
+    ///
+    /// gpt-5.6-sol 的 schema 是 `additionalProperties:false` 且**只有** `reasoning`，
+    /// 向它下发 `output_config` / `max_tokens` / `thinking` 都会 400。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
+}
+
+/// `thinking` 控制（claude-opus-5）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// `reasoning` 控制（gpt-5.6-sol）。`effort` 额外支持 `none` 档。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
+    pub effort: String,
 }
 
 /// The effort control field recognized by the AWS Q backend
@@ -116,6 +143,8 @@ mod tests {
         // (`additionalModelRequestFields`) while the inner key stays snake_case
         // (`output_config`), matching real Kiro CLI traffic.
         let fields = AdditionalModelRequestFields {
+            thinking: None,
+            reasoning: None,
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),

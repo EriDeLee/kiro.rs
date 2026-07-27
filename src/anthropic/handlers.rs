@@ -574,9 +574,19 @@ pub async fn get_models(
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
+/// 内部转发标记。
+///
+/// `/v1/responses` 把 OpenAI 请求翻译成 [`MessagesRequest`] 后复用
+/// [`post_messages`]，通过该 Extension 声明「已在上一层按自己的协议校验过模型」，
+/// 使 Anthropic 协议校验跳过。外部 HTTP 请求永远不会带上它 —— axum 只会注入
+/// 路由层显式 `.layer()` 或调用方手动传入的 Extension。
+#[derive(Clone, Copy)]
+pub(super) struct InternalForward;
+
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    internal_forward: Option<Extension<InternalForward>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -593,6 +603,27 @@ pub async fn post_messages(
     );
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+    }
+    // 模型白名单 + 协议绑定校验：Anthropic 协议只服务 `claude-opus-5`。
+    //
+    // `/v1/responses` 会把 GPT 请求翻译成 MessagesRequest 后复用本函数，那条路径
+    // 已在 `post_responses` 入口按 OpenAiResponses 协议校验过，并带上
+    // [`InternalForward`] 标记，故跳过此处校验；外部直连一律按 Anthropic 协议判定
+    // —— 用 `/v1/messages` 请求 gpt-5.6-sol 必须被拒。
+    if internal_forward.is_none()
+        && let Err(rejected) = crate::model::allowlist::resolve(
+            &payload.model,
+            crate::model::allowlist::Protocol::Anthropic,
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                rejected.message(&payload.model),
+            )),
+        )
+            .into_response();
     }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
@@ -740,13 +771,7 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应
@@ -767,7 +792,6 @@ pub async fn post_messages(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -792,7 +816,6 @@ pub async fn post_messages(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -810,7 +833,6 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -844,7 +866,6 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
-    ctx.cache_usage = cache_usage;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1005,14 +1026,13 @@ fn record_stream_usage(
     credential_id: u64,
     status: &str,
 ) {
-    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    let input = ctx.resolved_usage();
     hook.record(
         credential_id,
         input,
         ctx.output_tokens,
-        cache_creation,
-        cache_read,
+        0,
+        0,
         ctx.credits,
         status,
     );
@@ -1020,12 +1040,12 @@ fn record_stream_usage(
 
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
 fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    let input = ctx.resolved_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
         output_tokens: ctx.output_tokens.max(0) as u64,
-        cache_creation_tokens: cache_creation.max(0) as u64,
-        cache_read_tokens: cache_read.max(0) as u64,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1048,7 +1068,6 @@ async fn handle_non_stream_request(
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1113,7 +1132,6 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
-    // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
     // 最近一次 meteringEvent 的完整 payload，用于在响应体 usage 中透传
     // credit_usage / credit_unit / credit_unit_plural 字段，与 /v1/messages
@@ -1259,14 +1277,12 @@ async fn handle_non_stream_request(
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
     // 互斥分摊：input + cache_creation + cache_read == total
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        (total_input_tokens, 0, 0);
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
         "input_tokens": final_input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": cache_creation_tokens,
-        "cache_read_input_tokens": cache_read_tokens
+        "output_tokens": output_tokens
     });
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
     // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
@@ -1404,6 +1420,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     );
 
     payload.thinking = Some(Thinking {
+        display: None,
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
@@ -1599,12 +1616,6 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1625,7 +1636,6 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             total_input_tokens,
-            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1650,7 +1660,6 @@ pub async fn post_messages_cc(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1671,7 +1680,6 @@ async fn handle_stream_request_buffered(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1704,7 +1712,6 @@ async fn handle_stream_request_buffered(
         tool_name_map,
         known_tool_names,
     );
-    ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
@@ -1795,8 +1802,8 @@ fn create_buffered_sse_stream(
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                let (i, o, credits) = ctx.final_usage();
+                                hook.record(credential_id, i, o, 0, 0, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
@@ -1806,8 +1813,8 @@ fn create_buffered_sse_stream(
                                     TraceUsage {
                                         input_tokens: i.max(0) as u64,
                                         output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
+                                        cache_creation_tokens: 0,
+                                        cache_read_tokens: 0,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                     },
                                 );
@@ -1822,16 +1829,16 @@ fn create_buffered_sse_stream(
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
+                                let (i, o, credits) = ctx.final_usage();
                                 let trace_usage = TraceUsage {
                                     input_tokens: i.max(0) as u64,
                                     output_tokens: o.max(0) as u64,
-                                    cache_creation_tokens: cc.max(0) as u64,
-                                    cache_read_tokens: cr.max(0) as u64,
+                                    cache_creation_tokens: 0,
+                                    cache_read_tokens: 0,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
                                 if let Some(message) = ctx.tool_json_error_message() {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    hook.record(credential_id, i, o, 0, 0, credits, "error");
                                     tracer.finalize(
                                         "error",
                                         Some(outcome::BAD_REQUEST),
@@ -1840,7 +1847,7 @@ fn create_buffered_sse_stream(
                                         trace_usage,
                                     );
                                 } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    hook.record(credential_id, i, o, 0, 0, credits, "success");
                                     tracer.finalize("success", None, None, None, trace_usage);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

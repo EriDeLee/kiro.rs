@@ -544,7 +544,10 @@ impl KiroProvider {
             let body = endpoint.transform_api_body(request_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
+            tracing::debug!(
+                "实际发送请求体: {}",
+                crate::security::body_log_summary(&body)
+            );
 
             let base = self
                 .client_for(&ctx.credentials)?

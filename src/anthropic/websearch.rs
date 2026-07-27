@@ -277,9 +277,7 @@ fn generate_websearch_events(
                 "stop_reason": null,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "output_tokens": 0
                 }
             }
         }),
@@ -691,6 +689,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -731,6 +730,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -773,6 +773,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -802,6 +803,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -827,6 +829,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 

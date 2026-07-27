@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -276,72 +278,39 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     Some(format!("claude-{}-{}", parts[family_index], version))
 }
 
-/// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
+/// 把客户端模型名映射到上游 Kiro modelId。
+///
+/// 本部署只服务 Anthropic 协议上的 `claude-opus-5`，其余一律 `None`（由调用方回
+/// 400）。不做家族/版本号的模糊推断，也不再透传未知模型——透传等于把不受支持的
+/// id 直接甩给上游，换来一个语义不明的 400。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
     }
-
-    // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
-    if let Some(custom) = crate::model::custom_models::lookup(model) {
-        return Some(custom.backend_id.clone());
-    }
-
-    normalize_claude_model(model).or_else(|| Some(model.to_string()))
+    // 白名单是唯一权威：只认 claude-opus-5 与 gpt-5.6-sol（含别名后缀），
+    // 其余一律 None。协议与模型的一对一绑定由端点层（handlers / responses）校验，
+    // 这里不区分协议——converter 是两条端点共用的下游。
+    crate::model::allowlist::normalize(model).map(str::to_string)
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 上下文窗口，取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`。
+///
+/// 本端点只服务 `claude-opus-5`（1M in / 128k out）。
 pub fn get_context_window_size(model: &str) -> i32 {
-    // 自定义模型若显式声明了上下文窗口，优先返回。
-    if let Some(custom) = crate::model::custom_models::lookup(model) {
-        if let Some(window) = custom.context_window {
-            return window;
-        }
-    }
-
-    match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
+    match map_model(model).as_deref() {
+        Some(crate::model::allowlist::MODEL_OPUS_5) => 1_000_000,
         _ => 200_000,
     }
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
+/// 是否向该模型下发 `additionalModelRequestFields.output_config`。
 ///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
-/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
-/// 若后续实测某模型 400，从这里去除即可。
+/// 实测 `claude-opus-5` 的 schema 接受 `output_config.effort ∈
+/// {low,medium,high,xhigh,max}` 与 `thinking.{type,display}`。本端点只服务它。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
-    // 自定义模型可按 backend_id 声明支持 reasoning。
-    if crate::model::custom_models::backend_supports_reasoning(model_id) {
-        return true;
-    }
-    let m = model_id.to_ascii_lowercase();
-    matches!(
-        m.as_str(),
-        "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
-    ) || m.contains("fable-5")
-        || m.contains("mythos-5")
-        || m.contains("sonnet-5")
-        || m.contains("opus-5")
-        || m.contains("claude-5")
+    model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_OPUS_5)
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -379,12 +348,23 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 
 /// 选定最终下发的 effort：优先显式 `output_config.effort`；否则据 `budget_tokens`
 /// 推导；再统一过 [`normalize_effort_for_model`]（按模型把 xhigh 安全降级等）。
+/// 选定最终下发的 effort 档位。
+///
+/// 优先级：**顶层 `effort`**（opencode 实际位置）> `output_config.effort`（官方位置）
+/// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 默认 `high`（与上游 default 一致）。
+/// 随后按该模型实测枚举裁剪。
 fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> String {
     let raw = req
-        .output_config
-        .as_ref()
-        .map(|oc| oc.effort.trim().to_string())
+        .effort
+        .as_deref()
+        .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty())
+        .or_else(|| {
+            req.output_config
+                .as_ref()
+                .map(|oc| oc.effort.trim().to_string())
+                .filter(|e| !e.is_empty())
+        })
         .or_else(|| {
             req.thinking
                 .as_ref()
@@ -397,6 +377,8 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    /// 仅 gpt-5.6-sol 支持；claude-opus-5 的枚举里没有这一档。
+    None,
     Low,
     Medium,
     High,
@@ -407,6 +389,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -418,6 +401,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -427,69 +411,51 @@ impl EffortTier {
     }
 }
 
+/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema）。
+///
+/// - `claude-opus-5`：low / medium / high / xhigh / max（**无 none**）
+/// - `gpt-5.6-sol` ：none / low / medium / high / xhigh / max
+fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
+    use EffortTier::*;
+    if model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_GPT_56_SOL) {
+        &[None, Low, Medium, High, XHigh, Max]
+    } else {
+        &[Low, Medium, High, XHigh, Max]
+    }
+}
+
+/// 把请求的 effort 裁剪到该模型支持的枚举内。
+///
+/// 命中则原样下发；无法识别或该模型不支持则回落 `high`（上游 default），
+/// 不会静默拉到最高档 —— 拉高档位同样是篡改客户端意图。
 fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String> {
     let trimmed = raw_effort.trim();
     if trimmed.is_empty() {
-        return None;
+        return Option::None;
     }
 
-    let requested = match EffortTier::parse(trimmed) {
-        Some(tier) => tier,
-        None => {
+    let tiers = model_effort_tiers(model_id);
+    match EffortTier::parse(trimmed) {
+        Some(tier) if tiers.contains(&tier) => Some(tier.as_str().to_string()),
+        Some(tier) => {
+            tracing::debug!(
+                model_id = %model_id,
+                effort = %tier.as_str(),
+                fallback_effort = EffortTier::High.as_str(),
+                "该模型不支持请求的 effort 档位，回落 high"
+            );
+            Some(EffortTier::High.as_str().to_string())
+        }
+        Option::None => {
             tracing::debug!(
                 model_id = %model_id,
                 effort = %trimmed,
                 fallback_effort = EffortTier::High.as_str(),
-                "falling back unsupported output_config.effort"
+                "无法识别的 effort 值，回落 high"
             );
-            return Some(EffortTier::High.as_str().to_string());
+            Some(EffortTier::High.as_str().to_string())
         }
-    };
-
-    // `xhigh` is a newer effort tier. Known older effort-capable models reject
-    // it with `Invalid additionalModelRequestFields`, so map to the nearest
-    // lower tier instead of failing the request. Unknown/future models keep
-    // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
-        EffortTier::High
-    } else {
-        requested
-    };
-    if normalized != requested || normalized.as_str() != trimmed {
-        tracing::debug!(
-            model_id = %model_id,
-            effort = %trimmed,
-            normalized_effort = normalized.as_str(),
-            "normalized output_config.effort for model"
-        );
     }
-
-    Some(normalized.as_str().to_string())
-}
-
-fn model_supports_xhigh_effort(model_id: &str) -> bool {
-    let model = model_id.to_ascii_lowercase();
-
-    // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
-    if model.contains("opus-4.7")
-        || model.contains("opus-4.8")
-        || model.contains("fable-5")
-        || model.contains("mythos-5")
-        || model.contains("claude-5")
-    {
-        return true;
-    }
-
-    // Known Kiro/Claude model ids that predate xhigh. Keep this as a compact
-    // deny-list, not a full capability matrix.
-    !matches!(
-        model.as_str(),
-        "claude-opus-4.6"
-            | "claude-sonnet-4.6"
-            | "claude-opus-4.5"
-            | "claude-sonnet-4.5"
-            | "claude-haiku-4.5"
-    )
 }
 
 fn build_additional_model_request_fields(
@@ -505,27 +471,71 @@ fn build_additional_model_request_fields(
         return None;
     }
 
-    // 仅对确认接受 output_config 的模型下发，避免上游 400。
-    if !model_supports_native_reasoning(model_id) {
-        if let Some(oc) = &req.output_config
-            && !oc.effort.trim().is_empty()
-        {
-            tracing::debug!(
-                model_id = %model_id,
-                "skipping unsupported additionalModelRequestFields.output_config for model"
-            );
-        }
-        return None;
-    }
-
-    // 需要客户端确实请求了 reasoning（thinking 启用或显式 effort；opus 4.6 需 adaptive）。
+    // 需要客户端确实请求了 reasoning（thinking 启用，或任一位置的显式 effort）。
     if !native_reasoning_requested(req, model_id) {
         return None;
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
+
+    // 两个模型的推理字段路径完全不同，按实测 schema 分流，不做任何互相兼容。
+    if model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_GPT_56_SOL) {
+        return Some(AdditionalModelRequestFields {
+            thinking: None,
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        });
+    }
+
+    if model_supports_native_reasoning(model_id) {
+        return Some(AdditionalModelRequestFields {
+            thinking: build_kiro_thinking(req, &effort),
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        });
+    }
+
+    None
+}
+
+/// 构造 `additionalModelRequestFields.thinking`（仅 claude-opus-5）。
+///
+/// 上游只接受 `type ∈ {adaptive, disabled}`，发 `enabled` 会 400；且 effort 为
+/// `xhigh`/`max` 时连 `disabled` 也被拒。冲突时**整体不下发 thinking 字段**，让上游
+/// 走默认行为 —— 绝不改写 effort（改 effort 等于篡改客户端请求的推理强度）。
+///
+/// `display` 原样透传：上游缺省 `omitted` 会吞掉思考文本，opencode 会主动发
+/// `summarized` 要回来。
+fn build_kiro_thinking(req: &MessagesRequest, effort: &str) -> Option<KiroThinkingConfig> {
+    let thinking = req.thinking.as_ref()?;
+
+    if thinking.thinking_type == "disabled" {
+        if matches!(effort, "xhigh" | "max") {
+            tracing::debug!(
+                effort = %effort,
+                "thinking=disabled 与 effort=xhigh/max 冲突，跳过下发 thinking 字段"
+            );
+            return None;
+        }
+        return Some(KiroThinkingConfig {
+            thinking_type: "disabled".to_string(),
+            display: None,
+        });
+    }
+
+    if !thinking.is_enabled() {
+        return None;
+    }
+    // enabled / adaptive 一律归一为上游唯一接受的 adaptive
+    // （Anthropic 官方迁移路径：enabled+budget_tokens → adaptive+output_config.effort）。
+    Some(KiroThinkingConfig {
+        thinking_type: "adaptive".to_string(),
+        display: thinking
+            .display
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1549,34 +1559,6 @@ fn convert_tools(
     Ok(out)
 }
 
-/// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .and_then(|c| normalize_effort_for_model(model_id, &c.effort))
-                .unwrap_or_else(|| "high".to_string());
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
-        }
-    }
-    None
-}
-
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
-}
-
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1589,7 +1571,10 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req, model_id);
+    // 本部署只服务 claude-opus-5 / gpt-5.6-sol，两者都走 Kiro 原生 reasoning 字段
+    // （output_config.effort / reasoning.effort），因此不再注入 `<thinking_mode>`
+    // prompt 标签 —— 上游版本对该注入**无模型门控**，会与原生 effort 同时下发：
+    // 既污染历史上下文，又把推理强度变成「写在提示词里的字面量」而非上游真实档位。
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -1604,15 +1589,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
+            let final_content = system_content;
 
             // 系统消息作为 user + assistant 配对
             let user_msg = HistoryUserMessage::new(final_content, model_id);
@@ -1621,13 +1598,6 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
 
     // 2. 处理常规消息历史
@@ -1841,152 +1811,15 @@ fn merge_assistant_messages(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-5-20250929")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-sonnet-4-6")
-                .unwrap()
-                .contains("sonnet")
-        );
-    }
 
-    #[test]
-    fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-5-20251101")
-                .unwrap()
-                .contains("opus")
-        );
-    }
 
-    #[test]
-    fn test_map_model_opus_4_7() {
-        assert_eq!(
-            map_model("claude-opus-4-7"),
-            Some("claude-opus-4.7".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4.7-thinking"),
-            Some("claude-opus-4.7".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
-    }
 
-    #[test]
-    fn test_map_model_opus_4_8() {
-        assert_eq!(
-            map_model("claude-opus-4-8"),
-            Some("claude-opus-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4.8-thinking"),
-            Some("claude-opus-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
-    }
 
-    #[test]
-    fn test_map_model_sonnet_4_8() {
-        assert_eq!(
-            map_model("claude-sonnet-4-8"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.8-thinking"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
-    }
 
-    #[test]
-    fn test_map_model_sonnet_5() {
-        assert_eq!(
-            map_model("claude-sonnet-5"),
-            Some("claude-sonnet-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-5-20260101-thinking"),
-            Some("claude-sonnet-5".to_string())
-        );
-        // 点号形式 sonnet.5 也应命中
-        assert_eq!(
-            map_model("claude-sonnet.5"),
-            Some("claude-sonnet-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet5"),
-            Some("claude-sonnet-5".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
-        assert_eq!(
-            map_model("claude-3-5-sonnet-20241022"),
-            Some("claude-sonnet-3.5".to_string())
-        );
-    }
 
-    #[test]
-    fn test_map_model_fable_5() {
-        assert_eq!(
-            map_model("claude-fable-5"),
-            Some("claude-fable-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-fable-5-thinking"),
-            Some("claude-fable-5".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
-    }
 
-    #[test]
-    fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
-    }
 
-    #[test]
-    fn test_map_model_open_passthrough() {
-        for model in [
-            "glm-5",
-            "minimax-m2.5",
-            "deepseek-3.2",
-            "gpt-4",
-            "future-model-2030",
-        ] {
-            assert_eq!(map_model(model), Some(model.to_string()));
-        }
-    }
 
-    #[test]
-    fn test_map_model_future_claude_formats() {
-        assert_eq!(
-            map_model("claude-opus-5"),
-            Some("claude-opus-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-5-latest"),
-            Some("claude-opus-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-5-20270101-thinking"),
-            Some("claude-opus-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-5-2"),
-            Some("claude-sonnet-5.2".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-5-beta"),
-            Some("claude-opus-5-beta".to_string())
-        );
-    }
 
     #[test]
     fn test_map_model_rejects_invalid_ids() {
@@ -1996,42 +1829,10 @@ mod tests {
         assert!(map_model(&"x".repeat(MAX_MODEL_ID_LEN + 1)).is_none());
     }
 
-    #[test]
-    fn test_map_model_gpt_5_6_family() {
-        // Kiro serves the GPT-5.6 family; ids pass through verbatim.
-        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
-        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
-    }
 
-    #[test]
-    fn test_map_model_thinking_suffix_sonnet() {
-        // thinking 后缀不应影响 sonnet 模型映射
-        let result = map_model("claude-sonnet-4-5-20250929-thinking");
-        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
-    }
 
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_5() {
-        // thinking 后缀不应影响 opus 4.5 模型映射
-        let result = map_model("claude-opus-4-5-20251101-thinking");
-        assert_eq!(result, Some("claude-opus-4.5".to_string()));
-    }
 
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_6() {
-        // thinking 后缀不应影响 opus 4.6 模型映射
-        let result = map_model("claude-opus-4-6-thinking");
-        assert_eq!(result, Some("claude-opus-4.6".to_string()));
-    }
 
-    #[test]
-    fn test_map_model_thinking_suffix_haiku() {
-        // thinking 后缀不应影响 haiku 模型映射
-        let result = map_model("claude-haiku-4-5-20251001-thinking");
-        assert_eq!(result, Some("claude-haiku-4.5".to_string()));
-    }
 
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
         minimal_request_with_effort(model, "high")
@@ -2055,6 +1856,7 @@ mod tests {
             output_config: Some(OutputConfig {
                 effort: effort.to_string(),
             }),
+            effort: None,
             metadata: None,
         }
     }
@@ -2064,6 +1866,7 @@ mod tests {
 
         let mut req = minimal_request_with_output_config(model);
         req.thinking = Some(Thinking {
+            display: None,
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
         });
@@ -2075,6 +1878,7 @@ mod tests {
 
         let mut req = minimal_request_with_effort(model, effort);
         req.thinking = Some(Thinking {
+            display: None,
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
         });
@@ -2087,154 +1891,26 @@ mod tests {
         let mut req = minimal_request_with_output_config(model);
         req.output_config = None;
         req.thinking = Some(Thinking {
+            display: None,
             thinking_type: thinking_type.to_string(),
             budget_tokens: 20000,
         });
         req
     }
 
-    #[test]
-    fn test_output_config_does_not_emit_unsupported_additional_fields() {
-        let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
-        let result = convert_request(&req).unwrap();
 
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
-        );
-    }
 
-    #[test]
-    fn test_output_config_does_not_emit_for_unconfirmed_dynamic_model() {
-        let req = minimal_request_with_output_config("glm-5");
-        let result = convert_request(&req).unwrap();
 
-        assert!(result.additional_model_request_fields.is_none());
-        assert_eq!(
-            result
-                .conversation_state
-                .current_message
-                .user_input_message
-                .model_id,
-            "glm-5"
-        );
-    }
 
-    #[test]
-    fn test_output_config_does_not_emit_for_non_adaptive_opus_4_6() {
-        let req = minimal_request_with_output_config("claude-opus-4-6");
-        let result = convert_request(&req).unwrap();
 
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "opus 4.6 only uses additionalModelRequestFields for adaptive thinking"
-        );
-    }
 
-    #[test]
-    fn test_thinking_does_not_emit_additional_fields_for_sonnet_4_5() {
-        let req = minimal_thinking_request("claude-sonnet-4-5-20250929-thinking", "enabled");
-        let result = convert_request(&req).unwrap();
 
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "sonnet 4.5 rejects additionalModelRequestFields even when thinking is enabled"
-        );
-    }
 
-    #[test]
-    fn test_enabled_thinking_does_not_emit_output_config_for_opus_4_6() {
-        let mut req = minimal_request_with_output_config("claude-opus-4-6-thinking");
-        req.thinking = minimal_thinking_request("claude-opus-4-6-thinking", "enabled").thinking;
-        let result = convert_request(&req).unwrap();
-
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "opus 4.6 output_config is only accepted on adaptive thinking requests"
-        );
-    }
-
-    #[test]
-    fn test_output_config_emits_additional_fields_for_opus_4_6() {
-        let req = minimal_adaptive_thinking_request_with_output_config("claude-opus-4-6-thinking");
-        let result = convert_request(&req).unwrap();
-
-        let fields = result
-            .additional_model_request_fields
-            .expect("opus 4.6 adaptive thinking should keep the real effort field");
-        assert_eq!(
-            fields.output_config.unwrap().effort,
-            "high",
-            "effort should be passed through for the supported model"
-        );
-    }
-
-    #[test]
-    fn test_output_config_downgrades_xhigh_for_opus_4_6() {
-        let req =
-            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "xhigh");
-        let result = convert_request(&req).unwrap();
-
-        let fields = result
-            .additional_model_request_fields
-            .expect("opus 4.6 adaptive thinking should keep output_config");
-        assert_eq!(
-            fields.output_config.unwrap().effort,
-            "high",
-            "opus 4.6 upstream only accepts low/medium/high/max, so xhigh should downgrade"
-        );
-    }
-
-    #[test]
-    fn test_output_config_downgrades_xhigh_for_known_older_models() {
-        for model in [
-            "claude-opus-4.6",
-            "claude-sonnet-4.6",
-            "claude-opus-4.5",
-            "claude-sonnet-4.5",
-            "claude-haiku-4.5",
-        ] {
-            assert_eq!(
-                normalize_effort_for_model(model, "xhigh").as_deref(),
-                Some("high"),
-                "{model} should not emit xhigh"
-            );
-        }
-    }
-
-    #[test]
-    fn test_output_config_preserves_xhigh_for_models_without_known_restriction() {
-        assert_eq!(
-            normalize_effort_for_model("claude-opus-4.7", "xhigh").as_deref(),
-            Some("xhigh"),
-            "opus 4.7 supports xhigh"
-        );
-        assert_eq!(
-            normalize_effort_for_model("claude-opus-4.8", "xhigh").as_deref(),
-            Some("xhigh"),
-            "opus 4.8 supports xhigh"
-        );
-        assert_eq!(
-            normalize_effort_for_model("claude-5", "xhigh").as_deref(),
-            Some("xhigh"),
-            "claude 5 supports xhigh"
-        );
-        assert_eq!(
-            normalize_effort_for_model("claude-sonnet-5.1", "xhigh").as_deref(),
-            Some("xhigh"),
-            "future models should not require explicit allow-listing for recognized effort values"
-        );
-        assert_eq!(
-            normalize_effort_for_model("claude-unknown-9", "xhigh").as_deref(),
-            Some("xhigh"),
-            "unknown future models should keep recognized effort values"
-        );
-    }
 
     #[test]
     fn test_output_config_normalizes_effort_case_and_spacing() {
         let req =
-            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "  MAX  ");
+            minimal_adaptive_thinking_request_with_effort("claude-opus-5", "  MAX  ");
         let result = convert_request(&req).unwrap();
 
         let fields = result
@@ -2250,7 +1926,7 @@ mod tests {
     #[test]
     fn test_output_config_unknown_effort_falls_back_to_high() {
         let req =
-            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "extreme");
+            minimal_adaptive_thinking_request_with_effort("claude-opus-5", "extreme");
         let result = convert_request(&req).unwrap();
 
         let fields = result
@@ -2276,77 +1952,13 @@ mod tests {
         assert_eq!(effort_from_budget_tokens(100_000), "xhigh");
     }
 
-    #[test]
-    fn model_supports_native_reasoning_allows_confirmed_and_5_family() {
-        for m in [
-            "claude-opus-4.6",
-            "claude-opus-4.7",
-            "claude-opus-4.8",
-            "claude-sonnet-4.6",
-            "claude-fable-5",
-            "claude-sonnet-5",
-        ] {
-            assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
-        }
-        for m in [
-            "claude-sonnet-4.8",
-            "claude-sonnet-4.5",
-            "claude-opus-4.5",
-            "claude-haiku-4.5",
-        ] {
-            assert!(
-                !model_supports_native_reasoning(m),
-                "{m} 未确认支持，不应下发 output_config"
-            );
-        }
-    }
 
-    #[test]
-    fn enabled_thinking_emits_output_config_for_opus_4_7() {
-        // 标准 Anthropic thinking:{type:"enabled"}（无 output_config）→ 由 budget 推导 effort。
-        let req = minimal_thinking_request("claude-opus-4-7", "enabled");
-        let result = convert_request(&req).unwrap();
-        let fields = result
-            .additional_model_request_fields
-            .expect("opus 4.7 enabled thinking should emit output_config");
-        // 默认 budget_tokens=20000 → high。
-        assert_eq!(fields.output_config.unwrap().effort, "high");
-    }
 
-    #[test]
-    fn enabled_thinking_emits_output_config_for_sonnet_4_6() {
-        let req = minimal_thinking_request("claude-sonnet-4-6", "enabled");
-        let result = convert_request(&req).unwrap();
-        assert!(
-            result.additional_model_request_fields.is_some(),
-            "sonnet 4.6 enabled thinking should emit output_config"
-        );
-    }
 
-    #[test]
-    fn budget_tokens_derive_effort_for_opus_4_8() {
-        use super::super::types::Thinking;
-        let mut req = minimal_thinking_request("claude-opus-4-8", "enabled");
-        req.thinking = Some(Thinking {
-            thinking_type: "enabled".into(),
-            budget_tokens: 3_000,
-        });
-        let result = convert_request(&req).unwrap();
-        assert_eq!(
-            result
-                .additional_model_request_fields
-                .unwrap()
-                .output_config
-                .unwrap()
-                .effort,
-            "low",
-            "budget_tokens=3000 应推导为 low"
-        );
-    }
 
     #[test]
     fn disabled_thinking_emits_nothing_even_for_supported_model() {
-        let req = minimal_thinking_request("claude-opus-4-8", "disabled");
+        let req = minimal_thinking_request("claude-opus-5", "disabled");
         let result = convert_request(&req).unwrap();
         assert!(
             result.additional_model_request_fields.is_none(),
@@ -2354,17 +1966,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_effort_emits_for_fable_5_without_thinking() {
-        // 仅 output_config.effort（无 thinking）在 5 系模型上也算请求了 reasoning。
-        let req = minimal_request_with_effort("claude-fable-5", "xhigh");
-        let result = convert_request(&req).unwrap();
-        let fields = result
-            .additional_model_request_fields
-            .expect("fable-5 显式 effort 应下发");
-        // fable-5 支持 xhigh（model_supports_xhigh_effort），不降级。
-        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
-    }
 
     // ---- normalize_json_schema: 顶层 type / 组合关键字（PR#6）----
 
@@ -2408,7 +2009,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -2417,6 +2018,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -2438,7 +2040,7 @@ mod tests {
         let history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
-                "claude-sonnet-4.5",
+                "claude-opus-5",
             )),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
@@ -2687,7 +2289,7 @@ mod tests {
     fn cc_convert_request_default_maps_builtin_names() {
         use super::super::types::Message as AnthropicMessage;
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2699,6 +2301,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
         // convert_request 测试垫片默认 ClaudeCode 模式。
@@ -2719,7 +2322,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2740,6 +2343,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -2770,7 +2374,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2804,6 +2408,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -2834,7 +2439,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2861,6 +2466,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -2933,7 +2539,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2945,6 +2551,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -2965,7 +2572,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2977,6 +2584,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -2999,7 +2607,7 @@ mod tests {
         // 测试孤立的 tool_result 被过滤
         // 历史中没有 tool_use，但 tool_results 中有 tool_result
         let history = vec![
-            Message::User(HistoryUserMessage::new("Hello", "claude-sonnet-4.5")),
+            Message::User(HistoryUserMessage::new("Hello", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage::new("Hi there!")),
         ];
 
@@ -3025,7 +2633,7 @@ mod tests {
         let history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
-                "claude-sonnet-4.5",
+                "claude-opus-5",
             )),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
@@ -3057,7 +2665,7 @@ mod tests {
         let history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
-                "claude-sonnet-4.5",
+                "claude-opus-5",
             )),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
@@ -3086,7 +2694,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -3120,7 +2728,7 @@ mod tests {
         ]);
 
         // 构建历史中的 user 消息，包含 tool_result
-        let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
+        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5");
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
@@ -3129,7 +2737,7 @@ mod tests {
             // 第一轮：用户请求
             Message::User(HistoryUserMessage::new(
                 "Read the file",
-                "claude-sonnet-4.5",
+                "claude-opus-5",
             )),
             // 第一轮：assistant 使用工具
             Message::Assistant(HistoryAssistantMessage {
@@ -3166,7 +2774,7 @@ mod tests {
         ]);
 
         // 历史中已有 tool_result
-        let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
+        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5");
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
@@ -3174,7 +2782,7 @@ mod tests {
         let history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
-                "claude-sonnet-4.5",
+                "claude-opus-5",
             )),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
@@ -3272,7 +2880,7 @@ mod tests {
         ]);
 
         let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -3310,7 +2918,7 @@ mod tests {
         ]);
 
         let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -3372,7 +2980,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3407,6 +3015,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -3437,7 +3046,7 @@ mod tests {
 
         // user question -> assistant tool_use -> user tool_result (with image + text)
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3466,6 +3075,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 
@@ -3493,7 +3103,7 @@ mod tests {
 
         // text-only tool_result: regression unchanged, should produce no top-level image
         let req = MessagesRequest {
-            model: "claude-sonnet-4.5".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3519,6 +3129,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         };
 

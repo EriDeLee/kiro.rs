@@ -518,6 +518,32 @@ impl KiroCredentials {
             .unwrap_or(false)
     }
 
+    /// 是否为 AWS Builder ID 账号。
+    ///
+    /// Builder ID 不支持 `ListAvailableProfiles`（上游固定 403
+    /// `AWS Builder ID is not supported for this operation.`），也没有真实
+    /// profileArn，只能用 [`BUILDER_ID_PROFILE_ARN`] 占位符。识别它才能跳过那次
+    /// 必然失败的探测。
+    ///
+    /// 两个信号任一成立即判定：显式 `provider = "BuilderId"`（KAM / kiro-cli 导出
+    /// 常见形态，此时往往**没有** `startUrl`），或 profileArn 已是 Builder ID 占位符。
+    pub fn is_builder_id_credential(&self) -> bool {
+        let provider_says_builder_id = self
+            .provider
+            .as_deref()
+            .map(|p| {
+                let p = p.trim();
+                p.eq_ignore_ascii_case("builderid") || p.eq_ignore_ascii_case("builder_id")
+            })
+            .unwrap_or(false);
+        provider_says_builder_id
+            || self
+                .profile_arn
+                .as_deref()
+                .map(|arn| arn == BUILDER_ID_PROFILE_ARN)
+                .unwrap_or(false)
+    }
+
     /// 返回该凭据在 CodeWhisperer 调用上应携带的 `tokentype` 头值（无则 None）。
     ///
     /// - API Key 凭据 → `"API_KEY"`

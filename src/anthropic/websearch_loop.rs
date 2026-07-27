@@ -895,9 +895,7 @@ pub(crate) fn render_json(
 ) -> Response {
     let mut usage = json!({
         "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0
+        "output_tokens": output_tokens
     });
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
     // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
@@ -975,9 +973,7 @@ fn build_sse_events(
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "output_tokens": 0
                 }
             }
         }),
@@ -1156,6 +1152,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            effort: None,
             metadata: None,
         }
     }

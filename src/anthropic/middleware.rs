@@ -16,7 +16,6 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -47,7 +46,6 @@ pub struct AppState {
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
-    pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -66,7 +64,6 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            cache_meter: None,
             trace_store: None,
         }
     }
@@ -91,11 +88,6 @@ impl AppState {
     }
 
     /// 注入缓存计量器
-    pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
-        self.cache_meter = cache;
-        self
-    }
-
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;

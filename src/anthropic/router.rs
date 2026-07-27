@@ -16,10 +16,8 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
 
 use super::{
-    cache_metering::SharedCacheMeter,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
-    openai::post_chat_completions,
     responses::post_responses,
 };
 
@@ -43,7 +41,6 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -56,7 +53,6 @@ pub fn create_router(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
-    cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     create_router_with_shared_provider(
@@ -66,7 +62,6 @@ pub fn create_router(
         client_keys,
         usage_recorder,
         usage_aggregator,
-        cache_meter,
         trace_store,
     )
 }
@@ -80,7 +75,6 @@ pub fn create_router_with_shared_provider(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
-    cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
@@ -88,7 +82,6 @@ pub fn create_router_with_shared_provider(
         state = state.with_shared_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
-    state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由
@@ -96,7 +89,6 @@ pub fn create_router_with_shared_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
-        .route("/chat/completions", post(post_chat_completions))
         .route("/responses", post(post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),

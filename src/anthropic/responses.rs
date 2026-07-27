@@ -6,7 +6,7 @@
 //!
 //! 为什么需要这个端点：Codex CLI 自 0.122 起移除了 `wire_api = "chat"`，
 //! 只支持 `wire_api = "responses"`——即向 `<base_url>/responses` POST，
-//! 走 OpenAI 的 Responses API 协议。因此 `chat/completions` 端点对 Codex
+//! 走 OpenAI 的 Responses API 协议（本部署唯一的 OpenAI 端点）。对 Codex
 //! 无效，必须提供 Responses 端点。
 //!
 //! 工具桥接（完整 codex 能力的关键）：codex 的工具按声明类型分两类，
@@ -44,12 +44,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::handlers::post_messages;
+use super::handlers::{InternalForward, post_messages};
 use super::middleware::{AppState, KeyContext};
-use super::openai::{
+use super::responses_support::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
 };
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -151,6 +151,20 @@ pub async fn post_responses(
         "Received POST /v1/responses request"
     );
 
+    // 0. 模型白名单 + 协议绑定校验。
+    //    本端点只服务 gpt-5.6-sol；用 OpenAI 协议请求 Claude 模型会被明确拒绝，
+    //    不做任何跨协议兼容（两者的推理字段路径与请求体形状根本不同）。
+    if let Err(rejected) = crate::model::allowlist::resolve(
+        &model,
+        crate::model::allowlist::Protocol::OpenAiResponses,
+    ) {
+        return responses_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &rejected.message(&model),
+        );
+    }
+
     // 1. Responses -> Anthropic 请求翻译（同时得到工具声明类型表）
     let (anthropic_req, tool_kinds) = match responses_to_anthropic(req) {
         Ok(r) => r,
@@ -160,7 +174,13 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(
+        State(state),
+        Extension(key_ctx),
+        Some(Extension(InternalForward)),
+        Json(anthropic_req),
+    )
+    .await;
 
     let status = inner.status();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
@@ -325,11 +345,14 @@ fn responses_to_anthropic(
 
     let tools = Some(tool_list);
     let tool_choice = req.tool_choice.as_ref().and_then(convert_tool_choice);
-    let output_config = req
+    // OpenAI Responses 的 `reasoning.effort` 原样带下去。放进 MessagesRequest 的顶层
+    // `effort` 字段后，converter 会依据模型把它落到 gpt-5.6-sol 的
+    // `additionalModelRequestFields.reasoning.effort`（**不是** output_config——
+    // 后者会被上游以 400 REQUEST_BODY_INVALID 拒绝）。
+    let effort = req
         .reasoning
         .and_then(|r| r.effort)
-        .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
+        .filter(|e| !e.trim().is_empty());
 
     Ok((
         MessagesRequest {
@@ -341,7 +364,8 @@ fn responses_to_anthropic(
             tools,
             tool_choice,
             thinking: None,
-            output_config,
+            output_config: None,
+            effort,
             metadata: None,
         },
         tool_kinds,

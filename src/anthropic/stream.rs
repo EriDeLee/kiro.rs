@@ -1271,8 +1271,6 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
-        cache_creation_input_tokens: i32,
-        cache_read_input_tokens: i32,
         metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -1297,8 +1295,6 @@ impl SseStateManager {
             let mut usage_json = json!({
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens
             });
             // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
             // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
@@ -1382,10 +1378,6 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
-    /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
-    /// 覆盖的前缀重复计进 input_tokens。
-    pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加得到本次总量）
     pub credits: f64,
     /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
@@ -1411,13 +1403,16 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
-    /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
+    /// 最终上报口径的 input_tokens。
+    ///
+    /// 上游 Kiro 私有协议既不接受请求侧 `cachePoint`，也不回传 `tokenUsage`
+    /// （2026-07 端到端实测：同形状未知字段同样返 200 = 静默丢弃；`metadataEvent`
+    /// 仅含 `stopReason`），故不存在可上报的 cache 明细。
     ///
     /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
-    pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+    /// `input_tokens`。
+    pub fn resolved_usage(&self) -> i32 {
+        self.context_input_tokens.unwrap_or(self.input_tokens)
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1455,7 +1450,6 @@ impl StreamContext {
             pending_thinking_signature: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
-            cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
             metering: None,
             repeat_guard_last_line: String::new(),
@@ -1482,8 +1476,6 @@ impl StreamContext {
                 "usage": {
                     "input_tokens": self.input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
                 }
             }
         })
@@ -2472,15 +2464,12 @@ impl StreamContext {
             self.state_manager.set_stop_reason("error");
         }
 
-        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let final_input_tokens = self.resolved_usage();
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             self.output_tokens,
-            cache_creation,
-            cache_read,
             self.metering.as_ref(),
         ));
 
@@ -2545,11 +2534,6 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
-    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
-        self.inner.cache_usage = cache_usage;
-    }
-
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -2580,21 +2564,18 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let final_input_tokens = self.inner.resolved_usage();
 
-        // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
+        // 生成最终事件
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
+        // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                     }
                 }
             }
@@ -2605,14 +2586,11 @@ impl BufferedStreamContext {
 
     /// 取出最终用量（在 finish_and_get_all_events 之后调用）
     ///
-    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
-    pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
-        let (input, creation, read) = self.inner.resolved_usage();
+    /// 返回顺序：(input_tokens, output_tokens, credits)
+    pub fn final_usage(&self) -> (i32, i32, f64) {
         (
-            input,
+            self.inner.resolved_usage(),
             self.inner.output_tokens,
-            creation,
-            read,
             self.inner.credits,
         )
     }
@@ -2625,7 +2603,7 @@ impl BufferedStreamContext {
 
 /// 简单的 token 估算（中英文字符混合）
 ///
-/// 公开供 cache_meter 等模块复用同一估算口径。
+/// 公开供 token 计数等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;
@@ -4722,7 +4700,7 @@ mod tests {
     fn test_generate_final_events_omits_credit_fields_without_metering() {
         // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
         let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, None);
+        let events = manager.generate_final_events(10, 5, None);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -4739,7 +4717,7 @@ mod tests {
         let metering = parse_metering(
             r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
         );
-        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
+        let events = manager.generate_final_events(10, 5, Some(&metering));
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")

@@ -110,6 +110,18 @@ impl KiroEndpoint for IdeEndpoint {
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
         inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
     }
+
+    /// MCP（WebSearch）请求体同样需要根对象上的 `profileArn`。
+    ///
+    /// 缺省实现原样返回，导致 Builder ID 账号调 WebSearch 时上游返回
+    /// `400 profileArn is required for this request.`：`decorate_mcp` 只带了
+    /// `x-amzn-kiro-profile-arn` 头，且用 `effective_profile_arn()`——它会把
+    /// Builder ID 的占位 ARN 过滤成 `None`，于是请求既无头也无 body 字段。
+    /// 这里与流式路径统一用 `streaming_profile_arn()`，它对 Builder ID / free
+    /// 账号返回官方占位 ARN。
+    fn transform_mcp_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
+    }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象

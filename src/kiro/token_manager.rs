@@ -3152,6 +3152,16 @@ impl MultiTokenManager {
             }
         }
 
+        // AWS Builder ID 账号不支持 ListAvailableProfiles，上游固定返回
+        // `403 AccessDeniedException: AWS Builder ID is not supported for this operation.`
+        // 不做门控的话，这类账号（authMethod=idc + provider=BuilderId，profileArn 是
+        // 占位符）会在**每次请求**上白跑一趟 403，既拖慢首字节又刷满告警日志。
+        // 直接返回 None，让调用方走占位 ARN 回退。
+        if credentials.is_builder_id_credential() {
+            tracing::debug!("凭据 #{id} 是 Builder ID 账号，跳过 ListAvailableProfiles 探测");
+            return Ok(None);
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let profiles =

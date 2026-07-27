@@ -1,3 +1,4 @@
+mod security;
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -102,7 +103,10 @@ async fn main() {
     });
 
     if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+        tracing::info!(
+            "已配置 HTTP 代理: {}",
+            security::redact_proxy_url(config.proxy_url.as_ref().unwrap())
+        );
     }
 
     // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
@@ -255,13 +259,6 @@ async fn main() {
         );
     }
 
-    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
-    cache_meter.clone().spawn_background();
-
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -269,7 +266,6 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(cache_meter.clone()),
         trace_store.clone(),
     );
 
