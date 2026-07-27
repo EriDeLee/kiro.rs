@@ -198,15 +198,13 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 用户 / assistant 消息
     for msg in &messages {
         if let serde_json::Value::String(s) = &msg.content {
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
+                total += count_content_block_tokens(item);
             }
         }
     }
@@ -222,6 +220,70 @@ fn count_all_tokens_local(
     }
 
     total.max(1)
+}
+
+/// 估算单个 Anthropic content block 的 token 数。
+///
+/// 此前只统计 `text` 字段，`tool_use.input` / `tool_result.content` / `image` /
+/// `thinking` 全部漏算。opencode 依赖 `/v1/messages/count_tokens` 决定何时压缩
+/// 上下文，低估会让它压缩得太晚、直接撞上游窗口上限。
+///
+/// `tool_result.content` 本身可以是字符串或嵌套 block 数组，故递归处理。
+fn count_content_block_tokens(block: &serde_json::Value) -> u64 {
+    let mut total = 0;
+
+    match block.get("type").and_then(|v| v.as_str()) {
+        // 图片按 Anthropic 的 (w*h)/750 公式估算，复用 image_resize 的实现。
+        Some("image") => {
+            if let Some(src) = block.get("source") {
+                let media = src
+                    .get("media_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image/png");
+                if let Some(data) = src.get("data").and_then(|v| v.as_str()) {
+                    total += u64::from(crate::image_resize::estimate_image_tokens(media, data));
+                }
+            }
+            return total;
+        }
+        // 工具入参是 JSON 对象，按序列化后的字面量计。
+        Some("tool_use") => {
+            total += count_tokens(block.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+            if let Some(input) = block.get("input") {
+                total += count_tokens(&input.to_string());
+            }
+            return total;
+        }
+        // 工具结果：content 可能是字符串，也可能是嵌套 block 数组（含图片）。
+        Some("tool_result") => {
+            match block.get("content") {
+                Some(serde_json::Value::String(s)) => total += count_tokens(s),
+                Some(serde_json::Value::Array(items)) => {
+                    for item in items {
+                        total += count_content_block_tokens(item);
+                    }
+                }
+                _ => {}
+            }
+            return total;
+        }
+        // thinking / redacted_thinking 也占上下文。
+        Some("thinking") => {
+            total += count_tokens(block.get("thinking").and_then(|v| v.as_str()).unwrap_or(""));
+            return total;
+        }
+        Some("redacted_thinking") => {
+            total += count_tokens(block.get("data").and_then(|v| v.as_str()).unwrap_or(""));
+            return total;
+        }
+        _ => {}
+    }
+
+    // text 块与未知类型：退化为只数 text 字段（与旧行为一致）。
+    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+        total += count_tokens(text);
+    }
+    total
 }
 
 /// 估算输出 tokens
@@ -254,6 +316,56 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 回归锁：入站统计必须覆盖 tool_use / tool_result / thinking / image，
+    /// 只数 text 会让 opencode 严重低估上下文、压缩过晚。
+    #[test]
+    fn count_content_block_tokens_covers_non_text_blocks() {
+        let long = "x".repeat(400);
+
+        let tool_use = serde_json::json!({
+            "type": "tool_use", "id": "t1", "name": "Edit",
+            "input": {"file_path": "/a.rs", "old_string": long.clone()}
+        });
+        assert!(
+            count_content_block_tokens(&tool_use) > 50,
+            "tool_use.input 必须计入"
+        );
+
+        let tool_result = serde_json::json!({
+            "type": "tool_result", "tool_use_id": "t1", "content": long.clone()
+        });
+        assert!(
+            count_content_block_tokens(&tool_result) > 50,
+            "tool_result.content 字符串必须计入"
+        );
+
+        // 嵌套 block 数组形态
+        let nested = serde_json::json!({
+            "type": "tool_result", "tool_use_id": "t1",
+            "content": [{"type": "text", "text": long.clone()}]
+        });
+        assert!(
+            count_content_block_tokens(&nested) > 50,
+            "tool_result 的嵌套 block 必须递归计入"
+        );
+
+        let thinking = serde_json::json!({"type": "thinking", "thinking": long.clone()});
+        assert!(
+            count_content_block_tokens(&thinking) > 50,
+            "thinking 必须计入"
+        );
+
+        let redacted = serde_json::json!({"type": "redacted_thinking", "data": long});
+        assert!(
+            count_content_block_tokens(&redacted) > 50,
+            "redacted_thinking 必须计入"
+        );
+
+        // text 块保持原行为
+        let text = serde_json::json!({"type": "text", "text": "hello"});
+        assert!(count_content_block_tokens(&text) > 0);
+    }
 
     #[test]
     fn estimate_output_tokens_counts_thinking_blocks() {

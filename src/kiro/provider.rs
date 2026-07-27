@@ -548,6 +548,15 @@ impl KiroProvider {
                 "实际发送请求体: {}",
                 crate::security::body_log_summary(&body)
             );
+            // 诊断：只打 additionalModelRequestFields（推理档位），不含任何对话内容。
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                tracing::debug!(
+                    "additionalModelRequestFields = {}",
+                    v.get("additionalModelRequestFields")
+                        .map(|f| f.to_string())
+                        .unwrap_or_else(|| "<absent>".to_string())
+                );
+            }
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -561,7 +570,16 @@ impl KiroProvider {
             let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                    // 逐条过脱敏：Authorization / tokentype 等敏感头只留占位，
+                    // 否则 RUST_LOG=debug 会把 `Bearer <access_token>` 明文写进日志。
+                    tracing::debug!(
+                        "  header {}: {}",
+                        k,
+                        crate::security::redact_header_value(
+                            k.as_str(),
+                            v.to_str().unwrap_or("<binary>")
+                        )
+                    );
                 }
             }
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {

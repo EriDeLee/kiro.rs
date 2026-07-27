@@ -29,7 +29,7 @@ use crate::token;
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
-use super::stream::{CompletedToolUse, SseEvent};
+use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 
@@ -72,6 +72,9 @@ struct RoundOutcome {
     /// True if the upstream stream ended due to a read error, so the decoded
     /// content for this round is partial and must not be treated as a success.
     stream_error: bool,
+    /// 上游 tool JSON 非法或半截。与 `stream_error` 同性质：本轮内容不可信，
+    /// 不能当成功处理，更不能把降级后的空参数交给客户端执行。
+    tool_json_error: Option<ToolJsonAccumulatorError>,
     /// Tool names declared to the upstream this round (original + shortened),
     /// taken from `ConversionResult::known_tool_names`. Used by the shared
     /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
@@ -202,11 +205,12 @@ async fn decode_round(
 
     let mut text = String::new();
     let mut thinking = String::new();
-    // id -> (name, json_buffer), preserving the order of appearance
-    let mut buffers: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    // 与 /v1/messages 主路径同款的 tool JSON 累积器：只有整段 JSON 完整可解析才
+    // 产出 tool_use。此前这里是「解析失败就降级成 {}」，会让客户端拿着空参数去
+    // 执行工具（混合工具集场景会命中），属于静默数据损坏。
+    let mut tool_accumulator = ToolJsonAccumulator::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
+    let mut tool_json_error: Option<ToolJsonAccumulatorError> = None;
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
@@ -244,16 +248,16 @@ async fn decode_round(
                         thinking.push_str(t);
                     }
                 }
-                Event::ToolUse(tu) => {
-                    let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
-                        order.push(tu.tool_use_id.clone());
-                        (String::new(), String::new())
-                    });
-                    if entry.0.is_empty() {
-                        entry.0 = tu.name.clone();
+                Event::ToolUse(tu) => match tool_accumulator.push(&tu, tool_name_map) {
+                    // 未收到 stop：继续缓冲。
+                    Ok(None) => {}
+                    Ok(Some(completed)) => tool_uses.push(completed),
+                    // 上游给了非法 JSON：记录并终止本轮，绝不降级成空参数。
+                    Err(e) => {
+                        tracing::error!("{}", e);
+                        tool_json_error = Some(e);
                     }
-                    entry.1.push_str(&tu.input);
-                }
+                },
                 Event::ContextUsage(cu) => {
                     let window = get_context_window_size(model);
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
@@ -276,20 +280,12 @@ async fn decode_round(
         }
     }
 
-    // Assemble the complete tool_use in order of appearance (restoring the tool_name_map short name)
-    for id in order {
-        if let Some((name, buf)) = buffers.remove(&id) {
-            let input: Value = if buf.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tool input JSON: {}", e);
-                    json!({})
-                })
-            };
-            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
-            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
-        }
+    // 收尾：仍在缓冲、始终没收到 stop 的半截 tool JSON 视为错误，不静默丢弃。
+    if tool_json_error.is_none()
+        && let Err(e) = tool_accumulator.finish()
+    {
+        tracing::error!("{}", e);
+        tool_json_error = Some(e);
     }
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
@@ -304,6 +300,7 @@ async fn decode_round(
         last_metering,
         stop_reason_override,
         stream_error,
+        tool_json_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
         known_tool_names: std::collections::HashSet::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
@@ -384,6 +381,16 @@ async fn run_round(
                 "upstream_error",
                 "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
             )),
+        )
+            .into_response());
+    }
+    // 上游 tool JSON 非法 / 半截：与断流同等对待。降级成空参数再交给客户端执行，
+    // 等于让它拿错误的参数真的去动文件或跑命令。
+    if let Some(e) = &outcome.tool_json_error {
+        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(e.error_type(), e.message())),
         )
             .into_response());
     }
@@ -1133,6 +1140,7 @@ mod tests {
             last_metering: None,
             stop_reason_override: None,
             stream_error: false,
+            tool_json_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
@@ -1140,7 +1148,7 @@ mod tests {
 
     fn payload_with_last_block(block: Value) -> MessagesRequest {
         MessagesRequest {
-            model: "gpt-5.6-terra".to_string(),
+            model: "claude-opus-5".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),

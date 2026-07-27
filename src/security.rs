@@ -89,7 +89,7 @@ mod tests {
         );
         assert_eq!(
             redact_proxy_url("http://user:pass@127.0.0.1:8080"),
-            "http://[REDACTED]@127.0.0.1:8080"
+            format!("http://{REDACTED}@127.0.0.1:8080")
         );
         assert!(!redact_text("Authorization: Bearer sk-secret").contains("sk-secret"));
     }

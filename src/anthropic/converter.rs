@@ -315,17 +315,19 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
 
 /// 本次请求是否请求了原生 reasoning。
 ///
-/// Opus 4.6 有历史约束：上游只在 **adaptive** thinking 下接受 `output_config`
-/// （普通 enabled / 纯 effort 会 400），故单独判定；其余支持模型放宽为
-/// 「thinking 启用（enabled/adaptive） **或** 显式 `output_config.effort`」即算请求。
-fn native_reasoning_requested(req: &MessagesRequest, model_id: &str) -> bool {
-    if model_id == "claude-opus-4.6" {
-        return req
-            .thinking
-            .as_ref()
-            .is_some_and(|t| t.thinking_type == "adaptive");
-    }
+/// 客户端是否请求了原生 reasoning。
+///
+/// 三处信号任一成立即算，必须与 [`select_native_reasoning_effort`] 的取值链一致：
+///   - `thinking` 启用（adaptive / enabled）
+///   - **顶层 `effort`** —— opencode v1.18.5 的位置，也是 `/v1/responses` 把
+///     `reasoning.effort` 搬进来的落点（那条路径 thinking / output_config 恒为 None）
+///   - `output_config.effort` —— Anthropic 官方位置
+///
+/// 漏掉顶层 `effort` 会让 GPT 请求在此直接短路，`additionalModelRequestFields`
+/// 返回 None，上游收不到档位而回落 default —— 即「虚假推理强度」。
+fn native_reasoning_requested(req: &MessagesRequest) -> bool {
     req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req.effort.as_deref().is_some_and(|e| !e.trim().is_empty())
         || req
             .output_config
             .as_ref()
@@ -472,7 +474,7 @@ fn build_additional_model_request_fields(
     }
 
     // 需要客户端确实请求了 reasoning（thinking 启用，或任一位置的显式 effort）。
-    if !native_reasoning_requested(req, model_id) {
+    if !native_reasoning_requested(req) {
         return None;
     }
 

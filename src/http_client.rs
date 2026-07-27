@@ -76,7 +76,11 @@ pub fn build_client(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        // 代理 URL 可能带 user:pass，必须脱敏后再写日志。
+        tracing::debug!(
+            "HTTP Client 使用代理: {}",
+            crate::security::redact_proxy_url(&proxy_config.url)
+        );
     }
 
     Ok(builder.build()?)
