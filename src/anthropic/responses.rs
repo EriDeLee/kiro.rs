@@ -277,7 +277,7 @@ fn responses_to_anthropic(
                     continue;
                 }
 
-                translate_input_item(item, &mut system, &mut merged);
+                translate_input_item(item, &mut system, &mut merged)?;
             }
         }
         _ => {}
@@ -543,7 +543,7 @@ fn translate_input_item(
     item: &Value,
     system: &mut Vec<SystemMessage>,
     merged: &mut Vec<(String, Vec<Value>)>,
-) {
+) -> Result<(), String> {
     let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match ty {
@@ -566,7 +566,10 @@ fn translate_input_item(
                 .get("arguments")
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
-            let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+            // 坏 JSON 不降级成 {}：空参数会让客户端拿错误入参真的去执行工具。
+            let input: Value = serde_json::from_str(args_str).map_err(|e| {
+                format!("function_call `{name}` has invalid JSON arguments: {e}")
+            })?;
             let block = json!({
                 "type": "tool_use",
                 "id": call_id,
@@ -621,7 +624,7 @@ fn translate_input_item(
         _ => {
             let role = item.get("role").and_then(|v| v.as_str());
             let Some(role) = role else {
-                return;
+                return Ok(());
             };
             match role {
                 "system" | "developer" => {
@@ -640,6 +643,7 @@ fn translate_input_item(
             }
         }
     }
+    Ok(())
 }
 
 /// 把 Responses message.content（字符串或数组）转成 Anthropic content blocks

@@ -289,7 +289,10 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 /// 优先级：**顶层 `effort`**（opencode 实际位置）> `output_config.effort`（官方位置）
 /// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 默认 `high`（与上游 default 一致）。
 /// 随后按该模型实测枚举裁剪。
-fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> String {
+fn select_native_reasoning_effort(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Result<String, String> {
     let raw = req
         .effort
         .as_deref()
@@ -308,7 +311,8 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
                 .map(|t| effort_from_budget_tokens(t.budget_tokens).to_string())
         })
         .unwrap_or_else(|| "high".to_string());
-    normalize_effort_for_model(model_id, &raw).unwrap_or_else(|| "high".to_string())
+    // 客户端未指定时才用 default high；显式指定但不被支持则上抛，不静默改写。
+    Ok(normalize_effort_for_model(model_id, &raw)?.unwrap_or_else(|| "high".to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,74 +368,70 @@ fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
 ///
 /// 命中则原样下发；无法识别或该模型不支持则回落 `high`（上游 default），
 /// 不会静默拉到最高档 —— 拉高档位同样是篡改客户端意图。
-fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String> {
+fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Result<Option<String>, String> {
     let trimmed = raw_effort.trim();
     if trimmed.is_empty() {
-        return Option::None;
+        return Ok(Option::None);
     }
 
     let tiers = model_effort_tiers(model_id);
     match EffortTier::parse(trimmed) {
-        Some(tier) if tiers.contains(&tier) => Some(tier.as_str().to_string()),
-        Some(tier) => {
-            tracing::debug!(
-                model_id = %model_id,
-                effort = %tier.as_str(),
-                fallback_effort = EffortTier::High.as_str(),
-                "该模型不支持请求的 effort 档位，回落 high"
-            );
-            Some(EffortTier::High.as_str().to_string())
-        }
-        Option::None => {
-            tracing::debug!(
-                model_id = %model_id,
-                effort = %trimmed,
-                fallback_effort = EffortTier::High.as_str(),
-                "无法识别的 effort 值，回落 high"
-            );
-            Some(EffortTier::High.as_str().to_string())
-        }
+        Some(tier) if tiers.contains(&tier) => Ok(Some(tier.as_str().to_string())),
+        // 不回落：静默把档位改成 high 等于篡改客户端请求的推理强度，调用方拿到
+        // 200 却以为自己设的档位生效了。直接拒绝，让它知道这个模型不支持。
+        Some(tier) => Err(format!(
+            "effort `{}` is not supported by model `{}`; supported tiers: {}",
+            tier.as_str(),
+            model_id,
+            tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+        Option::None => Err(format!(
+            "unrecognized effort value `{}`; supported tiers for `{}`: {}",
+            trimmed,
+            model_id,
+            tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 
 fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
-) -> Option<AdditionalModelRequestFields> {
+) -> Result<Option<AdditionalModelRequestFields>, String> {
     // 显式关闭 thinking：不下发任何 reasoning 字段。
     if req
         .thinking
         .as_ref()
         .is_some_and(|t| t.thinking_type == "disabled")
     {
-        return None;
+        return Ok(None);
     }
 
     // 需要客户端确实请求了 reasoning（thinking 启用，或任一位置的显式 effort）。
     if !native_reasoning_requested(req) {
-        return None;
+        return Ok(None);
     }
 
-    let effort = select_native_reasoning_effort(req, model_id);
+    let effort = select_native_reasoning_effort(req, model_id)?;
 
     // 两个模型的推理字段路径完全不同，按实测 schema 分流，不做任何互相兼容。
     if model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_GPT_56_SOL) {
-        return Some(AdditionalModelRequestFields {
+        return Ok(Some(AdditionalModelRequestFields {
             thinking: None,
             output_config: None,
             reasoning: Some(KiroReasoningConfig { effort }),
-        });
+        }));
     }
 
     if model_supports_native_reasoning(model_id) {
-        return Some(AdditionalModelRequestFields {
+        return Ok(Some(AdditionalModelRequestFields {
             thinking: build_kiro_thinking(req, &effort),
             output_config: Some(KiroOutputConfig { effort }),
             reasoning: None,
-        });
+        }));
     }
 
-    None
+    Ok(None)
 }
 
 /// 构造 `additionalModelRequestFields.thinking`（仅 claude-opus-5）。
@@ -496,6 +496,10 @@ pub struct ConversionResult {
 pub enum ConversionError {
     InvalidModel(String),
     EmptyMessages,
+    /// 请求本身违反本部署的严格约束（不支持的 effort 档位、assistant prefill 等）。
+    /// 与 `InvalidModel` 分开，避免把 effort / prefill 问题报成「无效模型 ID」
+    /// 而误导排查方向。
+    UnsupportedRequest(String),
     /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
     UnsupportedToolMapping(String),
 }
@@ -504,6 +508,7 @@ impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConversionError::InvalidModel(reason) => write!(f, "无效模型 ID: {}", reason),
+            ConversionError::UnsupportedRequest(reason) => write!(f, "{}", reason),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
@@ -611,19 +616,19 @@ pub fn convert_request_with_mode(
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
-        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
-        let last_user_idx = req
-            .messages
-            .iter()
-            .rposition(|m| m.role == "user")
-            .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
-    } else {
-        &req.messages
-    };
+    // 2.5. assistant prefill：Kiro 上游不支持，直接拒绝而非静默丢弃。
+    //
+    // 旧行为是截断到最后一条 user 消息并继续，调用方拿到 200 却完全不知道自己的
+    // prefill 被扔了 —— 模型的回答不再受那段预填约束，结果与预期不符却无从察觉。
+    if req.messages.last().is_some_and(|m| m.role != "user") {
+        return Err(ConversionError::UnsupportedRequest(
+            "assistant prefill is not supported: the Kiro upstream has no slot for a \
+             pre-filled assistant turn. Remove the trailing assistant message; \
+             put the constraint in the user message or system prompt instead."
+                .to_string(),
+        ));
+    }
+    let messages: &[_] = &req.messages;
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
@@ -735,7 +740,8 @@ pub fn convert_request_with_mode(
     // wire field is narrower: newer/non-adaptive models reject it with
     // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
     // by upstream model capability rather than by the mere presence of client output_config.
-    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id)
+        .map_err(ConversionError::UnsupportedRequest)?;
 
     Ok(ConversionResult {
         conversation_state,
@@ -775,7 +781,20 @@ fn process_message_content_dedup(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                // 反序列化失败不静默跳过：客户端发的 content block 凭空消失会让
+                // 对话内容缺失且无从察觉，至少要留下痕迹。
+                let block = match serde_json::from_value::<ContentBlock>(item.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            block_type = %item.get("type").and_then(|v| v.as_str()).unwrap_or("<none>"),
+                            "客户端 content block 解析失败，已跳过: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+                {
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(text) = block.text {
@@ -1646,7 +1665,20 @@ fn convert_assistant_message(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                // 反序列化失败不静默跳过：客户端发的 content block 凭空消失会让
+                // 对话内容缺失且无从察觉，至少要留下痕迹。
+                let block = match serde_json::from_value::<ContentBlock>(item.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            block_type = %item.get("type").and_then(|v| v.as_str()).unwrap_or("<none>"),
+                            "客户端 content block 解析失败，已跳过: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+                {
                     match block.block_type.as_str() {
                         // 历史思考走上游的结构化 `reasoningContent` 字段，**不再**拼成
                         // `<thinking>` 塞进 content。原因：上游解密 signature 重建思维链，
@@ -1885,20 +1917,34 @@ mod tests {
         );
     }
 
+    /// 回归锁：非法 / 不受支持的 effort **不再静默回落 high**，直接拒绝。
+    ///
+    /// 静默改写档位等于篡改客户端请求的推理强度：调用方拿到 200，以为自己设的
+    /// 档位生效了，实际跑的是另一档。
     #[test]
-    fn test_output_config_unknown_effort_falls_back_to_high() {
-        let req =
-            minimal_adaptive_thinking_request_with_effort("claude-opus-5", "extreme");
-        let result = convert_request(&req).unwrap();
-
-        let fields = result
-            .additional_model_request_fields
-            .expect("opus 4.6 adaptive thinking should keep output_config");
-        assert_eq!(
-            fields.output_config.unwrap().effort,
-            "high",
-            "unknown effort values should fall back instead of causing upstream validation errors"
+    fn unsupported_effort_is_rejected_not_downgraded() {
+        // 无法识别的值
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "extreme");
+        let err = convert_request(&req).expect_err("非法 effort 必须被拒绝");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unrecognized effort"), "got: {msg}");
+        assert!(
+            msg.contains("low, medium, high, xhigh, max"),
+            "应列出支持档位: {msg}"
         );
+
+        // gpt-5.6-sol 独有的 none 档：opus-5 不支持，同样拒绝而非回落
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "none");
+        let err = convert_request(&req).expect_err("opus-5 不支持 none 档");
+        assert!(format!("{err:?}").contains("not supported by model"));
+
+        // 合法档位仍正常下发
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "xhigh");
+        let fields = convert_request(&req)
+            .expect("合法 effort 应通过")
+            .additional_model_request_fields
+            .expect("应下发 output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
     // ---- Fix 3: 原生 thinking effort 下发拓宽 + budget 推导 ----

@@ -326,6 +326,9 @@ async fn run_round(
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("invalid model id: {}", reason))
                 }
+                ConversionError::UnsupportedRequest(reason) => {
+                    ("invalid_request_error", reason.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
@@ -564,7 +567,7 @@ fn build_flush_content(
     searched: &[Option<WebSearchResults>],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ToolJsonAccumulatorError> {
     let mut content: Vec<Value> = presentation;
     if !text.is_empty() {
         // Run the shared one-shot `<invoke>` sniffer: splits `text` into a sequence of
@@ -595,8 +598,19 @@ fn build_flush_content(
             .filter(|t| t.name != "web_search")
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
-        for block in super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
-        {
+        // 坏 JSON 上抛：与主路径 ToolJsonAccumulator 同口径，绝不降级成空参数。
+        let reclaimed = match super::stream::extract_invoke_content_blocks(
+            text,
+            &reclaim_tools,
+            tool_name_map,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("{}", e);
+                return Err(e);
+            }
+        };
+        for block in reclaimed {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let key = (
@@ -635,7 +649,7 @@ fn build_flush_content(
             content.push(tu.to_anthropic_block());
         }
     }
-    content
+    Ok(content)
 }
 
 /// web_search loop entry point
@@ -824,14 +838,26 @@ pub(super) async fn run_web_search_loop(
                 searched.push(None);
             }
         }
-        let content = build_flush_content(
+        let content = match build_flush_content(
             presentation.clone(),
             &round.text,
             &round.tool_uses,
             &searched,
             &round.known_tool_names,
             &round.tool_name_map,
-        );
+        ) {
+            Ok(c) => c,
+            // 上游 `<invoke>` 泄漏里的 JSON 非法：与断流同等对待，不降级成空参数。
+            Err(e) => {
+                tracing::error!("{}", e);
+                hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(e.error_type(), e.message())),
+                )
+                    .into_response();
+            }
+        };
         // stop_reason must be computed from the FINAL flushed content, not just
         // round.tool_uses: the <invoke> fault tolerance can reclaim a structured tool_use
         // out of the assistant text (the common leak case where the model emits the call as
@@ -1388,7 +1414,7 @@ mod tests {
         let tool_uses = vec![tu("web_search"), tu("exec")];
         let searched = vec![fake_results("rust 2026"), None];
         let content =
-            build_flush_content(Vec::new(), "answer", &tool_uses, &searched, &names(&["exec"]), &nomap());
+            build_flush_content(Vec::new(), "answer", &tool_uses, &searched, &names(&["exec"]), &nomap()).unwrap();
 
         let raw_web_search = content
             .iter()
@@ -1429,7 +1455,7 @@ mod tests {
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
         let searched: Vec<Option<WebSearchResults>> = vec![None];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&["exec"]), &nomap()).unwrap();
         assert!(
             content
                 .iter()
@@ -1466,7 +1492,7 @@ mod tests {
             &[],
             &names(&["exec_command"]),
             &nomap(),
-        );
+        ).unwrap();
         assert!(
             !leaks_literal_invoke(&content),
             "literal <invoke> must not leak as text. content={:?}",
@@ -1491,7 +1517,7 @@ mod tests {
         // Narrative text before the leaked invoke must be preserved as a text block,
         // and the invoke still reclaimed.
         let leaked = "Here is the result.\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert!(!leaks_literal_invoke(&content));
         assert!(
             content.iter().any(|c| c["type"] == "text"
@@ -1509,7 +1535,7 @@ mod tests {
         // An <invoke> shown inside a ``` code fence is a DISPLAY/discussion, not a real call.
         // It must stay as text, never become a tool_use.
         let text = "Look at this example:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "fenced <invoke> must NOT be reclaimed (it's a display). content={:?}",
@@ -1521,7 +1547,7 @@ mod tests {
     fn flush_content_does_not_reclaim_invoke_mid_sentence() {
         // <invoke> embedded mid-sentence (not at line start) is discussion text, not a call.
         let text = "the tag <invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke> means a call";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "mid-sentence <invoke> must NOT be reclaimed. content={:?}",
@@ -1534,7 +1560,7 @@ mod tests {
         // Tool-table guard: a clean line-start <invoke> whose name is NOT a declared tool
         // must NOT be reclaimed (never synthesize a call for an unknown tool).
         let leaked = "call\n<invoke name=\"definitely_not_a_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unknown tool name must NOT be reclaimed. content={:?}",
@@ -1558,7 +1584,7 @@ mod tests {
             // known_tool_names DELIBERATELY contains web_search (mirrors the real request).
             &names(&["web_search", "exec_command"]),
             &nomap(),
-        );
+        ).unwrap();
         assert!(
             !content
                 .iter()
@@ -1589,7 +1615,7 @@ mod tests {
             &[],
             &names(&["web_search", "exec_command"]),
             &nomap(),
-        );
+        ).unwrap();
         assert!(
             content
                 .iter()
@@ -1609,7 +1635,7 @@ mod tests {
     #[test]
     fn flush_content_clean_text_is_single_text_block() {
         // No <invoke> at all -> behavior identical to before: one text block, unchanged.
-        let content = build_flush_content(Vec::new(), "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "just a normal answer");
@@ -1626,7 +1652,7 @@ mod tests {
             &[],
             &names(&["exec_command", "get_time"]),
             &nomap(),
-        );
+        ).unwrap();
         assert!(!leaks_literal_invoke(&content));
         let tus: Vec<&Value> = content.iter().filter(|c| c["type"] == "tool_use").collect();
         assert_eq!(tus.len(), 2, "both invokes reclaimed. content={:?}", content);
@@ -1640,7 +1666,7 @@ mod tests {
     fn flush_content_unclosed_invoke_stays_text() {
         // An <invoke> with no closing tag in the complete text is not a clean call -> keep as text.
         let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unclosed <invoke> must NOT be reclaimed. content={:?}",
@@ -1668,7 +1694,7 @@ mod tests {
             &[],
             &names(&[short]),
             &map,
-        );
+        ).unwrap();
         let tu = content
             .iter()
             .find(|c| c["type"] == "tool_use")
@@ -1688,7 +1714,7 @@ mod tests {
         // stop_reason="tool_use". This test pins that contract: a leaked invoke with an empty
         // tool_uses list still yields a client tool_use block in the content.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap()).unwrap();
         let has_client_tool_use = content
             .iter()
             .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
@@ -1759,7 +1785,7 @@ mod tests {
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
         let searched = vec![fake_results("q")];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap()).unwrap();
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -1791,7 +1817,7 @@ mod tests {
             &[],
             &names(&["exec_command"]),
             &nomap(),
-        );
+        ).unwrap();
         let exec_calls = content
             .iter()
             .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
@@ -1820,7 +1846,7 @@ mod tests {
             &[],
             &names(&["exec_command"]),
             &nomap(),
-        );
+        ).unwrap();
         let exec_calls = content
             .iter()
             .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")

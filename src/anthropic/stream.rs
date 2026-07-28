@@ -734,7 +734,7 @@ pub(crate) fn extract_invoke_content_blocks(
     text: &str,
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, ToolJsonAccumulatorError> {
     // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
     // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
     let collapsed = collapse_stray_token_floods(text);
@@ -789,8 +789,15 @@ pub(crate) fn extract_invoke_content_blocks(
             }
             push_text(&mut blocks, &mut pending_text);
             let (name, input_json) = parsed.expect("parsed is Some when name_known");
-            let input: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
+            // 坏 JSON 一律上抛：降级成 {} 会让客户端拿着空参数真的去执行工具
+            // （改文件、跑命令），比请求失败危险得多。
+            let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+                ToolJsonAccumulatorError::InvalidJson {
+                    tool_use_id: String::new(),
+                    name: name.clone(),
+                    message: e.to_string(),
+                }
+            })?;
             // 统一还原（名字 + 入参）并统一拼块，与结构化 / websearch 路径同口径。
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
             let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
@@ -805,7 +812,7 @@ pub(crate) fn extract_invoke_content_blocks(
     }
 
     push_text(&mut blocks, &mut pending_text);
-    blocks
+    Ok(blocks)
 }
 
 /// 累积完成的工具调用（`ToolUseEvent` 的所有分片拼接、解析成功后的结果）。
@@ -1776,8 +1783,23 @@ impl StreamContext {
                                 // parsed 在上面已确认是 Some 且 name_known
                                 let (name, input_json) = parsed.expect("parsed is Some when name_known");
                                 // 解析完整入参 → 统一还原 → 统一发出（与结构化 toolUseEvent 同一发出口）。
-                                let input: serde_json::Value =
-                                    serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
+                                // 坏 JSON 不降级：记为工具调用错误，由收尾逻辑发出
+                                // Anthropic `error` 事件，绝不把空参数交给客户端执行。
+                                let input: serde_json::Value = match serde_json::from_str(
+                                    &input_json,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let err = ToolJsonAccumulatorError::InvalidJson {
+                                            tool_use_id: String::new(),
+                                            name: name.clone(),
+                                            message: e.to_string(),
+                                        };
+                                        tracing::error!("{}", err);
+                                        self.tool_json_error = Some(err);
+                                        return events;
+                                    }
+                                };
                                 let tool_use_id =
                                     format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
                                 let completed = CompletedToolUse::from_kiro(
@@ -2719,7 +2741,7 @@ mod tests {
             text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
-        );
+        ).unwrap();
         let tu = blocks
             .iter()
             .find(|b| b["type"] == "tool_use")
@@ -2749,7 +2771,7 @@ mod tests {
         known.insert(short.to_string());
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
-        let blocks = extract_invoke_content_blocks(&text, &known, &map);
+        let blocks = extract_invoke_content_blocks(&text, &known, &map).unwrap();
         let tu = blocks.iter().find(|b| b["type"] == "tool_use").expect("reclaimed");
         assert_eq!(tu["name"], original, "shortened name must be restored to original");
     }
@@ -2758,11 +2780,11 @@ mod tests {
     fn extract_blocks_does_not_reclaim_fenced_or_unknown() {
         // fenced -> display, not reclaimed
         let fenced = "see:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let b1 = extract_invoke_content_blocks(fenced, &test_known_tools(), &std::collections::HashMap::new());
+        let b1 = extract_invoke_content_blocks(fenced, &test_known_tools(), &std::collections::HashMap::new()).unwrap();
         assert!(!b1.iter().any(|b| b["type"] == "tool_use"), "fenced must not reclaim");
         // unknown tool name -> not reclaimed
         let unknown = "call\n<invoke name=\"not_a_real_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let b2 = extract_invoke_content_blocks(unknown, &test_known_tools(), &std::collections::HashMap::new());
+        let b2 = extract_invoke_content_blocks(unknown, &test_known_tools(), &std::collections::HashMap::new()).unwrap();
         assert!(!b2.iter().any(|b| b["type"] == "tool_use"), "unknown name must not reclaim");
     }
 
@@ -2772,7 +2794,7 @@ mod tests {
             "just a normal answer with no tool calls",
             &test_known_tools(),
             &std::collections::HashMap::new(),
-        );
+        ).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "just a normal answer with no tool calls");
@@ -4386,7 +4408,7 @@ mod tests {
             &text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
-        );
+        ).unwrap();
         let joined: String = blocks
             .iter()
             .filter(|b| b["type"] == "text")
@@ -4405,7 +4427,7 @@ mod tests {
             text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
-        );
+        ).unwrap();
         assert!(
             blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "exec_command"),
             "单个引导词不应触发折叠，invoke 应捞回: {:?}",

@@ -31,7 +31,17 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
-            _ => Self::Unknown,
+            // 未知事件类型：记录后丢弃。**必须留下痕迹** —— 上游加新事件时若完全
+            // 静默，我们对协议变更就是失明的。历史教训：`metadataEvent`（承载
+            // tokenUsage / cache 明细）就是这样被无声丢掉，导致长期误以为
+            // 「上游不下发 cache 字段」。
+            other => {
+                tracing::warn!(
+                    event_type = %other,
+                    "上游下发了未知事件类型，已丢弃；若反复出现说明上游协议已变更"
+                );
+                Self::Unknown
+            }
         }
     }
 

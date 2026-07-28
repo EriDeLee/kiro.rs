@@ -700,6 +700,10 @@ pub async fn post_messages(
                 ConversionError::InvalidModel(reason) => {
                     ("invalid_request_error", format!("无效模型 ID: {}", reason))
                 }
+                // 请求违反严格约束（effort 档位 / prefill）：原文即为可操作说明。
+                ConversionError::UnsupportedRequest(reason) => {
+                    ("invalid_request_error", reason.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -924,12 +928,20 @@ fn create_sse_stream(
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
+                                    Ok(frame) => match Event::from_frame(frame) {
+                                        Ok(event) => {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
-                                    }
+                                        // 事件解析失败：整段上游内容会凭空消失，
+                                        // 至少要留下痕迹，不能静默吞掉。
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "上游事件解析失败，该事件内容已丢失: {}",
+                                                e
+                                            );
+                                        }
+                                    },
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
@@ -1137,7 +1149,14 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
+                let event = match Event::from_frame(frame) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        tracing::error!("上游事件解析失败，该事件内容已丢失: {}", e);
+                        continue;
+                    }
+                };
+                {
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
