@@ -272,6 +272,18 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// `thinking` 块的签名，上游用它解密重建原始思维链。
+    ///
+    /// Anthropic 官方明确：模型看到的历史思考来自 **signature 解密**，而不是
+    /// `thinking` 字段里的文本（"Any text you place in the `thinking` field of a
+    /// round-tripped omitted block is ignored"）。所以要真正保留历史推理，必须
+    /// 接住客户端回传的这个签名并原样转发给上游。此前该字段缺失，被 serde 静默
+    /// 丢弃，导致历史推理实际上无法回传。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// `redacted_thinking` 块的加密内容（上游 `reasoningContentEvent.redactedContent`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

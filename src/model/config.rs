@@ -33,7 +33,7 @@ pub enum ToolCompatibilityMode {
 /// 自定义模型定义。
 ///
 /// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
-/// 模型 ID 的映射及元数据。运行期由 [`crate::model::custom_models`] 全局注册表按
+/// 模型 ID 的映射及元数据。**已失效**（见 `Config::custom_models`）。原先由
 /// `id`（大小写不敏感）精确匹配，优先于内置的模糊映射逻辑——既能新增模型，也能
 /// 覆盖内置模型的映射。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,9 +256,12 @@ pub struct Config {
     /// 自定义模型映射表。
     ///
     /// 每条把一个客户端模型别名映射到 Kiro 后端模型 ID 并附带元数据。默认空数组
-    /// （完全向后兼容）。启动时装入 [`crate::model::custom_models`] 全局注册表，
+    /// （完全向后兼容）。**当前已忽略**，
     /// 供 `map_model` / `get_context_window_size` / `/v1/models` 查询。
     #[serde(default)]
+    /// **已失效**：本部署用严格白名单（`model::allowlist`）只服务
+    /// `claude-opus-5` 与 `gpt-5.6-sol`，自定义模型不再参与路由或 `/v1/models`
+    /// 列表。字段保留仅为兼容老配置文件的反序列化，配置值会被忽略。
     pub custom_models: Vec<CustomModel>,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）

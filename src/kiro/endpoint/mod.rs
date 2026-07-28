@@ -193,7 +193,16 @@ pub fn default_is_gateway_timeout(body: &str) -> bool {
 /// 而非上游故障）。仅收录**精确 reason 值**，不收录 `ValidationException`
 /// 这类宽泛异常类型——后者语义过宽，裸子串匹配会把恰好携带该词的真实上游
 /// 瞬态故障误判为"不可重试"，反而杀掉本可重试恢复的请求。
-const CLIENT_VALIDATION_REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID"];
+/// `THINKING_SIGNATURE_INVALID`：历史 `reasoningContent.reasoningText.signature`
+/// 验签失败（跨账号轮换、模型版本变更、或签名被中途改写）。归入本类是刻意选择：
+/// **不剥离 reasoningContent 重试**。剥离会让请求"看似成功"，实际已经悄悄丢掉
+/// 整段历史推理 —— 宁可让调用方看到失败并自行处理（新开会话或换回原账号），
+/// 也不要静默降级成没有推理的对话。
+const CLIENT_VALIDATION_REASONS: &[&str] = &[
+    "TOOL_USE_RESULT_MISMATCH",
+    "TOOL_SCHEMA_INVALID",
+    "THINKING_SIGNATURE_INVALID",
+];
 
 /// 触发同类判定的 message 级特征短语（用于无结构化 reason、仅文本报文的场景）
 ///

@@ -710,53 +710,6 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     0
 }
 
-/// 从完整文本中提取 thinking 块（用于非流式响应）
-///
-/// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
-/// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
-///
-/// # 返回值
-/// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
-/// - `(None, original_text)` — 未检测到，原样返回
-pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>, String) {
-    let start_pos = match find_real_thinking_start_tag(text) {
-        Some(pos) => pos,
-        None => return (None, text.to_string()),
-    };
-
-    let before = &text[..start_pos];
-    let after_open = &text[start_pos + "<thinking>".len()..];
-
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
-
-    // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
-
-    // 组装剩余文本：跳过纯空白的 before 部分
-    let mut remaining = String::new();
-    if !before.trim().is_empty() {
-        remaining.push_str(before);
-    }
-    remaining.push_str(text_after);
-
-    if thinking_content.is_empty() {
-        (None, remaining)
-    } else {
-        (Some(thinking_content.to_string()), remaining)
-    }
-}
 
 /// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列，
 /// 把混在文本里的字面 `<invoke name="...">...</invoke>` 工具调用捞回成结构化 `tool_use`。
@@ -2120,6 +2073,14 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
+        // 诊断：只报字段有无与长度，不打印思考内容或签名本身。
+        tracing::debug!(
+            "reasoningContentEvent: text={} signature={} redacted={}",
+            reasoning.text.as_deref().map_or(0, str::len),
+            reasoning.signature.as_deref().map_or(0, str::len),
+            reasoning.redacted_content.as_deref().map_or(0, str::len),
+        );
+
         if let Some(signature) = reasoning.signature.as_deref()
             && !signature.is_empty()
         {
@@ -2191,11 +2152,20 @@ impl StreamContext {
     /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
-    /// （converter 只读 `block.thinking`，不读 signature）。
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+    /// 上游 Kiro **确实下发真实签名**（2026-07 实测：`reasoningContentEvent.signature`
+    /// 长度 340~10920 字符的 base64，流式时在思考文本之后单独下发）。签名会被
+    /// `pending_thinking_signature` 暂存，并原样回传到上游历史的
+    /// `assistantResponseMessage.reasoningContent.reasoningText.signature` ——
+    /// 上游解密它来重建思维链，所以**必须逐字节保真**。
+    ///
+    /// 仅当上游没给签名时才退回非空占位串，以满足客户端「thinking 块必须带
+    /// 非空 signature」的本地校验。
+    fn create_signature_delta_event(&mut self, index: i32) -> SseEvent {
+        let signature = self
+            .pending_thinking_signature
+            .take()
+            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
+        self.create_signature_delta_event_with(index, &signature)
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
@@ -2492,114 +2462,7 @@ impl StreamContext {
     }
 }
 
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
 
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-        known_tool_names: std::collections::HashSet<String>,
-    ) -> Self {
-        let inner = StreamContext::new_with_thinking(
-            model,
-            estimated_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-        );
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            initial_events_generated: false,
-        }
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        let final_input_tokens = self.inner.resolved_usage();
-
-        // 生成最终事件
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
-    }
-
-    /// 取出最终用量（在 finish_and_get_all_events 之后调用）
-    ///
-    /// 返回顺序：(input_tokens, output_tokens, credits)
-    pub fn final_usage(&self) -> (i32, i32, f64) {
-        (
-            self.inner.resolved_usage(),
-            self.inner.output_tokens,
-            self.inner.credits,
-        )
-    }
-
-    /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn tool_json_error_message(&self) -> Option<String> {
-        self.inner.tool_json_error_message()
-    }
-}
 
 /// 简单的 token 估算（中英文字符混合）
 ///

@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -458,9 +458,9 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
     }
 }
 
-fn aggregate_available_models_with_custom(
+fn aggregate_available_models_inner(
     upstream_models: Vec<UpstreamModel>,
-    custom_models: &[crate::model::config::CustomModel],
+
 ) -> Vec<Model> {
     let mut merged_upstream: BTreeMap<String, UpstreamModel> = BTreeMap::new();
     for incoming in upstream_models {
@@ -487,30 +487,21 @@ fn aggregate_available_models_with_custom(
     }
 
     // 自定义别名最后写入，同名时其展示元数据优先于动态条目。
-    for custom in custom_models {
-        let model = Model {
-            id: custom.id.clone(),
-            object: "model".to_string(),
-            created: 0,
-            owned_by: custom
-                .owned_by
-                .clone()
-                .unwrap_or_else(|| "custom".to_string()),
-            display_name: custom
-                .display_name
-                .clone()
-                .unwrap_or_else(|| custom.id.clone()),
-            model_type: "chat".to_string(),
-            max_tokens: custom.max_tokens.unwrap_or(64_000),
-        };
-        models.insert(model.id.clone(), model);
-    }
 
     models.into_values().collect()
 }
 
+/// 汇总可用模型清单。
+///
+/// 只保留白名单内的模型：本部署严格只服务 `claude-opus-5`（/v1/messages）与
+/// `gpt-5.6-sol`（/v1/responses），其余一律在请求阶段 400。若这里仍列出白名单外
+/// 的模型（含 config 里的 `customModels`），客户端会看到一个「能选但一用就报错」
+/// 的假选项 —— 配置与实际行为不一致，是最容易自己踩的坑。
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
-    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
+    aggregate_available_models_inner(upstream_models)
+        .into_iter()
+        .filter(|m| crate::model::allowlist::normalize(&m.id).is_some())
+        .collect()
 }
 
 /// GET /v1/models
@@ -1349,25 +1340,15 @@ fn build_non_stream_content(
                 "signature": native_thinking_signature
                     .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
             }));
-        } else {
-            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
-            let (thinking, remaining_text) =
-                super::stream::extract_thinking_from_complete_text(&text_content);
-
-            if let Some(thinking_text) = thinking {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-                }));
-            }
-
-            if !remaining_text.is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": remaining_text
-                }));
-            }
+        } else if !text_content.is_empty() {
+            // 只认原生 `reasoningContentEvent`（带真 signature）。上游若把思考写进
+            // 正文的 `<thinking>` 标签，那是 legacy 形态：此处不再解析提取，正文
+            // 原样输出。2026-07 实测 claude-opus-5 在长推理 / 工具调用 / 流式与
+            // 非流式全部走原生模式（406 个 reasoning 事件，XML 模式 0 次）。
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
         }
 
         for redacted in native_redacted_thinking {
@@ -1457,413 +1438,10 @@ pub async fn count_tokens(
     })
 }
 
-/// POST /cc/v1/messages
-///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
-pub async fn post_messages_cc(
-    State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    tracing::info!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /cc/v1/messages request"
-    );
-    if let Err(error) = validate_max_tokens(payload.max_tokens) {
-        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-    }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        return resp;
-    }
-
-    let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
-        return super::websearch_loop::run_web_search_loop(
-            provider,
-            payload,
-            hook,
-            payload_stream,
-            key_ctx.group.clone(),
-            state.tool_compatibility_mode,
-        )
-        .await;
-    }
-
-    // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
-
-    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
-    // credentials; additional_model_request_fields is already filtered by converter model support.
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: conversion_result.additional_model_request_fields,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 计算总 input tokens
-    let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
-
-
-    if payload.stream {
-        // 流式响应（缓冲模式）
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
-        handle_stream_request_buffered(
-            provider,
-            &request_body,
-            &payload.model,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-            hook,
-            total_input_tokens,
-            tracer,
-            key_ctx.group.clone(),
-        )
-        .await
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            total_input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
-            hook,
-            tracer,
-            key_ctx.group.clone(),
-        )
-        .await
-    }
-}
-
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
-    fallback_input_tokens: i32,
-    tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(
-        model,
-        fallback_input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
 
 /// 创建缓冲 SSE 事件流
 ///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-    hook: UsageRecordHook,
-    credential_id: u64,
-    tracer: std::sync::Arc<RequestTracer>,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            hook,
-            credential_id,
-            tracer,
-            0u64,
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                tracer.mark_first_token();
-                                sent_bytes += chunk.len() as u64;
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, 0, 0, credits, "error");
-                                // 缓冲模式 chunk 读取失败：上游中途断流
-                                tracer.finalize(
-                                    "interrupted",
-                                    Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&e.to_string()),
-                                    Some(sent_bytes),
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: 0,
-                                        cache_read_tokens: 0,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    },
-                                );
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                            }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
-                                // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
-                                // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, credits) = ctx.final_usage();
-                                let trace_usage = TraceUsage {
-                                    input_tokens: i.max(0) as u64,
-                                    output_tokens: o.max(0) as u64,
-                                    cache_creation_tokens: 0,
-                                    cache_read_tokens: 0,
-                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                };
-                                if let Some(message) = ctx.tool_json_error_message() {
-                                    hook.record(credential_id, i, o, 0, 0, credits, "error");
-                                    tracer.finalize(
-                                        "error",
-                                        Some(outcome::BAD_REQUEST),
-                                        Some(&message),
-                                        None,
-                                        trace_usage,
-                                    );
-                                } else {
-                                    hook.record(credential_id, i, o, 0, 0, credits, "success");
-                                    tracer.finalize("success", None, None, None, trace_usage);
-                                }
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .flatten()
-}
 
 #[cfg(test)]
 mod tests {
@@ -1962,8 +1540,13 @@ mod tests {
         assert_eq!(content[2]["text"], "final answer");
     }
 
+    /// 回归锁：legacy `<thinking>` XML 提取已移除，只认原生 reasoningContentEvent。
+    ///
+    /// 上游若把思考写进正文标签（2026-07 实测 claude-opus-5 从不这样：406 个
+    /// reasoning 事件全部走原生模式），这里不再解析成 thinking 块，正文原样输出。
+    /// 伪造出的 thinking 块带不了真 signature，回传上游必然验签失败。
     #[test]
-    fn non_stream_legacy_thinking_extraction_still_works_without_native_reasoning() {
+    fn non_stream_does_not_extract_legacy_xml_thinking() {
         let content = build_non_stream_content(
             true,
             "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
@@ -1972,15 +1555,13 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "thinking");
-        assert_eq!(content[0]["thinking"], "legacy thinking");
+        assert_eq!(content.len(), 1, "不应再拆出 thinking 块");
+        assert_eq!(content[0]["type"], "text");
         assert_eq!(
-            content[0]["signature"],
-            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
+            content[0]["text"],
+            "<thinking>legacy thinking</thinking>\n\nfinal answer",
+            "正文应原样保留，不做 XML 提取"
         );
-        assert_eq!(content[1]["type"], "text");
-        assert_eq!(content[1]["text"], "final answer");
     }
 
     #[test]
@@ -2072,7 +1653,7 @@ mod tests {
     fn dynamic_models_merge_metadata_and_do_not_use_input_limit_as_output_limit() {
         let models = aggregate_available_models(vec![
             UpstreamModel {
-                model_id: "glm-5".to_string(),
+                model_id: "claude-opus-5".to_string(),
                 model_name: None,
                 description: Some("first".to_string()),
                 token_limits: Some(TokenLimits {
@@ -2081,8 +1662,8 @@ mod tests {
                 }),
             },
             UpstreamModel {
-                model_id: "glm-5".to_string(),
-                model_name: Some("GLM 5".to_string()),
+                model_id: "claude-opus-5".to_string(),
+                model_name: Some("Claude Opus 5".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
                     max_input_tokens: Some(1_000_000),
@@ -2092,39 +1673,60 @@ mod tests {
         ]);
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].display_name, "GLM 5");
-        assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].display_name, "Claude Opus 5");
+        // owned_by 按模型名前缀推断：claude-* → anthropic
+        assert_eq!(models[0].owned_by, "anthropic");
         assert_eq!(models[0].max_tokens, 32_000);
     }
 
+    /// 回归锁：`/v1/models` 只能列出白名单内的模型。
+    ///
+    /// 上游动态发现会返回账号可用的全部模型，但本部署严格只服务两个。若把白名单外
+    /// 的模型也列出来，客户端会看到「能选但一用就 400」的假选项。
     #[test]
-    fn custom_model_metadata_overrides_dynamic_collision() {
-        let custom = crate::model::config::CustomModel {
-            id: "gpt-next".to_string(),
-            backend_id: "gpt-next".to_string(),
-            display_name: Some("Configured GPT".to_string()),
-            context_window: Some(500_000),
-            max_tokens: Some(12_345),
-            supports_reasoning: Some(true),
-            owned_by: Some("configured-owner".to_string()),
-        };
-        let models = aggregate_available_models_with_custom(
-            vec![UpstreamModel {
-                model_id: "gpt-next".to_string(),
-                model_name: Some("Upstream GPT".to_string()),
+    fn available_models_only_lists_allowlisted() {
+        let upstream = vec![
+            UpstreamModel {
+                model_id: "claude-opus-5".to_string(),
+                model_name: Some("Claude Opus 5".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(300_000),
-                    max_output_tokens: Some(64_000),
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(128_000),
                 }),
-            }],
-            &[custom],
-        );
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: Some("GPT 5.6 Sol".to_string()),
+                description: None,
+                token_limits: None,
+            },
+            // 以下都在白名单外，必须被过滤掉
+            UpstreamModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6-terra".to_string(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "deepseek-3.2".to_string(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+        ];
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].display_name, "Configured GPT");
-        assert_eq!(models[0].owned_by, "configured-owner");
-        assert_eq!(models[0].max_tokens, 12_345);
+        let ids: Vec<String> = aggregate_available_models(upstream)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["claude-opus-5", "gpt-5.6-sol"]);
     }
 
     #[test]

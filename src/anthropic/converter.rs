@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
+    ReasoningContent,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::{
@@ -209,74 +210,7 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
     }
 }
 
-fn canonical_version(parts: &[&str]) -> Option<String> {
-    let first = *parts.first()?;
-    if parts.len() == 1
-        && first.contains('.')
-        && first
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-    {
-        return Some(first.to_string());
-    }
-    if !first.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    match parts {
-        [_, second] if second.chars().all(|c| c.is_ascii_digit()) => {
-            Some(format!("{}.{}", first, second))
-        }
-        [_] => Some(first.to_string()),
-        _ => None,
-    }
-}
 
-/// 规范化 Anthropic 客户端常见的 Claude ID，同时不猜测非 Claude 模型。
-fn normalize_claude_model(model: &str) -> Option<String> {
-    let mut normalized = model.to_ascii_lowercase();
-    loop {
-        let mut stripped_suffix = false;
-        for suffix in ["-thinking", "-latest"] {
-            if let Some(stripped) = normalized.strip_suffix(suffix) {
-                normalized = stripped.to_string();
-                stripped_suffix = true;
-            }
-        }
-        if !stripped_suffix {
-            break;
-        }
-    }
-    if let Some((base, suffix)) = normalized.rsplit_once('-')
-        && suffix.len() == 8
-        && suffix.chars().all(|c| c.is_ascii_digit())
-    {
-        normalized = base.to_string();
-    }
-
-    let body = normalized.strip_prefix("claude-")?;
-    const FAMILIES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "mythos"];
-
-    for family in FAMILIES {
-        if let Some(rest) = body.strip_prefix(family) {
-            let rest = rest
-                .strip_prefix('-')
-                .or_else(|| rest.strip_prefix('.'))
-                .unwrap_or(rest);
-            let version_parts: Vec<&str> = rest.split('-').collect();
-            let version = canonical_version(&version_parts)?;
-            return Some(format!("claude-{}-{}", family, version));
-        }
-    }
-
-    // 旧式日期 ID 把系列名放在版本之后，例如 claude-3-5-sonnet-20241022。
-    let parts: Vec<&str> = body.split('-').collect();
-    let family_index = parts.iter().position(|part| FAMILIES.contains(part))?;
-    if family_index == 0 || family_index + 1 != parts.len() {
-        return None;
-    }
-    let version = canonical_version(&parts[..family_index])?;
-    Some(format!("claude-{}-{}", parts[family_index], version))
-}
 
 /// 把客户端模型名映射到上游 Kiro modelId。
 ///
@@ -1701,6 +1635,8 @@ fn convert_assistant_message(
     mode: ToolCompatibilityMode,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
+    let mut thinking_signature: Option<String> = None;
+    let mut redacted_thinking: Option<String> = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -1712,9 +1648,23 @@ fn convert_assistant_message(
             for item in arr {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
+                        // 历史思考走上游的结构化 `reasoningContent` 字段，**不再**拼成
+                        // `<thinking>` 塞进 content。原因：上游解密 signature 重建思维链，
+                        // content 里的明文对模型无效，只会污染上下文并诱导模型把内部
+                        // 推理写进可见输出。Smithy union 每条消息只能带一个 reasoning
+                        // 块，故多个 thinking 块的文本累加、签名取最后一个非空值。
                         "thinking" => {
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                            }
+                            if let Some(sig) = block.signature.filter(|s| !s.is_empty()) {
+                                thinking_signature = Some(sig);
+                            }
+                        }
+                        // 加密思考：原样回传 base64 内容（与 reasoningText 互斥）。
+                        "redacted_thinking" => {
+                            if let Some(data) = block.data.filter(|d| !d.is_empty()) {
+                                redacted_thinking = Some(data);
                             }
                         }
                         "text" => {
@@ -1740,19 +1690,10 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    let has_reasoning = redacted_thinking.is_some() || !thinking_content.is_empty();
+    // content 只放可见正文；思考走 `reasoningContent` 结构化字段。
+    // Kiro API 要求 content 非空，仅有 tool_use / 仅有思考时用空格占位。
+    let final_content = if text_content.is_empty() && (!tool_uses.is_empty() || has_reasoning) {
         " ".to_string()
     } else {
         text_content
@@ -1761,6 +1702,14 @@ fn convert_assistant_message(
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
+    }
+    // union 二选一：加密思考优先（它本身就是上游下发的完整密文），
+    // 否则用明文 + 签名。签名缺失时仍下发 text —— Smithy 里 signature 是可选字段。
+    if let Some(data) = redacted_thinking {
+        assistant = assistant.with_reasoning_content(ReasoningContent::redacted(data));
+    } else if !thinking_content.is_empty() {
+        assistant = assistant
+            .with_reasoning_content(ReasoningContent::text(thinking_content, thinking_signature));
     }
 
     Ok(HistoryAssistantMessage {
@@ -1782,6 +1731,9 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // `reasoningContent` 是 Smithy union，合并后的单条消息只能带一个。
+    // 保留最后一条非空的：它对应最近一次推理，与紧随其后的 tool_use 配对。
+    let mut merged_reasoning: Option<ReasoningContent> = None;
 
     for msg in messages {
         let converted = convert_assistant_message(msg, tool_name_map, mode)?;
@@ -1792,9 +1744,14 @@ fn merge_assistant_messages(
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
         }
+        if let Some(rc) = am.reasoning_content {
+            merged_reasoning = Some(rc);
+        }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
+    let content = if content_parts.is_empty()
+        && (!all_tool_uses.is_empty() || merged_reasoning.is_some())
+    {
         " ".to_string()
     } else {
         content_parts.join("\n\n")
@@ -1803,6 +1760,9 @@ fn merge_assistant_messages(
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
+    }
+    if let Some(rc) = merged_reasoning {
+        assistant = assistant.with_reasoning_content(rc);
     }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
@@ -2968,8 +2928,24 @@ mod tests {
         let result = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        // 思考不再拼进 content，而是走结构化 reasoningContent（上游解密 signature
+        // 重建思维链，content 里的明文对模型无效且会污染上下文）。
+        assert!(
+            !content.contains("<thinking>"),
+            "content 不应再包含 thinking XML 标签"
+        );
         assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        let rc = result
+            .assistant_response_message
+            .reasoning_content
+            .as_ref()
+            .expect("合并后应保留 reasoningContent");
+        let rt = rc.reasoning_text.as_ref().expect("应为 reasoningText 分支");
+        assert!(
+            rt.text.contains("I should read the file"),
+            "应保留最后一条消息的思考文本, got: {}",
+            rt.text
+        );
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);

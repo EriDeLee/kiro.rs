@@ -548,6 +548,30 @@ impl KiroProvider {
                 "实际发送请求体: {}",
                 crate::security::body_log_summary(&body)
             );
+            // 诊断：历史 reasoningContent 是否真的下发（只报有无与长度，不含内容）。
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                let hist = v.pointer("/conversationState/history").and_then(|h| h.as_array());
+                if let Some(hist) = hist {
+                    let with_rc = hist
+                        .iter()
+                        .filter_map(|m| m.pointer("/assistantResponseMessage/reasoningContent"))
+                        .map(|rc| {
+                            let t = rc.pointer("/reasoningText/text").and_then(|v| v.as_str()).map_or(0, str::len);
+                            let sg = rc.pointer("/reasoningText/signature").and_then(|v| v.as_str()).map_or(0, str::len);
+                            let rd = rc.get("redactedContent").and_then(|v| v.as_str()).map_or(0, str::len);
+                            format!("text={t},sig={sg},redacted={rd}")
+                        })
+                        .collect::<Vec<_>>();
+                    if !with_rc.is_empty() {
+                        tracing::debug!(
+                            "history reasoningContent x{}: [{}]",
+                            with_rc.len(),
+                            with_rc.join(" | ")
+                        );
+                    }
+                }
+            }
+
             // 诊断：只打 additionalModelRequestFields（推理档位），不含任何对话内容。
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 tracing::debug!(

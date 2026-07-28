@@ -170,7 +170,6 @@ async fn main() {
     ));
 
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
-    model::custom_models::init(config.custom_models.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -382,9 +381,17 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey      = {}（每次启动时同步为系统 Key）", api_key);
-                tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
-                tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
+                // 首次生成配置时用户必须拿到密钥，但不能留在日志文件里（日志常被
+                // 打包上传排查）。改为 stdout 直出 + 日志只留指纹，便于事后核对
+                // 「当前生效的 key 是不是我记的那个」而不泄露原文。
+                println!("  apiKey      = {}（每次启动时同步为系统 Key）", api_key);
+                println!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
+                println!("请妥善保存上述密钥，可在配置文件中修改");
+                tracing::info!(
+                    "  apiKey 指纹 = {} / adminApiKey 指纹 = {}",
+                    security::key_fingerprint(&api_key),
+                    security::key_fingerprint(&admin_api_key)
+                );
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),
         }
