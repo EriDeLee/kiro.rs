@@ -247,17 +247,34 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
     model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_OPUS_5)
 }
 
-/// 本次请求是否请求了原生 reasoning。
+/// 取出一条消息里的可见文本（拼接所有 text 块）。
 ///
+/// 用于 assistant prefill 转换：只关心 text，其余块类型（thinking / tool_use /
+/// image）在 prefill 场景下不会出现 —— opencode 的 MAX_STEPS_PROMPT 是纯 text。
+fn collect_message_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(|v| v.as_str()).unwrap_or("text") == "text"
+            })
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// 客户端是否请求了原生 reasoning。
 ///
 /// 三处信号任一成立即算，必须与 [`select_native_reasoning_effort`] 的取值链一致：
 ///   - `thinking` 启用（adaptive / enabled）
-///   - **顶层 `effort`** —— opencode v1.18.5 的位置，也是 `/v1/responses` 把
-///     `reasoning.effort` 搬进来的落点（那条路径 thinking / output_config 恒为 None）
+///   - `req.effort` —— `/v1/responses` 的内部通路（那条路径 thinking /
+///     output_config 恒为 None，见 `MessagesRequest::effort`）
 ///   - `output_config.effort` —— Anthropic 官方位置
 ///
-/// 漏掉顶层 `effort` 会让 GPT 请求在此直接短路，`additionalModelRequestFields`
+/// 漏掉 `req.effort` 会让 GPT 请求在此直接短路，`additionalModelRequestFields`
 /// 返回 None，上游收不到档位而回落 default —— 即「虚假推理强度」。
 fn native_reasoning_requested(req: &MessagesRequest) -> bool {
     req.thinking.as_ref().is_some_and(|t| t.is_enabled())
@@ -286,7 +303,8 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 /// 推导；再统一过 [`normalize_effort_for_model`]（按模型把 xhigh 安全降级等）。
 /// 选定最终下发的 effort 档位。
 ///
-/// 优先级：**顶层 `effort`**（opencode 实际位置）> `output_config.effort`（官方位置）
+/// 优先级：`req.effort`（`/v1/responses` 内部通路）> `output_config.effort`（Anthropic
+/// 官方规范，也是 `@ai-sdk/anthropic` 的实际线格式）
 /// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 默认 `high`（与上游 default 一致）。
 /// 随后按该模型实测枚举裁剪。
 fn select_native_reasoning_effort(
@@ -616,19 +634,54 @@ pub fn convert_request_with_mode(
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. assistant prefill：Kiro 上游不支持，直接拒绝而非静默丢弃。
+    // 2.5. assistant prefill：Kiro 上游没有预填槽位，转成末尾 user 指令而非丢弃。
     //
-    // 旧行为是截断到最后一条 user 消息并继续，调用方拿到 200 却完全不知道自己的
-    // prefill 被扔了 —— 模型的回答不再受那段预填约束，结果与预期不符却无从察觉。
-    if req.messages.last().is_some_and(|m| m.role != "user") {
-        return Err(ConversionError::UnsupportedRequest(
-            "assistant prefill is not supported: the Kiro upstream has no slot for a \
-             pre-filled assistant turn. Remove the trailing assistant message; \
-             put the constraint in the user message or system prompt instead."
-                .to_string(),
-        ));
+    // opencode 在 agent 达到 `steps` 上限时会发一条末尾 assistant 消息
+    // （`session/prompt.ts` 的 MAX_STEPS_PROMPT，内容形如「已达最大步数，只许输出
+    // 文字」）—— 这是它的**合法正常流程**，不是客户端错误。默认四个内置 agent 都
+    // 没配 `steps`，但用户一旦配了，无条件 400 会把会话打死且错误信息难以溯源。
+    //
+    // prefill 的语义是「约束模型接下来的输出」，转成 user 消息末尾的指令语义损失
+    // 最小，也不丢任何信息。这不是静默降级：转换会记 warn。
+    let prefilled: Option<Vec<super::types::Message>> =
+        match req.messages.last().filter(|m| m.role != "user") {
+            None => None,
+            Some(tail) => {
+                let directive = collect_message_text(&tail.content);
+                if directive.trim().is_empty() {
+                    // 空 prefill 没有可转换的约束，直接去掉尾巴。
+                    tracing::warn!("末尾 assistant 消息为空，已移除（上游无 prefill 槽位）");
+                    Some(req.messages[..req.messages.len() - 1].to_vec())
+                } else {
+                    tracing::warn!(
+                        directive_len = directive.len(),
+                        "检测到 assistant prefill（常见来源：opencode 的 agent steps 上限），\
+                         上游无预填槽位，已转为末尾 user 指令"
+                    );
+                    let mut rebuilt = req.messages[..req.messages.len() - 1].to_vec();
+                    match rebuilt.last_mut().filter(|m| m.role == "user") {
+                        // 末尾已是 user：把指令并入该消息，避免产生连续 user 消息。
+                        Some(last_user) => {
+                            let mut merged = collect_message_text(&last_user.content);
+                            if !merged.is_empty() {
+                                merged.push_str("\n\n");
+                            }
+                            merged.push_str(&directive);
+                            last_user.content = serde_json::Value::String(merged);
+                        }
+                        None => rebuilt.push(super::types::Message {
+                            role: "user".to_string(),
+                            content: serde_json::Value::String(directive),
+                        }),
+                    }
+                    Some(rebuilt)
+                }
+            }
+        };
+    let messages: &[_] = prefilled.as_deref().unwrap_or(&req.messages);
+    if messages.is_empty() {
+        return Err(ConversionError::EmptyMessages);
     }
-    let messages: &[_] = &req.messages;
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
@@ -1686,6 +1739,28 @@ fn convert_assistant_message(
                         // 推理写进可见输出。Smithy union 每条消息只能带一个 reasoning
                         // 块，故多个 thinking 块的文本累加、签名取最后一个非空值。
                         "thinking" => {
+                            // 只回传带**真签名**的思考。
+                            //
+                            // 上游解密 signature 重建思维链，签名对不上会返回
+                            // `THINKING_SIGNATURE_INVALID`（本代理据此直接报错、不剥离
+                            // 重试）。而当上游本轮没下发真签名时，出站侧会填一个占位串
+                            // 以满足客户端「thinking 块必须带非空 signature」的本地校验
+                            // —— 那个占位串会被客户端原样回传到这里，若继续转发给上游
+                            // 就是**必然失败**的一次请求。
+                            //
+                            // 因此这里识别并丢弃占位签名的块：本轮用户照常看得到思考，
+                            // 下一轮不会因为一个假签名把整个会话打死。
+                            let is_placeholder = block
+                                .signature
+                                .as_deref()
+                                .is_some_and(|s| s == super::stream::THINKING_SIGNATURE_PLACEHOLDER);
+                            if is_placeholder {
+                                tracing::debug!(
+                                    "历史 thinking 块携带占位签名（上游本轮未下发真签名），\
+                                     已跳过回传以避免上游验签失败"
+                                );
+                                continue;
+                            }
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
                             }
@@ -2946,6 +3021,99 @@ mod tests {
         } else {
             panic!("应该是 Assistant 消息");
         }
+    }
+
+    /// 回归锁：assistant prefill 转成末尾 user 指令，不丢内容也不报错。
+    ///
+    /// opencode 在 agent 达到 `steps` 上限时会发末尾 assistant 消息
+    /// （MAX_STEPS_PROMPT），那是它的合法流程。Kiro 上游没有预填槽位，
+    /// 转成 user 指令语义损失最小。
+    #[test]
+    fn assistant_prefill_is_converted_to_trailing_user_directive() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_output_config("claude-opus-5");
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("do the thing"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "MAXIMUM STEPS REACHED. Respond with text only."}
+                ]),
+            },
+        ];
+
+        let result = convert_request(&req).expect("prefill 应被转换而非拒绝");
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        // 转换后末尾必须是 user 消息，且同时含原始提问与 prefill 指令。
+        assert!(current.contains("do the thing"), "原始 user 内容应保留: {current}");
+        assert!(
+            current.contains("MAXIMUM STEPS REACHED"),
+            "prefill 指令应并入 user 消息: {current}"
+        );
+        // 历史里不应再出现那条 assistant 消息（它已被并入 user）。
+        let rendered = serde_json::to_string(&result.conversation_state.history).unwrap();
+        assert!(
+            !rendered.contains("MAXIMUM STEPS REACHED"),
+            "prefill 不应同时留在历史里"
+        );
+    }
+
+    /// 回归锁：携带占位签名的历史 thinking 块不回传上游。
+    ///
+    /// 出站侧在上游未下发真签名时会填占位串（满足客户端「signature 必须非空」的
+    /// 本地校验），客户端下一轮会原样回传。若继续转发，上游验签必然失败 →
+    /// `THINKING_SIGNATURE_INVALID` → 会话被打死。真签名则必须原样回传。
+    #[test]
+    fn placeholder_signature_thinking_is_not_replayed_upstream() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let with_sig = |sig: &str| {
+            let mut req = minimal_request_with_output_config("claude-opus-5");
+            req.messages = vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("q1"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "internal reasoning", "signature": sig},
+                        {"type": "text", "text": "a1"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("q2"),
+                },
+            ];
+            convert_request(&req).expect("应转换成功")
+        };
+
+        // 占位签名 → 整块跳过，历史里没有 reasoningContent
+        let placeholder = with_sig(crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER);
+        let rendered = serde_json::to_string(&placeholder.conversation_state.history).unwrap();
+        assert!(
+            !rendered.contains("reasoningContent"),
+            "占位签名的思考不应回传: {rendered}"
+        );
+        assert!(rendered.contains("a1"), "可见正文仍应保留");
+
+        // 真签名 → 必须回传，且签名逐字节保真
+        let real = with_sig("CAISyRAKcAgQEAEYAipAREALSIG");
+        let rendered = serde_json::to_string(&real.conversation_state.history).unwrap();
+        assert!(
+            rendered.contains("CAISyRAKcAgQEAEYAipAREALSIG"),
+            "真签名必须原样回传: {rendered}"
+        );
+        assert!(rendered.contains("internal reasoning"), "思考文本应随签名回传");
     }
 
     #[test]

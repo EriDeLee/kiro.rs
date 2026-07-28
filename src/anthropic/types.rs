@@ -133,11 +133,17 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
-    /// 顶层 `effort`（非 Anthropic 官方规范，但 opencode v1.18.5 实际这么发）。
+    /// `/v1/responses` 转译时携带的推理档位（内部通路，**不是** Anthropic 线格式）。
     ///
-    /// 官方规范把档位放在 `output_config.effort`。两处都要接住，否则客户端调档位会
-    /// 被静默丢弃、永远回落默认 high —— 那就是「虚假推理强度」。
-    #[serde(default)]
+    /// OpenAI Responses 的 `reasoning.effort` 会落在这里，因为那条路径的
+    /// `thinking` 与 `output_config` 恒为 `None`（gpt-5.6-sol 的上游 schema 是
+    /// `additionalProperties:false` 且只接受 `reasoning`，发另两个会 400）。
+    ///
+    /// Anthropic 协议侧的档位一律走 `output_config.effort` —— 这是官方规范，也是
+    /// `@ai-sdk/anthropic` 的实际线格式（2026-07 抓包核验：2.0.91~4.0.23 共 11 个
+    /// 版本均把 `providerOptions.anthropic.effort` 降级到 `output_config.effort`，
+    /// 不存在顶层 `effort` 的线格式）。
+    #[serde(default, skip_serializing)]
     pub effort: Option<String>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
