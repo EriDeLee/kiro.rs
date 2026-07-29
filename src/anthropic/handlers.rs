@@ -478,8 +478,9 @@ fn aggregate_available_models_inner(
 
 /// 汇总可用模型清单。
 ///
-/// 只保留白名单内的模型：本部署严格只服务 `claude-opus-5`（/v1/messages）与
-/// `gpt-5.6-sol`（/v1/responses），其余一律在请求阶段 400。若这里仍列出白名单外
+/// 只保留白名单内的模型：本部署严格只服务 Claude 组（`claude-opus-5`、
+/// `claude-sonnet-5`，走 /v1/messages）与 GPT 组（`gpt-5.6-sol`、`gpt-5.6-terra`、
+/// `gpt-5.6-luna`，走 /v1/responses），其余一律在请求阶段 400。若这里仍列出白名单外
 /// 的模型，客户端会看到一个「能选但一用就报错」
 /// 的假选项 —— 配置与实际行为不一致，是最容易自己踩的坑。
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
@@ -580,12 +581,13 @@ pub async fn post_messages(
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
-    // 模型白名单 + 协议绑定校验：Anthropic 协议只服务 `claude-opus-5`。
+    // 模型白名单 + 协议绑定校验：Anthropic 协议只服务 Claude 组
+    // （`claude-opus-5`、`claude-sonnet-5`）。
     //
     // `/v1/responses` 会把 GPT 请求翻译成 MessagesRequest 后复用本函数，那条路径
     // 已在 `post_responses` 入口按 OpenAiResponses 协议校验过，并带上
     // [`InternalForward`] 标记，故跳过此处校验；外部直连一律按 Anthropic 协议判定
-    // —— 用 `/v1/messages` 请求 gpt-5.6-sol 必须被拒。
+    // —— 用 `/v1/messages` 请求任一 GPT 组模型必须被拒。
     if internal_forward.is_none()
         && let Err(rejected) = crate::model::allowlist::resolve(
             &payload.model,
@@ -1369,7 +1371,7 @@ fn build_non_stream_content(
 /// 白名单接受 `claude-opus-5-thinking` 作为 `claude-opus-5` 的别名（`allowlist`
 /// 只校验不改写 `payload.model`，所以后缀在此仍可见）。
 ///
-/// 上游 `claude-opus-5` 只接受 `thinking.type = adaptive`，发 `enabled` 会 400；
+/// 上游 Claude 族只接受 `thinking.type = adaptive`，发 `enabled` 会 400；
 /// 档位交给 `converter` 的取值链决定（顶层 effort > output_config > 默认 high），
 /// 此处不写死 `output_config`，否则会覆盖客户端显式指定的档位。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -1660,8 +1662,9 @@ mod tests {
 
     /// 回归锁：`/v1/models` 只能列出白名单内的模型。
     ///
-    /// 上游动态发现会返回账号可用的全部模型，但本部署严格只服务两个。若把白名单外
-    /// 的模型也列出来，客户端会看到「能选但一用就 400」的假选项。
+    /// 上游动态发现会返回账号可用的全部模型，但本部署只服务白名单里的 5 个
+    /// （Claude 组 2 个 + GPT 组 3 个）。若把白名单外的模型也列出来，客户端会看到
+    /// 「能选但一用就 400」的假选项。
     #[test]
     fn available_models_only_lists_allowlisted() {
         let upstream = vec![
@@ -1675,8 +1678,32 @@ mod tests {
                 }),
             },
             UpstreamModel {
+                model_id: "claude-sonnet-5".to_string(),
+                model_name: Some("Claude Sonnet 5".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(64_000),
+                }),
+            },
+            UpstreamModel {
                 model_id: "gpt-5.6-sol".to_string(),
                 model_name: Some("GPT 5.6 Sol".to_string()),
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6-terra".to_string(),
+                model_name: Some("GPT 5.6 Terra".to_string()),
+                description: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(272_000),
+                    max_output_tokens: Some(128_000),
+                }),
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6-luna".to_string(),
+                model_name: Some("GPT 5.6 Luna".to_string()),
                 description: None,
                 token_limits: None,
             },
@@ -1687,8 +1714,15 @@ mod tests {
                 description: None,
                 token_limits: None,
             },
+            // 相邻版本号：绝不能被误判成 claude-sonnet-5
             UpstreamModel {
-                model_id: "gpt-5.6-terra".to_string(),
+                model_id: "claude-sonnet-4.6".to_string(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6".to_string(),
                 model_name: None,
                 description: None,
                 token_limits: None,
@@ -1701,11 +1735,25 @@ mod tests {
             },
         ];
 
-        let ids: Vec<String> = aggregate_available_models(upstream)
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(ids, vec!["claude-opus-5", "gpt-5.6-sol"]);
+        let models = aggregate_available_models(upstream);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        // BTreeMap 排序：claude-* 在 gpt-* 之前
+        assert_eq!(
+            ids,
+            vec![
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+            ]
+        );
+        // sonnet-5 的输出上限是 64k，与 opus-5 的 128k 不同 —— 上游值必须原样透出，
+        // 不能被同族的另一个模型的值污染。
+        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5").unwrap();
+        assert_eq!(sonnet.max_tokens, 64_000);
+        let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
+        assert_eq!(opus.max_tokens, 128_000);
     }
 
     #[test]

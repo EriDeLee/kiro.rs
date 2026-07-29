@@ -203,44 +203,53 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
 
 /// 把客户端模型名映射到上游 Kiro modelId。
 ///
-/// 本部署只服务 Anthropic 协议上的 `claude-opus-5`，其余一律 `None`（由调用方回
-/// 400）。不做家族/版本号的模糊推断，也不再透传未知模型——透传等于把不受支持的
-/// id 直接甩给上游，换来一个语义不明的 400。
+/// 只认白名单内的模型（含别名后缀），其余一律 `None`（由调用方回 400）。不做
+/// 家族/版本号的模糊推断，也不再透传未知模型——透传等于把不受支持的 id 直接甩给
+/// 上游，换来一个语义不明的 400。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
     }
-    // 白名单是唯一权威：只认 claude-opus-5 与 gpt-5.6-sol（含别名后缀），
-    // 其余一律 None。协议与模型的一对一绑定由端点层（handlers / responses）校验，
-    // 这里不区分协议——converter 是两条端点共用的下游。
+    // 白名单是唯一权威：只认 Claude 组（claude-opus-5 / claude-sonnet-5）与
+    // GPT 组（gpt-5.6-sol / -terra / -luna），其余一律 None。协议与模型组的绑定
+    // 由端点层（handlers / responses）校验，这里不区分协议——converter 是两条
+    // 端点共用的下游。
     crate::model::allowlist::normalize(model).map(str::to_string)
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 根据模型名称返回对应的上下文窗口大小（`maxInputTokens`）。
 ///
-/// 上下文窗口，取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`。
+/// 取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`，按协议族分组：
 ///
-/// 本端点只服务 `claude-opus-5`（1M in / 128k out）。
+/// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：1,000,000
+/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：272,000
+///   （官方 1.05M，Kiro 卡在 272k）
+///
+/// 这个值参与 contextUsageEvent 的百分比 → 绝对 token 数换算，取错会让上报的
+/// input_tokens 系统性偏差，进而误导客户端的上下文压缩时机。
+///
+/// 注：输出上限（opus-5 128k / sonnet-5 64k / gpt 族 128k）不在此函数职责内 ——
+/// `/v1/models` 的 `max_tokens` 直接取上游 `maxOutputTokens`，本函数只管输入窗口。
 pub fn get_context_window_size(model: &str) -> i32 {
-    use crate::model::allowlist::{MODEL_GPT_56_SOL, MODEL_OPUS_5};
-    match map_model(model).as_deref() {
-        Some(MODEL_OPUS_5) => 1_000_000,
-        // 实测 `ListAvailableModels`：gpt-5.6-sol 的 maxInputTokens 是 272,000
-        // （官方 1.05M，Kiro 卡在 272k）。这个值参与 contextUsageEvent 的百分比 →
-        // 绝对 token 数换算，取错会让上报的 input_tokens 系统性偏小 ~26%，
-        // 进而误导客户端的上下文压缩时机。
-        Some(MODEL_GPT_56_SOL) => 272_000,
+    use crate::model::allowlist::{Protocol, protocol_for_model};
+    match map_model(model).as_deref().and_then(protocol_for_model) {
+        Some(Protocol::Anthropic) => 1_000_000,
+        Some(Protocol::OpenAiResponses) => 272_000,
         // 白名单之外的模型走不到这里（map_model 已返回 None），保留保守默认值。
-        _ => 200_000,
+        None => 200_000,
     }
 }
 
-/// 是否向该模型下发 `additionalModelRequestFields.output_config`。
+/// 是否向该模型下发 `additionalModelRequestFields.output_config` + `thinking`。
 ///
-/// 实测 `claude-opus-5` 的 schema 接受 `output_config.effort ∈
-/// {low,medium,high,xhigh,max}` 与 `thinking.{type,display}`。本端点只服务它。
+/// 实测 Claude 族（`claude-opus-5`、`claude-sonnet-5`）的 schema 接受
+/// `output_config.effort ∈ {low,medium,high,xhigh,max}` 与 `thinking.{type,display}`；
+/// GPT 族只接受 `reasoning`，走另一条分支。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
-    model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_OPUS_5)
+    matches!(
+        crate::model::allowlist::protocol_for_model(model_id),
+        Some(crate::model::allowlist::Protocol::Anthropic)
+    )
 }
 
 /// 取出一条消息里的可见文本（拼接所有 text 块）。
@@ -331,7 +340,7 @@ fn select_native_reasoning_effort(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
-    /// 仅 gpt-5.6-sol 支持；claude-opus-5 的枚举里没有这一档。
+    /// 仅 GPT 族（gpt-5.6-sol / -terra / -luna）支持；Claude 族的枚举里没有这一档。
     None,
     Low,
     Medium,
@@ -365,16 +374,20 @@ impl EffortTier {
     }
 }
 
-/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema）。
+/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema），按协议族分组。
 ///
-/// - `claude-opus-5`：low / medium / high / xhigh / max（**无 none**）
-/// - `gpt-5.6-sol` ：none / low / medium / high / xhigh / max
+/// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：low / medium / high / xhigh / max
+///   （**无 none**）
+/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：
+///   none / low / medium / high / xhigh / max
 fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
     use EffortTier::*;
-    if model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_GPT_56_SOL) {
-        &[None, Low, Medium, High, XHigh, Max]
-    } else {
-        &[Low, Medium, High, XHigh, Max]
+    use crate::model::allowlist::{Protocol, protocol_for_model};
+    match protocol_for_model(model_id) {
+        Some(Protocol::OpenAiResponses) => &[None, Low, Medium, High, XHigh, Max],
+        // Claude 族与白名单外的兜底都用不含 none 的五档：白名单外的模型走不到这里
+        // （map_model 已 None），保守取更严格的枚举。
+        _ => &[Low, Medium, High, XHigh, Max],
     }
 }
 
@@ -428,8 +441,13 @@ fn build_additional_model_request_fields(
 
     let effort = select_native_reasoning_effort(req, model_id)?;
 
-    // 两个模型的推理字段路径完全不同，按实测 schema 分流，不做任何互相兼容。
-    if model_id.eq_ignore_ascii_case(crate::model::allowlist::MODEL_GPT_56_SOL) {
+    // 两个协议族的推理字段路径完全不同（GPT 族只认 `reasoning`，Claude 族只认
+    // `output_config` + `thinking`），按实测 schema 分流，不做任何互相兼容。
+    // 族内所有模型的字段路径一致，因此按族判断而非逐个模型 id。
+    if matches!(
+        crate::model::allowlist::protocol_for_model(model_id),
+        Some(crate::model::allowlist::Protocol::OpenAiResponses)
+    ) {
         return Ok(Some(AdditionalModelRequestFields {
             thinking: None,
             output_config: None,
@@ -448,7 +466,7 @@ fn build_additional_model_request_fields(
     Ok(None)
 }
 
-/// 构造 `additionalModelRequestFields.thinking`（仅 claude-opus-5）。
+/// 构造 `additionalModelRequestFields.thinking`（仅 Claude 族：opus-5 / sonnet-5）。
 ///
 /// 上游只接受 `type ∈ {adaptive, disabled}`，发 `enabled` 会 400；且 effort 为
 /// `xhigh`/`max` 时连 `disabled` 也被拒。冲突时**整体不下发 thinking 字段**，让上游
@@ -1177,7 +1195,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    // 本部署只服务 claude-opus-5 / gpt-5.6-sol，两者都走 Kiro 原生 reasoning 字段
+    // 白名单内的模型（Claude 组 / GPT 组）都走 Kiro 原生 reasoning 字段
     // （output_config.effort / reasoning.effort），因此不再注入 `<thinking_mode>`
     // prompt 标签 —— 上游版本对该注入**无模型门控**，会与原生 effort 同时下发：
     // 既污染历史上下文，又把推理强度变成「写在提示词里的字面量」而非上游真实档位。
@@ -1587,7 +1605,7 @@ mod tests {
             "应列出支持档位: {msg}"
         );
 
-        // gpt-5.6-sol 独有的 none 档：opus-5 不支持，同样拒绝而非回落
+        // GPT 族独有的 none 档：Claude 族不支持，同样拒绝而非回落
         let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "none");
         let err = convert_request(&req).expect_err("opus-5 不支持 none 档");
         assert!(format!("{err:?}").contains("not supported by model"));
@@ -1599,6 +1617,100 @@ mod tests {
             .additional_model_request_fields
             .expect("应下发 output_config");
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
+    /// 白名单从 2 个模型扩到 5 个后，档位枚举必须按**协议族**分组，而不是只认
+    /// 当初那一个 id。漏改的后果是新模型拿到错误的枚举：sonnet-5 会被误允许 `none`
+    /// （上游 400），terra/luna 会被误拒 `none`（客户端合法请求被拒）。
+    #[test]
+    fn effort_tiers_are_grouped_by_protocol_family() {
+        use crate::model::allowlist::{
+            MODEL_GPT_56_LUNA, MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_OPUS_5, MODEL_SONNET_5,
+        };
+
+        for model in [MODEL_OPUS_5, MODEL_SONNET_5] {
+            let tiers = model_effort_tiers(model);
+            assert!(
+                !tiers.contains(&EffortTier::None),
+                "{model}（Claude 族）不能有 none 档"
+            );
+            assert_eq!(tiers.len(), 5, "{model} 应为五档");
+        }
+        for model in [MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA] {
+            let tiers = model_effort_tiers(model);
+            assert!(
+                tiers.contains(&EffortTier::None),
+                "{model}（GPT 族）必须有 none 档"
+            );
+            assert_eq!(tiers.len(), 6, "{model} 应为六档");
+        }
+    }
+
+    /// 每个白名单模型的 effort 必须真的按族落到正确的字段路径。
+    ///
+    /// Claude 族 → `output_config` + `thinking`（`reasoning` 必须 absent）；
+    /// GPT 族 → 只有 `reasoning`（`output_config` / `thinking` 必须 absent，
+    /// 否则上游 400 REQUEST_BODY_INVALID）。
+    #[test]
+    fn reasoning_fields_route_by_protocol_family() {
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            let req = minimal_adaptive_thinking_request_with_effort(model, "max");
+            let fields = convert_request(&req)
+                .unwrap_or_else(|e| panic!("{model} 应转换成功: {e:?}"))
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
+            assert_eq!(
+                fields.output_config.expect("Claude 族应有 output_config").effort,
+                "max",
+                "{model}"
+            );
+            assert!(
+                fields.reasoning.is_none(),
+                "{model}（Claude 族）不能下发 reasoning"
+            );
+        }
+
+        // GPT 族走内部通路（`/v1/responses` 把 reasoning.effort 放进顶层 effort）
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let mut req = minimal_request_with_effort(model, "high");
+            req.output_config = None;
+            req.effort = Some("none".to_string());
+            let fields = convert_request(&req)
+                .unwrap_or_else(|e| panic!("{model} 应转换成功: {e:?}"))
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
+            assert_eq!(
+                fields.reasoning.expect("GPT 族应有 reasoning").effort,
+                "none",
+                "{model} 的 none 档必须被接受"
+            );
+            assert!(
+                fields.output_config.is_none(),
+                "{model}（GPT 族）不能下发 output_config"
+            );
+            assert!(
+                fields.thinking.is_none(),
+                "{model}（GPT 族）不能下发 thinking"
+            );
+        }
+    }
+
+    /// 上下文窗口必须按族取值：错了会让 contextUsage 百分比 → 绝对 token 的换算
+    /// 系统性偏差，误导客户端的上下文压缩时机。
+    #[test]
+    fn context_window_size_matches_measured_limits() {
+        // Claude 族 1M in
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-thinking"), 1_000_000);
+        // GPT 族 272k in（官方 1.05M，Kiro 卡在 272k）
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5-6-terra"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+        // 白名单外 → 保守默认值（这条路径实际走不到，端点层已 400）
+        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 200_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
     }
 
     // ---- Fix 3: 原生 thinking effort 下发拓宽 + budget 推导 ----

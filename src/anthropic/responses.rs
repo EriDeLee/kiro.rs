@@ -152,8 +152,9 @@ pub async fn post_responses(
     );
 
     // 0. 模型白名单 + 协议绑定校验。
-    //    本端点只服务 gpt-5.6-sol；用 OpenAI 协议请求 Claude 模型会被明确拒绝，
-    //    不做任何跨协议兼容（两者的推理字段路径与请求体形状根本不同）。
+    //    本端点只服务 GPT 组（gpt-5.6-sol / -terra / -luna）；用 OpenAI 协议请求
+    //    Claude 模型会被明确拒绝，不做任何跨协议兼容（两族的推理字段路径与请求体
+    //    形状根本不同）。
     if let Err(rejected) = crate::model::allowlist::resolve(
         &model,
         crate::model::allowlist::Protocol::OpenAiResponses,

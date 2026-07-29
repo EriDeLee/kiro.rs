@@ -17,14 +17,19 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 
 ## 一、项目目标（硬边界）
 
-只服务两个模型，协议与模型**严格一对一绑定**：
+只服务 5 个模型，协议与模型组**严格绑定**（一协议一组模型）：
 
-| 端点 | 唯一允许的模型 | 推理档位字段 |
+| 端点 | 允许的模型 | 推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5` | `output_config.effort` |
-| `POST /v1/responses` | `gpt-5.6-sol` | `reasoning.effort` |
+| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5` | `output_config.effort` |
+| `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
-配套端点：`GET /v1/models`、`POST /v1/messages/count_tokens`。**路由总数 4 条**，新增端点需要明确理由。
+同族内推理字段路径与请求体形状完全一致，扩充模型只是多几个 id，对本项目无新增成本；
+跨族则根本不同。字段路径、上下文窗口、effort 枚举一律按**族**分流
+（`allowlist::protocol_for_model`），禁止再逐个模型 `eq_ignore_ascii_case` —— 那种写法
+在加模型时必然漏改，漏改的后果是静默走错字段路径。
+
+配套端点：`GET /v1/models`、`POST /v1/messages/count_tokens`。**路由总数 4 条**（模型数变化不影响路由数），新增端点需要明确理由。
 
 绝对禁止：
 
@@ -219,16 +224,17 @@ graceful shutdown 失效。
 
 | 批 | 覆盖 | 关键判据 |
 |---|---|---|
-| 1 | 白名单与协议隔离 | 白名单外模型全 400；协议交叉双向 400；`-thinking`/`-latest` 别名 200 |
+| 1 | 白名单与协议隔离 | 白名单内 5 个模型各在对应端点 200（Claude 组 2 个走 `/v1/messages`、GPT 组 3 个走 `/v1/responses`）；白名单外模型全 400（含相邻版本 `claude-sonnet-4.6`、`claude-opus-4.8`）；协议交叉双向 400（Claude 组任一走 `/v1/responses`、GPT 组任一走 `/v1/messages`）；`-thinking`/`-latest`/日期戳别名 200 |
 | 2 | 已移除端点 absent | `/cc/v1/*`、`/v1/chat/completions` 全 404 |
-| 3 | 推理档位全矩阵 | opus 五档全 200、`none`/非法值 400；gpt 六档全 200、非法 400 |
-| 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>` |
+| 3 | 推理档位全矩阵 | Claude 组五档全 200、`none`/非法值 400；GPT 组六档全 200、非法 400 |
+| 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>`（Claude 组两个模型都要验） |
 | 5 | signature 端到端 | 真签名回传后模型能基于历史推理续算；占位签名被剔除不打死会话 |
 | 6 | 工具 schema 透传 | 工具名与 input_schema 原样下发；仅超长名缩短 + 入站还原 |
 | 7 | 静默降级已移除 | prefill 转换 200 + warn；坏 JSON / 空 messages 400 |
 | 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0 |
 | 9 | graceful shutdown | SIGTERM → 落盘计数与日志吻合 |
 | 10 | 全局代理现取 | 见 §3.8 反向判据 |
+| 11 | 多模型白名单 | 5 个模型 × 正确端点 200 / 错误端点 400；同族 effort 枚举一致；白名单外 11 个模型两端点全 400 |
 
 配置项类改动（如 `extractThinking`、`traceEnabled`）需要**单独起实例**，它们只在启动时读取。
 测试客户端行为时不必安装该客户端 —— 从其源码读出真实的工具 id / 参数形状后手工
@@ -246,6 +252,24 @@ graceful shutdown 失效。
 
 三项都过之后再跑一遍端到端实测（§3.10），因为上游改动可能落在我方改过的同一文件里。
 
+### 3.12 写断言前先读实现，不要让证据服从预期
+
+本轮连续犯了四次同类错误，共同点是**先形成预期，再让证据服从预期**：
+
+| 预期 | 实际 | 后果 |
+|---|---|---|
+| `pgrep -f 'cargo\|rustc'` 只匹配编译进程 | 匹配到含该模式的自身 grep 命令 | 判断"编译进程在重生"，连杀五六轮，实际根本没有编译在跑 |
+| `"    }\n"` 能定位函数结尾 | 匹配到内层 `match` 的闭合括号 | 删函数留下 4 行残骸，`unexpected closing delimiter` |
+| 优先级高的凭据就该被选中 | priority 模式下 `current_id` 是**粘性**的 | 写出错误断言，测试失败 |
+| 同族模型 effort 枚举一致 | 恰好成立 | 但当时只是推断，未实测就写进了代码分支 |
+
+前两条是 §3.9 / §3.5 已记录的坑，写下之后自己又踩。规律：**改动前先读实现确认语义，
+断言失败时先怀疑自己的假设而不是代码**。第三条尤其典型 —— 测试挂了，挂的是我新加的
+断言，而被测代码的行为是设计意图。
+
+同理，把「推断」写进代码分支前要标注它未经实测，或者干脆先实测。第四条虽然结果正确，
+但当时若不成立，按族分流就是错的。
+
 ---
 
 ## 四、已固化的实测结论
@@ -254,11 +278,27 @@ graceful shutdown 失效。
 
 ### 4.1 上游 Kiro 协议
 
-**推理档位 schema**（2026-07-26 实测 `ListAvailableModels`）：
+**推理档位 schema**（2026-07-26 实测 `ListAvailableModels`，2026-07-29 复测补齐 sonnet-5 / terra / luna）：
 
-- `claude-opus-5`：`output_config.effort ∈ {low,medium,high,xhigh,max}`（default `high`）；`thinking.type ∈ {adaptive, disabled}`（**无 `enabled`**，发了会 400）；`thinking.display ∈ {summarized, omitted}`（上游默认 `omitted`，会吞掉思考文本）；1M in / 128k out
-- `gpt-5.6-sol`：**只有** `reasoning`，`additionalProperties: false`。`reasoning.effort ∈ {none,low,medium,high,xhigh,max}`；`reasoning.mode ∈ {standard, pro}`。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`；272k in / 128k out
+推理字段路径与 effort 枚举**按协议族一致**，同族内各模型无差异；只有窗口大小逐模型不同。
+这一条不是从 schema 推断的，而是 2026-07-29 端到端实测确认：GPT 族三个模型 `effort=none`
+全部 200、Claude 族两个模型 `effort=none` 全部 400、五个模型 `effort=bogus` 全部 400。
+
+- **Claude 族**（`claude-opus-5`、`claude-sonnet-5`）：`output_config.effort ∈ {low,medium,high,xhigh,max}`（default `high`，**无 `none`**）；`thinking.type ∈ {adaptive, disabled}`（**无 `enabled`**，发了会 400）；`thinking.display ∈ {summarized, omitted}`（上游默认 `omitted`，会吞掉思考文本）
+- **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，`additionalProperties: false`。`reasoning.effort ∈ {none,low,medium,high,xhigh,max}`（default `high`）；`reasoning.mode ∈ {standard, pro}`。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`
 - `effort=xhigh|max` 与 `thinking.type=disabled` 冲突时**整体不下发 thinking 字段**，绝不反向改写 effort
+
+**窗口大小**（`tokenLimits`，2026-07-29 实测）：
+
+| 模型 | maxInputTokens | maxOutputTokens |
+|---|---|---|
+| `claude-opus-5` | 1,000,000 | 128,000 |
+| `claude-sonnet-5` | 1,000,000 | **64,000** |
+| `gpt-5.6-sol` | 272,000 | 128,000 |
+| `gpt-5.6-terra` | 272,000 | 128,000 |
+| `gpt-5.6-luna` | 272,000 | 128,000 |
+
+`get_context_window_size` 只取 `maxInputTokens`（Claude 族 1M / GPT 族 272k），它参与 contextUsage 百分比 → 绝对 token 换算，取错会让上报的 input_tokens 系统性偏差。`maxOutputTokens` 由 `/v1/models` 从上游原样透出 —— 注意 `claude-sonnet-5` 是 64k，与同族 opus-5 的 128k 不同，不可按族推断。
 
 **prompt cache 不可用**（端到端实证）：
 

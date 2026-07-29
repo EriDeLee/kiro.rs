@@ -75,7 +75,7 @@ pub struct Thinking {
     pub budget_tokens: i32,
     /// 思考内容展示方式：`summarized` / `omitted`。
     ///
-    /// 上游 claude-opus-5 缺省 `omitted`（不回传思考文本）；客户端 SDK 会主动
+    /// 上游 Claude 族缺省 `omitted`（不回传思考文本）；客户端 SDK 会主动
     /// 发 `summarized` 要回来，所以必须接住并透传，否则思考内容会被上游吞掉。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
@@ -136,7 +136,7 @@ pub struct MessagesRequest {
     /// `/v1/responses` 转译时携带的推理档位（内部通路，**不是** Anthropic 线格式）。
     ///
     /// OpenAI Responses 的 `reasoning.effort` 会落在这里，因为那条路径的
-    /// `thinking` 与 `output_config` 恒为 `None`（gpt-5.6-sol 的上游 schema 是
+    /// `thinking` 与 `output_config` 恒为 `None`（GPT 族的上游 schema 是
     /// `additionalProperties:false` 且只接受 `reasoning`，发另两个会 400）。
     ///
     /// Anthropic 协议侧的档位一律走 `output_config.effort` —— 这是官方规范，也是

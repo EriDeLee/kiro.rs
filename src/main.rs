@@ -328,11 +328,11 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("监听地址: {}", addr);
-    tracing::info!("可用 API（模型与协议严格一对一绑定，跨协议请求返回 400）:");
+    tracing::info!("可用 API（一协议一组模型，严格绑定；跨协议请求返回 400）:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages              [claude-opus-5]");
+    tracing::info!("  POST /v1/messages              [claude-opus-5, claude-sonnet-5]");
     tracing::info!("  POST /v1/messages/count_tokens");
-    tracing::info!("  POST /v1/responses             [gpt-5.6-sol]");
+    tracing::info!("  POST /v1/responses             [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]");
     tracing::info!("Admin: /api/admin/* + UI /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

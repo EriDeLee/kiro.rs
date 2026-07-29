@@ -43,9 +43,9 @@ pub struct KiroRequest {
     ///     "output_config": { "effort": "max" }
     /// }
     /// ```
-    /// 档位枚举按模型而异，见 `converter::model_effort_tiers`：
-    /// `claude-opus-5` 接受 low/medium/high/xhigh/max，
-    /// `gpt-5.6-sol` 额外接受 none。
+    /// 档位枚举按协议族而异，见 `converter::model_effort_tiers`：
+    /// Claude 族（claude-opus-5 / claude-sonnet-5）接受 low/medium/high/xhigh/max，
+    /// GPT 族（gpt-5.6-sol / -terra / -luna）额外接受 none。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
@@ -57,7 +57,7 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// `thinking` 控制（仅 claude-opus-5 接受）。
+    /// `thinking` 控制（仅 Claude 族接受：claude-opus-5 / claude-sonnet-5）。
     ///
     /// 实测 schema：`type ∈ {adaptive, disabled}`（**没有 `enabled`**）、
     /// `display ∈ {summarized, omitted}`，`display` 缺省为 `omitted`（吞掉思考文本）。
@@ -68,13 +68,13 @@ pub struct AdditionalModelRequestFields {
     pub output_config: Option<KiroOutputConfig>,
     /// GPT 系的推理档位路径：`reasoning.effort`。
     ///
-    /// gpt-5.6-sol 的 schema 是 `additionalProperties:false` 且**只有** `reasoning`，
+    /// GPT 族的 schema 是 `additionalProperties:false` 且**只有** `reasoning`，
     /// 向它下发 `output_config` / `max_tokens` / `thinking` 都会 400。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<KiroReasoningConfig>,
 }
 
-/// `thinking` 控制（claude-opus-5）。
+/// `thinking` 控制（Claude 族：claude-opus-5 / claude-sonnet-5）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroThinkingConfig {
     #[serde(rename = "type")]
@@ -83,7 +83,7 @@ pub struct KiroThinkingConfig {
     pub display: Option<String>,
 }
 
-/// `reasoning` 控制（gpt-5.6-sol）。`effort` 额外支持 `none` 档。
+/// `reasoning` 控制（GPT 族：gpt-5.6-sol / -terra / -luna）。`effort` 额外支持 `none` 档。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroReasoningConfig {
     pub effort: String,
@@ -91,8 +91,8 @@ pub struct KiroReasoningConfig {
 
 /// The effort control field recognized by the AWS Q backend
 ///
-/// 档位枚举按模型而异：`claude-opus-5` 为 low/medium/high/xhigh/max，
-/// `gpt-5.6-sol` 额外接受 none。不受支持的档位会在 converter 层直接报错，
+/// 档位枚举按协议族而异：Claude 族为 low/medium/high/xhigh/max，
+/// GPT 族额外接受 none。不受支持的档位会在 converter 层直接报错，
 /// 不静默回落。
 ///
 /// Measured (via a ladder experiment), the same prompt between `low` and `max` differs

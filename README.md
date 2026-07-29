@@ -6,12 +6,16 @@
 
 本分支的 schema 严格对齐 **[Vercel AI SDK](https://ai-sdk.dev)**（`@ai-sdk/anthropic` / `@ai-sdk/openai`）的实际线格式 —— 该 SDK 是当前 agent 客户端的事实标准，其线格式与官方 REST 规范存在差异之处一律以 SDK 抓包为准。
 
-本分支**只服务两个模型，协议与模型严格一对一绑定**，跨协议请求一律拒绝。
+本分支**只服务 5 个模型，协议与模型组严格绑定**（一协议一组模型），跨协议请求一律拒绝。
 
-| 端点 | 唯一允许的模型 | 推理档位字段 |
+| 端点 | 允许的模型 | 推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5` | `output_config.effort` |
-| `POST /v1/responses` | `gpt-5.6-sol` | `reasoning.effort` |
+| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5` | `output_config.effort` |
+| `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
+
+同族内推理字段路径一致，跨族则根本不同（GPT 族只认 `reasoning`，下发 `output_config` /
+`thinking` 会被上游 400）。白名单是穷举的：上游账号里的 `claude-sonnet-4.6`、
+`claude-opus-4.8`、`glm-5`、`auto` 等一律 400，不做家族/版本号模糊推断。
 
 工程约定见 [AGENTS.md](AGENTS.md)
 
@@ -26,7 +30,7 @@
 | **历史推理真实回传**<br><sub>请求侧 `assistantResponseMessage.reasoningContent`</sub> | ✅ | ❌ 拼 `<thinking>` 进 content<sup>1</sup> | ❌ | ❌ 直接丢弃 |
 | **真 signature 透传** | ✅ | ✅ | ❌ | ❌ 一律占位符 |
 | **gpt-5.6 `reasoning.effort`** | ✅ | ❌ 塞进 `output_config`<sup>2</sup> | ❌ | ✅ |
-| **模型白名单 + 协议隔离** | ✅ 跨协议 400 | ❌ 未知模型透传 | ❌ | ❌ |
+| **模型白名单 + 协议隔离** | ✅ 一协议一组模型，跨协议 400 | ❌ 未知模型透传 | ❌ | ❌ |
 | **prompt cache 计量** | 已移除<sup>3</sup> | 本地伪造 | 本地伪造 | 本地伪造 |
 | **静默降级** | 全部移除<sup>4</sup> | 存在 | 存在 | 存在 |
 | `<invoke>` XML 泄漏捞回 | ✅ | ✅ | ❌ | ❌ |
@@ -37,7 +41,7 @@
 
 <sup>1</sup> Anthropic 官方明确：模型靠解密 `signature` 重建思维链，`thinking` 字段的明文**被忽略**。拼进 content 只会浪费上下文，并诱导模型把内部推理写进可见输出。
 
-<sup>2</sup> `gpt-5.6-sol` 的上游 schema 是 `additionalProperties: false` 且只接受 `reasoning`，塞 `output_config` 会被 400 拒绝——表现为推理档位完全不生效。
+<sup>2</sup> GPT 族（`gpt-5.6-sol` / `-terra` / `-luna`）的上游 schema 是 `additionalProperties: false` 且只接受 `reasoning`，塞 `output_config` 会被 400 拒绝——表现为推理档位完全不生效。
 
 <sup>3</sup> 端到端实证：请求侧 `cachePoint` 被静默丢弃（同形状 bogus 字段同样返回 200），响应侧 `metadataEvent` 只含 `stopReason`、无 `tokenUsage`。上游缓存隐式生效且免费（重复长前缀 credit ×0.528），但中转层拿不到明细，任何计量都是本地伪造。
 
@@ -102,10 +106,10 @@ cargo build --release
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/messages` | Anthropic Messages，仅 `claude-opus-5` |
+| `POST` | `/v1/messages` | Anthropic Messages，仅 `claude-opus-5` / `claude-sonnet-5` |
 | `POST` | `/v1/messages/count_tokens` | Token 估算，覆盖 text / tool_use / tool_result / image / thinking |
-| `POST` | `/v1/responses` | OpenAI Responses，仅 `gpt-5.6-sol` |
-| `GET` | `/v1/models` | 模型列表，仅列白名单内的两个 |
+| `POST` | `/v1/responses` | OpenAI Responses，仅 `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` |
+| `GET` | `/v1/models` | 模型列表，仅列白名单内的 5 个 |
 | — | `/api/admin/*` | Admin API（43 个端点，需 `adminApiKey`） |
 | — | `/admin` | Admin Web UI |
 
@@ -114,7 +118,7 @@ cargo build --release
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（542 个）
+cargo test --release                      # 后端测试（540 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

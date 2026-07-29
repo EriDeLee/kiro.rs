@@ -1206,18 +1206,16 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
 
 fn credential_matches_request(
     credentials: &KiroCredentials,
-    model: Option<&str>,
+    _model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
-    // 精确比较，不做 `contains("opus")` 式模糊匹配 —— 白名单只有两个模型，
-    // 模糊匹配是多模型时代的遗留（AGENTS.md §1 明令禁止）。
-    let is_opus = model
-        .is_some_and(|m| m.eq_ignore_ascii_case(crate::model::allowlist::MODEL_OPUS_5));
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
-    }
-
+    // 只做分组匹配。**按模型的凭据过滤完全交给 `cached_model_support`**
+    // （读真实 `ListAvailableModels`，逐条比对 model_id）。
+    //
+    // 此处曾有一道 `supports_opus()` 订阅门槛（`!title.contains("FREE")`），已移除：
+    // 它是猜测性启发式，且是**硬否决**——上游明明报告支持某模型，也会因订阅标题被
+    // 永久排除且不自愈。唯一起作用的窗口是模型缓存尚为 Unknown 的首次请求，
+    // 而那一次放行的代价只是一趟上游 400，远小于「凭据对某模型永久隐形」。
     group_matches(&credentials.groups, group)
 }
 
@@ -6197,6 +6195,55 @@ mod tests {
         assert_eq!(models[0].model_id, "glm-5");
     }
 
+    /// 回归锁：`credential_matches_request` **不得**按订阅档位否决任何模型。
+    ///
+    /// 曾有一道 `supports_opus()` 门槛（`!subscription_title.contains("FREE")`）在此
+    /// 硬否决 opus-5 请求。已移除，原因：
+    ///
+    /// 1. 它是猜测性启发式，而按凭据的精确过滤由 `cached_model_support` 负责
+    ///    （读真实 `ListAvailableModels` 逐条比对 model_id），后者已能排除
+    ///    上游确实不支持该模型的凭据。
+    /// 2. 它是**硬否决且不自愈**：上游明确报告支持某模型时也会因订阅标题永久排除，
+    ///    客户端只看到「无可用凭据」——静默的能力缩减（AGENTS.md §2.3）。
+    /// 3. 实测：Free 账号不能用 opus-5，但**可以**用 sonnet-5。若把门槛推广到
+    ///    Claude 族，Free 凭据对 sonnet-5 会彻底隐形；只对 opus-5 生效又只是
+    ///    在重复 `cached_model_support` 已经做对的事。
+    ///
+    /// 唯一让它起作用的窗口是模型缓存尚为 Unknown 的首次请求，而那一次放行的代价
+    /// 只是一趟上游 400（且随即被缓存修正），远小于凭据永久隐形。
+    #[test]
+    fn credential_match_does_not_gate_on_subscription_tier() {
+        let mut free = grouped_cred("free", &[]);
+        free.subscription_title = Some("KIRO FREE".to_string());
+
+        // 白名单全部 5 个模型都不因订阅档位被拦
+        for model in [
+            crate::model::allowlist::MODEL_OPUS_5,
+            crate::model::allowlist::MODEL_SONNET_5,
+            crate::model::allowlist::MODEL_GPT_56_SOL,
+            crate::model::allowlist::MODEL_GPT_56_TERRA,
+            crate::model::allowlist::MODEL_GPT_56_LUNA,
+        ] {
+            assert!(
+                credential_matches_request(&free, Some(model), None),
+                "{model}: 订阅档位不应参与凭据匹配（该职责属 cached_model_support）"
+            );
+        }
+
+        // 分组隔离仍然生效 —— 这才是本函数的唯一职责
+        let bound = grouped_cred("bound", &["g1"]);
+        assert!(credential_matches_request(
+            &bound,
+            Some(crate::model::allowlist::MODEL_OPUS_5),
+            Some("g1")
+        ));
+        assert!(!credential_matches_request(
+            &bound,
+            Some(crate::model::allowlist::MODEL_OPUS_5),
+            Some("g2")
+        ));
+    }
+
     #[test]
     fn test_group_matches_helper() {
         // 未绑定分组(None)匹配任何账号
@@ -6239,35 +6286,56 @@ mod tests {
         assert!(manager.select_next_credential(None, None).is_some());
     }
 
+    /// 回归锁：优先级最高的 current_id 不得绕过**按模型的凭据过滤**。
+    ///
+    /// 过滤依据是 `cached_model_support`（真实 `ListAvailableModels` 清单），
+    /// **不是**订阅档位标题 —— 后者那道 `supports_opus()` 门槛已移除，理由见
+    /// `credential_match_does_not_gate_on_subscription_tier`。
+    ///
+    /// 这里显式预置模型缓存来表达「上游说 #1 不支持 opus-5、#2 支持」，
+    /// 而不是靠 `subscription_title` 间接暗示。
     #[tokio::test]
     async fn test_acquire_context_priority_current_respects_model_support() {
-        let mut free_cred = grouped_cred("free", &[]);
-        free_cred.subscription_title = Some("KIRO FREE".to_string());
-
         let mut pro_cred = grouped_cred("pro", &[]);
-        pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![free_cred, pro_cred],
+            vec![grouped_cred("limited", &[]), pro_cred],
             None,
             None,
             false,
         )
         .unwrap();
 
-        // Warm current_id with the highest-priority Free account.
+        // 上游清单：#1 只有 sonnet-5，#2 两个都有。
+        seed_model_cache(&manager, 1, &["claude-sonnet-5"]);
+        seed_model_cache(&manager, 2, &["claude-opus-5", "claude-sonnet-5"]);
+
+        // 先把 current_id 预热到优先级最高的 #1。
         let current = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
+        // 请求 opus-5：#1 被上游清单排除，必须切到 #2。
         let opus = manager
             .acquire_context(Some("claude-opus-5"), None)
             .await
             .unwrap();
         assert_eq!(
             opus.id, 2,
-            "priority current_id must not bypass Opus subscription filtering"
+            "current_id 不得绕过 cached_model_support 的按模型过滤"
+        );
+
+        // 再请求 sonnet-5：priority 模式下 current_id 是**粘性**的 —— 上一步已切到 #2，
+        // 而 #2 也支持 sonnet-5，就继续用 #2，不会因为 #1 优先级更高而切回去。
+        // 这是设计意图（避免无谓切换），不是就近选优先级。
+        let sonnet = manager
+            .acquire_context(Some("claude-sonnet-5"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sonnet.id, 2,
+            "current_id 对该模型仍可用时应保持粘性，不因优先级切换"
         );
     }
 
