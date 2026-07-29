@@ -381,8 +381,6 @@ export interface ClientKeyItem {
   totalCalls: number
   totalInputTokens: number
   totalOutputTokens: number
-  totalCacheCreationTokens: number
-  totalCacheReadTokens: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
@@ -451,8 +449,6 @@ export interface TimeSeriesPoint {
   ts: string
   inputTokens: number
   outputTokens: number
-  cacheCreationTokens: number
-  cacheReadTokens: number
   calls: number
   errors: number
   credits: number
@@ -516,11 +512,7 @@ export interface TraceRecord {
   inputTokens?: number
   /** 输出 token */
   outputTokens?: number
-  /** 缓存创建 token */
-  cacheCreationTokens?: number
-  /** 缓存读取 token */
-  cacheReadTokens?: number
-  /** 总 token = input + output + cache_creation + cache_read */
+  /** 总 token = input + output */
   totalTokens?: number
   /** 费用（credits） */
   credits?: number

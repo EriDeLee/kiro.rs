@@ -4,9 +4,9 @@
 //! [`MessagesRequest`]，复用 [`super::handlers::post_messages`] 的完整链路，
 //! 再把 Anthropic 响应翻译回 Responses 格式。
 //!
-//! 为什么需要这个端点：Codex CLI 自 0.122 起移除了 `wire_api = "chat"`，
+//! 为什么需要这个端点：`@ai-sdk/openai` 的 `languageModel()` 默认走 Responses API，
 //! 只支持 `wire_api = "responses"`——即向 `<base_url>/responses` POST，
-//! 走 OpenAI 的 Responses API 协议（本部署唯一的 OpenAI 端点）。对 Codex
+//! 它是本部署唯一的 OpenAI 端点。对该 SDK
 //! 无效，必须提供 Responses 端点。
 //!
 //! 工具桥接（完整 codex 能力的关键）：codex 的工具按声明类型分两类，

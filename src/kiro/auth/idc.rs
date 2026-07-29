@@ -184,7 +184,16 @@ pub async fn poll_token(
             "slow_down" => return PollResult::Pending,
             "expired_token" => return PollResult::Expired,
             "access_denied" => return PollResult::Error(anyhow::anyhow!("用户拒绝了授权请求")),
-            _ => {}
+            other => {
+                // 带上 `error_description`：OIDC 规范用它承载人类可读的失败原因，
+                // 排障时比裸错误码有用得多。此前该字段解析出来却从不使用。
+                return PollResult::Error(match err_resp.error_description.as_deref() {
+                    Some(desc) if !desc.trim().is_empty() => {
+                        anyhow::anyhow!("轮询令牌失败 {}: {} - {}", status, other, desc)
+                    }
+                    _ => anyhow::anyhow!("轮询令牌失败 {}: {}", status, other),
+                });
+            }
         }
     }
 

@@ -36,7 +36,7 @@ use super::middleware::{AppState, KeyContext};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    Thinking,
 };
 use super::websearch;
 
@@ -74,8 +74,6 @@ impl UsageRecordHook {
         credential_id: u64,
         input_tokens: i32,
         output_tokens: i32,
-        cache_creation_tokens: i32,
-        cache_read_tokens: i32,
         credits: f64,
         status: &str,
     ) {
@@ -86,8 +84,6 @@ impl UsageRecordHook {
             model: self.model.clone(),
             input_tokens: input_tokens.max(0) as u64,
             output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
             credits: if credits.is_finite() && credits > 0.0 {
                 credits
             } else {
@@ -108,8 +104,6 @@ impl UsageRecordHook {
                     self.key_id,
                     rec.input_tokens,
                     rec.output_tokens,
-                    rec.cache_creation_tokens,
-                    rec.cache_read_tokens,
                     rec.credits,
                 );
             }
@@ -143,8 +137,6 @@ pub(crate) struct RequestTracer {
 pub(crate) struct TraceUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
     pub credits: f64,
 }
 
@@ -218,8 +210,6 @@ impl RequestTracer {
             interrupted_after_bytes,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
             attempts,
@@ -495,7 +485,7 @@ fn aggregate_available_models_inner(
 ///
 /// 只保留白名单内的模型：本部署严格只服务 `claude-opus-5`（/v1/messages）与
 /// `gpt-5.6-sol`（/v1/responses），其余一律在请求阶段 400。若这里仍列出白名单外
-/// 的模型（含 config 里的 `customModels`），客户端会看到一个「能选但一用就报错」
+/// 的模型，客户端会看到一个「能选但一用就报错」
 /// 的假选项 —— 配置与实际行为不一致，是最容易自己踩的坑。
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     aggregate_available_models_inner(upstream_models)
@@ -629,7 +619,7 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -669,7 +659,7 @@ pub async fn post_messages(
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(0, input_tokens, 0, 0.0, status);
         return resp;
     }
 
@@ -713,7 +703,7 @@ pub async fn post_messages(
                 ),
             };
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, 0.0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -734,7 +724,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -765,8 +755,6 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
-
-    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
 
     if payload.stream {
         // 流式响应
@@ -838,7 +826,7 @@ async fn handle_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize(
                 "error",
@@ -1034,8 +1022,6 @@ fn record_stream_usage(
         credential_id,
         input,
         ctx.output_tokens,
-        0,
-        0,
         ctx.credits,
         status,
     );
@@ -1047,8 +1033,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     TraceUsage {
         input_tokens: input.max(0) as u64,
         output_tokens: ctx.output_tokens.max(0) as u64,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 0,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
             ctx.credits
         } else {
@@ -1081,7 +1065,7 @@ async fn handle_non_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, input_tokens, 0, 0.0, "error");
             tracer.finalize(
                 "error",
                 last_attempt_outcome(&tracer),
@@ -1100,7 +1084,7 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(credential_id, input_tokens, 0, 0.0, "error");
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
@@ -1247,7 +1231,7 @@ async fn handle_non_stream_request(
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
     if let Some(err) = tool_json_error {
         let message = err.message();
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(credential_id, input_tokens, 0, 0.0, "error");
         tracer.finalize(
             "error",
             Some(outcome::BAD_REQUEST),
@@ -1285,9 +1269,7 @@ async fn handle_non_stream_request(
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        (total_input_tokens, 0, 0);
+    let final_input_tokens = total_input_tokens;
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -1316,8 +1298,6 @@ async fn handle_non_stream_request(
         credential_id,
         final_input_tokens,
         output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
         credits,
         "success",
     );
@@ -1329,8 +1309,6 @@ async fn handle_non_stream_request(
         TraceUsage {
             input_tokens: final_input_tokens.max(0) as u64,
             output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
             credits: if credits.is_finite() && credits > 0.0 {
                 credits
             } else {
@@ -1397,39 +1375,32 @@ fn build_non_stream_content(
     content
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 模型名带 `-thinking` 后缀时开启思考。
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 白名单接受 `claude-opus-5-thinking` 作为 `claude-opus-5` 的别名（`allowlist`
+/// 只校验不改写 `payload.model`，所以后缀在此仍可见）。
+///
+/// 上游 `claude-opus-5` 只接受 `thinking.type = adaptive`，发 `enabled` 会 400；
+/// 档位交给 `converter` 的取值链决定（顶层 effort > output_config > 默认 high），
+/// 此处不写死 `output_config`，否则会覆盖客户端显式指定的档位。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    if !payload.model.to_lowercase().contains("thinking") {
+        return;
+    }
+    if payload.thinking.is_some() {
+        // 客户端已显式给了 thinking 配置，别名后缀不覆盖它。
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
-
     tracing::info!(
         model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
+        "模型名含 thinking 后缀，开启 adaptive thinking"
     );
-
     payload.thinking = Some(Thinking {
-        display: None,
-        thinking_type: thinking_type.to_string(),
+        thinking_type: "adaptive".to_string(),
         budget_tokens: 20000,
+        display: None,
     });
-
-    if is_opus_4_6 {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
-    }
 }
 
 /// POST /v1/messages/count_tokens

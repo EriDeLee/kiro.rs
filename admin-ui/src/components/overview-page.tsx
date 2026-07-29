@@ -397,7 +397,7 @@ function TrendTitle({ granularity }: { granularity: StatsGranularity }) {
     <div>
       <h2 className="text-base font-semibold tracking-tight">Token 使用趋势</h2>
       <p className="text-[12px] text-muted-foreground">
-        {granularity === 'day' ? '按天' : '按小时'}聚合 · 输入/输出/缓存读写
+        {granularity === 'day' ? '按天' : '按小时'}聚合 · 输入/输出
       </p>
     </div>
   )

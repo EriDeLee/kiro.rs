@@ -38,7 +38,7 @@ const MAX_WEB_SEARCH_ROUNDS: usize = 5;
 
 /// A valid assistant turn after a tool result must contain either visible text or
 /// another client tool call. Kiro occasionally closes a successful upstream stream
-/// without either, which used to be serialized as `end_turn` and made Codex mark an
+/// without either, which used to be serialized as `end_turn` and made the client mark an
 /// unfinished task complete. Retry once before surfacing an upstream error.
 const MAX_EMPTY_TOOL_RESULT_RETRIES: usize = 1;
 
@@ -174,7 +174,7 @@ fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
 }
 
 /// Decide how to handle a successful upstream round after tool output. Reasoning
-/// by itself is intentionally not enough: Codex needs either assistant text (a
+/// by itself is intentionally not enough: the client needs either assistant text (a
 /// real final answer) or a client tool call to keep the task lifecycle sound.
 fn empty_tool_result_disposition(
     payload: &MessagesRequest,
@@ -337,7 +337,7 @@ async fn run_round(
                     format!("unsupported tool mapping: {}", reason),
                 ),
             };
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, 0.0, "error");
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
         }
     };
@@ -350,7 +350,7 @@ async fn run_round(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            hook.record(0, 0, 0, 0.0, "error");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
@@ -362,7 +362,7 @@ async fn run_round(
     let call_result = match provider.call_api_stream(&request_body, None, group).await {
         Ok(r) => r,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(0, fallback_input_tokens, 0, 0.0, "error");
             return Err(map_provider_error(e));
         }
     };
@@ -377,7 +377,7 @@ async fn run_round(
     if outcome.stream_error {
         // The upstream stream was cut off mid-round; the decoded content is partial,
         // so fail the round instead of feeding truncated text/tool_use back into the loop.
-        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(0, fallback_input_tokens, 0, 0.0, "error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -390,7 +390,7 @@ async fn run_round(
     // 上游 tool JSON 非法 / 半截：与断流同等对待。降级成空参数再交给客户端执行，
     // 等于让它拿错误的参数真的去动文件或跑命令。
     if let Some(e) = &outcome.tool_json_error {
-        hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        hook.record(0, fallback_input_tokens, 0, 0.0, "error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(e.error_type(), e.message())),
@@ -529,22 +529,6 @@ fn resolve_flush_stop_reason(
     }
 }
 
-/// Builds the final flush content with the web_search invariant baked in:
-/// - any web_search tool_use becomes a `server_tool_use` + `web_search_tool_result`
-///   presentation pair (NEVER a raw `tool_use`, which the Codex host rejects);
-/// - client tools (exec, get_time, ...) are returned verbatim as raw `tool_use`.
-///
-/// `searched` corresponds one-to-one (same order) to `tool_uses`; entries for
-/// web_search carry the already-completed search results, client-tool entries
-/// are ignored (typically None).
-///
-/// `known_tool_names` is the set of tool names declared by the current request
-/// (client short/long names). It is used to run the SAME `<invoke>` text-leak fault
-/// tolerance as the streaming path (`stream.rs`): when the upstream model degrades
-/// and emits a literal `<invoke name="...">...</invoke>` inside its assistant TEXT,
-/// we reclaim it into a structured `tool_use` instead of passing the raw XML through.
-/// The web_search loop builds its own SSE/content and historically bypassed that
-/// fault tolerance entirely — this is the fix.
 /// Canonical, order-independent key for a tool_use `input` JSON value, used to
 /// detect that a reclaimed-from-text tool_use is identical to a structured one.
 /// `serde_json::Value`'s `Map` is a BTreeMap (or preserves order when the
@@ -560,6 +544,22 @@ fn canonical_input_key(input: &Value) -> String {
     }
 }
 
+/// Builds the final flush content with the web_search invariant baked in:
+/// - any web_search tool_use becomes a `server_tool_use` + `web_search_tool_result`
+///   presentation pair (NEVER a raw `tool_use`, which the client host rejects);
+/// - client tools (exec, get_time, ...) are returned verbatim as raw `tool_use`.
+///
+/// `searched` corresponds one-to-one (same order) to `tool_uses`; entries for
+/// web_search carry the already-completed search results, client-tool entries
+/// are ignored (typically None).
+///
+/// `known_tool_names` is the set of tool names declared by the current request
+/// (client short/long names). It is used to run the SAME `<invoke>` text-leak fault
+/// tolerance as the streaming path (`stream.rs`): when the upstream model degrades
+/// and emits a literal `<invoke name="...">...</invoke>` inside its assistant TEXT,
+/// we reclaim it into a structured `tool_use` instead of passing the raw XML through.
+/// The web_search loop builds its own SSE/content and historically bypassed that
+/// fault tolerance entirely — this is the fix.
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
@@ -576,7 +576,7 @@ fn build_flush_content(
         // returns a single text block identical to the old behavior.
         //
         // INVARIANT GUARD: `web_search` must NEVER be reclaimed as a raw client `tool_use`
-        // — the Codex host has no web_search executor and rejects it with
+        // — the client host has no web_search executor and rejects it with
         // "unsupported call: web_search". `known_tool_names` is copied verbatim from
         // req.tools and (since we are in the web_search loop) always contains "web_search",
         // so we strip it from the reclamation tool-table here. A leaked
@@ -720,8 +720,6 @@ pub(super) async fn run_web_search_loop(
                         last_credential_id,
                         final_input,
                         0,
-                        0,
-                        0,
                         total_credits,
                         "error",
                     );
@@ -777,8 +775,6 @@ pub(super) async fn run_web_search_loop(
                             last_credential_id,
                             fallback_input_tokens,
                             0,
-                            0,
-                            0,
                             total_credits,
                             "error",
                         );
@@ -798,7 +794,7 @@ pub(super) async fn run_web_search_loop(
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
         let final_input = last_context_input.unwrap_or(fallback_input_tokens);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
-        // as a raw tool_use (the Codex host has no executor for it and rejects it
+        // as a raw tool_use (the client host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
         // (web_search + exec) and the round-limit case: search every web_search call
         // in this final round here, then build the flushed content with web_search
@@ -826,8 +822,6 @@ pub(super) async fn run_web_search_loop(
                             last_credential_id,
                             fallback_input_tokens,
                             0,
-                            0,
-                            0,
                             total_credits,
                             "error",
                         );
@@ -850,7 +844,7 @@ pub(super) async fn run_web_search_loop(
             // 上游 `<invoke>` 泄漏里的 JSON 非法：与断流同等对待，不降级成空参数。
             Err(e) => {
                 tracing::error!("{}", e);
-                hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+                hook.record(0, fallback_input_tokens, 0, 0.0, "error");
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(ErrorResponse::new(e.error_type(), e.message())),
@@ -873,8 +867,6 @@ pub(super) async fn run_web_search_loop(
             last_credential_id,
             final_input,
             output_tokens,
-            0,
-            0,
             total_credits,
             "success",
         );
@@ -902,7 +894,7 @@ pub(super) async fn run_web_search_loop(
     }
 
     // Theoretically unreachable (the loop always returns)
-    hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    hook.record(last_credential_id, fallback_input_tokens, 0, total_credits, "error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
@@ -1388,7 +1380,7 @@ mod tests {
     // with a client tool (exec/get_time), the flush content must present web_search
     // as server_tool_use + web_search_tool_result (never raw tool_use), while the
     // client tool is returned verbatim. Previously the flush loop emitted
-    // {"type":"tool_use","name":"web_search"} which the Codex host rejected with
+    // {"type":"tool_use","name":"web_search"} which the client host rejected with
     // "unsupported call: web_search".
 
     fn fake_results(q: &str) -> Option<WebSearchResults> {

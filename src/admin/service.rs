@@ -1783,7 +1783,15 @@ impl AdminService {
             GITHUB_RELEASES_REPO
         );
         let token = self.update_config.lock().github_token.clone();
-        let mut req = reqwest::Client::new()
+        // 必须走全局代理：同类 GitHub 调用（限流查询、二进制下载）都过
+        // `build_http_client(proxy)`，只有这里曾用裸 `Client::new()`。在需要代理
+        // 出网的部署里那会让「检查更新」永久失败，而 `resolve_target_version`
+        // 一见到 warning 就返回 Err → pull / apply / 自动更新整条链不可用，
+        // 且报错方向完全指错（下载和限流查询其实是通的）。
+        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
+        let client = super::binary_update::build_http_client(proxy.as_deref())
+            .map_err(|e| AdminServiceError::InternalError(format!("创建 HTTP 客户端失败: {e}")))?;
+        let mut req = client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -2986,12 +2994,12 @@ impl AdminService {
 
     /// 分类删除凭据错误
     fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        // `delete_credential` 只会产生「不存在」或持久化失败两类错误 ——
+        // 它不要求凭据先禁用，故此处无需匹配「请先禁用凭据」之类的文案
+        // （那是 `update_refresh_token` 的前置条件，走不到这条路径）。
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
-        {
-            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

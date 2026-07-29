@@ -37,10 +37,6 @@ pub struct UsageRecord {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
     /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）
     #[serde(default)]
     pub credits: f64,
@@ -175,8 +171,6 @@ fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
 pub struct BucketStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
@@ -186,8 +180,6 @@ impl BucketStats {
     fn add(&mut self, rec: &UsageRecord) {
         self.input_tokens += rec.input_tokens;
         self.output_tokens += rec.output_tokens;
-        self.cache_creation_tokens += rec.cache_creation_tokens;
-        self.cache_read_tokens += rec.cache_read_tokens;
         self.credits += rec.credits;
         self.calls += 1;
         if rec.status != "success" {
@@ -199,8 +191,6 @@ impl BucketStats {
     fn add_stats(&mut self, other: &BucketStats) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
         self.credits += other.credits;
         self.calls += other.calls;
         self.errors += other.errors;
@@ -298,8 +288,6 @@ pub struct TimeSeriesPoint {
     pub ts: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
@@ -464,8 +452,6 @@ impl UsageAggregator {
                     ts: ts_to_rfc3339(b.ts),
                     input_tokens: stats.input_tokens,
                     output_tokens: stats.output_tokens,
-                    cache_creation_tokens: stats.cache_creation_tokens,
-                    cache_read_tokens: stats.cache_read_tokens,
                     calls: stats.calls,
                     errors: stats.errors,
                     credits: stats.credits,
@@ -728,8 +714,6 @@ mod tests {
             model: "claude-opus-4-7".to_string(),
             input_tokens: 1000,
             output_tokens: 200,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
@@ -766,8 +750,6 @@ mod tests {
             model: "m-a".to_string(),
             input_tokens: 100,
             output_tokens: 20,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
@@ -779,8 +761,6 @@ mod tests {
             model: "m-b".to_string(),
             input_tokens: 300,
             output_tokens: 40,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
@@ -833,8 +813,6 @@ mod tests {
             model: "m-yesterday".to_string(),
             input_tokens: 100,
             output_tokens: 20,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
@@ -846,8 +824,6 @@ mod tests {
             model: "m-today".to_string(),
             input_tokens: 300,
             output_tokens: 40,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
@@ -895,8 +871,6 @@ mod tests {
             model: "claude-opus-4-7".to_string(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),

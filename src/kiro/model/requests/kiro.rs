@@ -43,9 +43,9 @@ pub struct KiroRequest {
     ///     "output_config": { "effort": "max" }
     /// }
     /// ```
-    /// Effort tiers are model-dependent. Older 4.5/4.6 models accept
-    /// `low / medium / high / max`; newer effort-capable models may also
-    /// accept `xhigh`.
+    /// 档位枚举按模型而异，见 `converter::model_effort_tiers`：
+    /// `claude-opus-5` 接受 low/medium/high/xhigh/max，
+    /// `gpt-5.6-sol` 额外接受 none。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
@@ -91,9 +91,9 @@ pub struct KiroReasoningConfig {
 
 /// The effort control field recognized by the AWS Q backend
 ///
-/// Accepted tiers are model-dependent. Older 4.5/4.6 models accept
-/// `low / medium / high / max`; newer effort-capable models may also accept
-/// `xhigh`.
+/// 档位枚举按模型而异：`claude-opus-5` 为 low/medium/high/xhigh/max，
+/// `gpt-5.6-sol` 额外接受 none。不受支持的档位会在 converter 层直接报错，
+/// 不静默回落。
 ///
 /// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
 /// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,

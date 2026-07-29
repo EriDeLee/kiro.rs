@@ -59,7 +59,6 @@ pub struct McpError {
 
 /// MCP 结果
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct McpResult {
     pub content: Vec<McpContent>,
     #[serde(rename = "isError")]
@@ -222,13 +221,46 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
 /// 解析 MCP 响应中的搜索结果
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
     let result = mcp_response.result.as_ref()?;
-    let content = result.content.first()?;
 
-    if content.content_type != "text" {
+    // MCP 协议用 `isError` 标记工具执行失败，此时 content 装的是错误描述而不是
+    // 搜索结果。此前这个字段解析出来却从不检查，上游报错会被当成正常结果继续
+    // 往下走 —— 属于 AGENTS.md §2.3 禁止的静默降级。
+    if result.is_error {
+        let detail = result
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or("<no content>");
+        tracing::warn!("web_search MCP 返回 isError=true，放弃解析结果: {}", detail);
         return None;
     }
 
-    serde_json::from_str(&content.text).ok()
+    let content = result.content.first()?;
+    if content.content_type != "text" {
+        tracing::warn!(
+            content_type = %content.content_type,
+            "web_search MCP 返回了非 text 内容，无法解析"
+        );
+        return None;
+    }
+
+    let results: WebSearchResults = match serde_json::from_str(&content.text) {
+        Ok(results) => results,
+        Err(e) => {
+            // 解析失败不静默返回 None：上游给了 text 却不是预期结构，说明协议变了。
+            tracing::warn!("web_search 结果 JSON 解析失败（上游结构可能已变更）: {}", e);
+            return None;
+        }
+    };
+
+    // 载荷里的业务级错误同样要看：此前该字段解析出来从不检查，搜索服务报错会被
+    // 当成「搜到 0 条」，调用方无从区分「确实没结果」与「服务出错」。
+    if let Some(err) = results.error.as_deref().filter(|e| !e.trim().is_empty()) {
+        tracing::warn!("web_search 服务返回错误: {}", err);
+        return None;
+    }
+
+    Some(results)
 }
 
 /// 生成 WebSearch SSE 响应流

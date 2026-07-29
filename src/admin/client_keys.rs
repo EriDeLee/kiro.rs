@@ -38,10 +38,6 @@ pub struct ClientKey {
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
-    #[serde(default)]
-    pub total_cache_creation_tokens: u64,
-    #[serde(default)]
-    pub total_cache_read_tokens: u64,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -174,8 +170,6 @@ impl ClientKeyManager {
             total_calls: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
-            total_cache_creation_tokens: 0,
-            total_cache_read_tokens: 0,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -217,8 +211,6 @@ impl ClientKeyManager {
                     total_calls: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
-                    total_cache_creation_tokens: 0,
-                    total_cache_read_tokens: 0,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -417,8 +409,6 @@ impl ClientKeyManager {
                 e.total_calls = 0;
                 e.total_input_tokens = 0;
                 e.total_output_tokens = 0;
-                e.total_cache_creation_tokens = 0;
-                e.total_cache_read_tokens = 0;
                 e.total_credits = 0.0;
                 true
             }
@@ -453,21 +443,11 @@ impl ClientKeyManager {
     }
 
     /// 在请求结束时累计 Token 用量并落盘
-    pub fn record_usage(
-        &self,
-        id: u64,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
-        credits: f64,
-    ) {
+    pub fn record_usage(&self, id: u64, input_tokens: u64, output_tokens: u64, credits: f64) {
         let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get_mut(&id) {
             entry.total_input_tokens += input_tokens;
             entry.total_output_tokens += output_tokens;
-            entry.total_cache_creation_tokens += cache_creation_tokens;
-            entry.total_cache_read_tokens += cache_read_tokens;
             if credits.is_finite() && credits > 0.0 {
                 entry.total_credits += credits;
             }
@@ -549,14 +529,12 @@ mod tests {
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
-        mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
-        mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
+        mgr.record_usage(entry.id, 100, 50, 0.0);
+        mgr.record_usage(entry.id, 200, 30, 1.5);
         let list = mgr.list();
         let e = list.iter().find(|x| x.id == entry.id).unwrap();
         assert_eq!(e.total_input_tokens, 300);
         assert_eq!(e.total_output_tokens, 80);
-        assert_eq!(e.total_cache_creation_tokens, 5);
-        assert_eq!(e.total_cache_read_tokens, 10);
     }
 
     #[test]
@@ -570,7 +548,7 @@ mod tests {
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
-        mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
+        mgr.record_usage(entry.id, 100, 50, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
         assert_ne!(rotated.key, old_key);
@@ -612,7 +590,7 @@ mod tests {
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
         );
-        mgr.record_usage(0, 100, 50, 5, 10, 1.5);
+        mgr.record_usage(0, 100, 50, 1.5);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
         mgr.set_disabled(0, true);
 

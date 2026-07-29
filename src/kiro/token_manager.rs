@@ -470,16 +470,16 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+/// `getUsageLimits` 与 `ListAvailableModels` 这两个 REST 端点**不接受**
+/// profileArn —— 它只属于流式端点，带上会让请求格式非法。故 URL 与凭据无关。
+fn usage_limits_url(host: &str) -> String {
     format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
+fn available_models_url(host: &str) -> String {
     format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
 }
 
@@ -512,10 +512,9 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host);
 
         let mut request = client
             .get(&url)
@@ -553,7 +552,6 @@ pub(crate) async fn get_usage_limits(
                 region,
                 candidates[idx + 1]
             );
-            last_error = Some(format!("{} {}", status, body_text));
             continue;
         }
 
@@ -567,11 +565,12 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取使用额度: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    // 不可达：循环体对每个候选端点的所有路径都终止（成功 return、429 return、
+    // 403 且尚有备用端点 continue、其余 bail），而最后一个候选的 403 会落进
+    // error_msg 分支直接 bail —— 循环永远不会自然结束。
+    // 用 unreachable! 而非编造一个错误消息：若将来循环逻辑变动真能走到这里，
+    // 立刻 panic 暴露，而不是静默返回一条假的失败原因。
+    unreachable!("获取使用额度：候选端点循环必在内部终止")
 }
 
 /// 获取该凭据当前可用的模型列表
@@ -605,10 +604,9 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host);
 
         let mut request = client
             .get(&url)
@@ -646,7 +644,6 @@ pub(crate) async fn get_available_models(
                 region,
                 candidates[idx + 1]
             );
-            last_error = Some(format!("{} {}", status, body_text));
             continue;
         }
 
@@ -660,11 +657,12 @@ pub(crate) async fn get_available_models(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取可用模型: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    // 不可达：循环体对每个候选端点的所有路径都终止（成功 return、429 return、
+    // 403 且尚有备用端点 continue、其余 bail），而最后一个候选的 403 会落进
+    // error_msg 分支直接 bail —— 循环永远不会自然结束。
+    // 用 unreachable! 而非编造一个错误消息：若将来循环逻辑变动真能走到这里，
+    // 立刻 panic 暴露，而不是静默返回一条假的失败原因。
+    unreachable!("获取可用模型：候选端点循环必在内部终止")
 }
 
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
@@ -805,7 +803,6 @@ pub(crate) async fn set_user_preference(
         })
     };
 
-    let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
         let url = format!("https://{}/setUserPreference", host);
@@ -847,7 +844,6 @@ pub(crate) async fn set_user_preference(
                 region,
                 candidates[idx + 1]
             );
-            last_error = Some(format!("{} {}", status, body_text));
             continue;
         }
 
@@ -862,11 +858,12 @@ pub(crate) async fn set_user_preference(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法设置用户偏好: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    // 不可达：循环体对每个候选端点的所有路径都终止（成功 return、429 return、
+    // 403 且尚有备用端点 continue、其余 bail），而最后一个候选的 403 会落进
+    // error_msg 分支直接 bail —— 循环永远不会自然结束。
+    // 用 unreachable! 而非编造一个错误消息：若将来循环逻辑变动真能走到这里，
+    // 立刻 panic 暴露，而不是静默返回一条假的失败原因。
+    unreachable!("设置用户偏好：候选端点循环必在内部终止")
 }
 
 // ============================================================================
@@ -1212,9 +1209,10 @@ fn credential_matches_request(
     model: Option<&str>,
     group: Option<&str>,
 ) -> bool {
+    // 精确比较，不做 `contains("opus")` 式模糊匹配 —— 白名单只有两个模型，
+    // 模糊匹配是多模型时代的遗留（AGENTS.md §1 明令禁止）。
     let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
+        .is_some_and(|m| m.eq_ignore_ascii_case(crate::model::allowlist::MODEL_OPUS_5));
 
     if is_opus && !credentials.supports_opus() {
         return false;
@@ -2883,17 +2881,15 @@ impl MultiTokenManager {
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
+                    // 进入 `entries` 的凭据一定已规范化（唯一的 `entries.push` 处用了
+                    // `canonicalize_auth_method_value`，它把 builder-id / iam 一律转 idc），
+                    // 故此处无需再做别名映射。
+                    // 注意：`refresh_token()` 里同名的 builder-id / iam 判断**是活的** ——
+                    // `add_credential` 会把尚未规范化的 new_cred 直接传给它。
                     auth_method: if e.credentials.is_api_key_credential() {
                         Some("api_key".to_string())
                     } else {
-                        e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
-                            {
-                                "idc".to_string()
-                            } else {
-                                m.to_string()
-                            }
-                        })
+                        e.credentials.auth_method.clone()
                     },
                     provider: if e.credentials.is_api_key_credential() {
                         None
@@ -3190,76 +3186,9 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据直接使用 kiro_api_key，无需刷新
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 检查是否需要刷新 token
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        // token 准备（API Key 直用 / 过期则持锁双检刷新 / 持久化 / 重读快照）
+        // 统一走 prepare_request_token，避免多处各存一份逐字相同的副本。
+        let (token, credentials) = self.prepare_request_token(id).await?;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3442,76 +3371,9 @@ impl MultiTokenManager {
             anyhow::bail!("overageStatus 必须是 ENABLED 或 DISABLED");
         }
 
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据：直接当 Bearer 用
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 复用与 get_usage_limits_for 完全相同的过期检查与刷新逻辑
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        // token 准备统一走 prepare_request_token（此前这里是一份逐字复制的副本，
+        // 注释却写着「复用」—— 现在是真的复用）。
+        let (token, credentials) = self.prepare_request_token(id).await?;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3842,16 +3704,15 @@ impl MultiTokenManager {
 
     /// 删除凭据（Admin API）
     ///
-    /// # 前置条件
-    /// - 凭据必须已禁用（disabled = true）
+    /// 不要求凭据处于禁用状态 —— 直接删除。（`update_refresh_token` 才有
+    /// 「必须先禁用」的前置条件，两者别混。）
     ///
     /// # 行为
     /// 1. 验证凭据存在
-    /// 2. 验证凭据已禁用
-    /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
-    /// 5. 如果删除后没有凭据，将 current_id 重置为 0
-    /// 6. 持久化到文件
+    /// 2. 从 entries 移除
+    /// 3. 如果删除的是当前凭据，切换到优先级最高的可用凭据
+    /// 4. 如果删除后没有凭据，将 current_id 重置为 0
+    /// 5. 持久化到文件
     ///
     /// # 返回
     /// - `Ok(())` - 删除成功
@@ -3860,18 +3721,15 @@ impl MultiTokenManager {
         let was_current = {
             let mut entries = self.entries.lock();
 
-            // 查找凭据
-            let _entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
             // 记录是否是当前凭据
-            let current_id = *self.current_id.lock();
-            let was_current = current_id == id;
+            let was_current = *self.current_id.lock() == id;
 
-            // 删除凭据
+            // 一次 retain 兼做存在性检查：长度未变说明 id 不存在
+            let before = entries.len();
             entries.retain(|e| e.id != id);
+            if entries.len() == before {
+                anyhow::bail!("凭据不存在: {}", id);
+            }
 
             was_current
         };
@@ -4286,9 +4144,16 @@ impl MultiTokenManager {
     }
 }
 
-impl Drop for MultiTokenManager {
-    fn drop(&mut self) {
+impl MultiTokenManager {
+    /// 进程退出前把待落盘的统计写下去。
+    ///
+    /// `save_stats_debounced` 有 30 秒去抖窗口，窗口内的 success / last_used 变更
+    /// 只标脏不落盘。而 `Drop` 在生产中**不会执行**（`main` 用信号触发退出、另有
+    /// 多处 `process::exit`，且 `Arc<Self>` 还被 app state 持有），所以必须由
+    /// 关机流程显式调用本方法，否则最后 30 秒的统计会静默丢失。
+    pub fn flush_stats(&self) {
         if self.stats_dirty.load(Ordering::Relaxed) {
+            tracing::info!("退出前落盘凭据统计");
             self.save_stats();
         }
     }
@@ -5729,22 +5594,17 @@ mod tests {
         );
     }
 
+    /// 这两个 REST 端点的 URL 不含 profileArn（它只属于流式端点）。
     #[test]
     fn test_usage_rest_urls_omit_resolved_profile_arn() {
-        let credentials = KiroCredentials {
-            profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
-            ),
-            ..Default::default()
-        };
         let host = "q.us-east-1.amazonaws.com";
 
         assert_eq!(
-            usage_limits_url(host, &credentials),
+            usage_limits_url(host),
             "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
         );
         assert_eq!(
-            available_models_url(host, &credentials),
+            available_models_url(host),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
     }
@@ -6402,7 +6262,7 @@ mod tests {
         assert_eq!(current.id, 1);
 
         let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None)
+            .acquire_context(Some("claude-opus-5"), None)
             .await
             .unwrap();
         assert_eq!(

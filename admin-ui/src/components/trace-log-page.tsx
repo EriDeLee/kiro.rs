@@ -178,9 +178,7 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
 function TokenCell({ rec }: { rec: TraceRecord }) {
   const input = rec.inputTokens ?? 0
   const output = rec.outputTokens ?? 0
-  const cacheCreation = rec.cacheCreationTokens ?? 0
-  const cacheRead = rec.cacheReadTokens ?? 0
-  const total = rec.totalTokens ?? input + output + cacheCreation + cacheRead
+  const total = rec.totalTokens ?? input + output
   // 全 0（早期失败、未走到上游）时不显示明细，仅占位
   if (total === 0) {
     return <span className="text-muted-foreground">—</span>
@@ -189,15 +187,13 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
     ['输入 Token', input],
     ['输出 Token', output],
   ]
-  if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
-  if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
   return (
     <TooltipProvider delayDuration={150}>
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
             <span className="text-emerald-600 dark:text-emerald-400">
-              ↓{formatTokens(input + cacheCreation + cacheRead)}
+              ↓{formatTokens(input)}
             </span>
             <span className="text-violet-600 dark:text-violet-400">
               ↑{formatTokens(output)}

@@ -328,22 +328,58 @@ async fn main() {
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
-    tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("可用 API:");
+    tracing::info!("监听地址: {}", addr);
+    tracing::info!("可用 API（模型与协议严格一对一绑定，跨协议请求返回 400）:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages");
+    tracing::info!("  POST /v1/messages              [claude-opus-5]");
     tracing::info!("  POST /v1/messages/count_tokens");
-    tracing::info!("Admin API:");
-    tracing::info!("  GET  /api/admin/credentials");
-    tracing::info!("  POST /api/admin/credentials/:index/disabled");
-    tracing::info!("  POST /api/admin/credentials/:index/priority");
-    tracing::info!("  POST /api/admin/credentials/:index/reset");
-    tracing::info!("  GET  /api/admin/credentials/:index/balance");
-    tracing::info!("Admin UI:");
-    tracing::info!("  GET  /admin");
+    tracing::info!("  POST /v1/responses             [gpt-5.6-sol]");
+    tracing::info!("Admin: /api/admin/* + UI /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // 优雅关机：收到 Ctrl-C / SIGTERM 后停止接受新连接，并把去抖窗口内尚未落盘的
+    // 凭据统计写下去。`save_stats_debounced` 有 30 秒窗口，没有这一步的话
+    // 每次重启都会静默丢掉最后 30 秒的 success / last_used 计数。
+    let shutdown_tm = token_manager.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_tm.flush_stats();
+        })
+        .await
+        .unwrap();
+}
+
+/// 等待 Ctrl-C 或（Unix 上）SIGTERM。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("监听 Ctrl-C 失败: {}", e);
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => tracing::warn!("监听 SIGTERM 失败: {}", e),
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("收到 Ctrl-C，开始优雅关机"),
+            _ = terminate => tracing::info!("收到 SIGTERM，开始优雅关机"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        tracing::info!("收到 Ctrl-C，开始优雅关机");
+    }
 }
 
 /// 文件不存在时初始化配置/凭证文件

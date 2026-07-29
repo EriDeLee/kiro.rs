@@ -96,8 +96,6 @@ pub struct KiroCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -148,7 +146,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
@@ -158,8 +155,18 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    ///
+    /// 全局代理**每次现取** `token_manager.proxy()`，不能用构造时的快照 ——
+    /// Admin 的「设置全局代理」只更新 token_manager 里那一份，若这里读快照，
+    /// 改代理后控制面（token 刷新 / getUsageLimits / ListAvailableModels）走新代理，
+    /// 而数据面（`/v1/messages`、`/v1/responses`、MCP）仍走旧代理直到重启，
+    /// 界面却提示「已设置」—— 属于静默失效。
+    ///
+    /// `client_cache` 以 effective proxy 为 key，代理变更后 key 自然不同、
+    /// 会新建 client，无需额外失效。
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let global_proxy = self.token_manager.proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);

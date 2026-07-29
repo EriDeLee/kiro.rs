@@ -37,9 +37,12 @@ impl EventType {
             "reasoningContentEvent" => Self::ReasoningContent,
             "metadataEvent" => Self::Metadata,
             // 未知事件类型：记录后丢弃。**必须留下痕迹** —— 上游加新事件时若完全
-            // 静默，我们对协议变更就是失明的。历史教训：`metadataEvent`（承载
-            // tokenUsage / cache 明细）就是这样被无声丢掉，导致长期误以为
-            // 「上游不下发 cache 字段」。
+            // 静默，我们对协议变更就是失明的。
+            //
+            // 历史教训：`metadataEvent` 长期落在这条分支里被无声丢掉，谁也不知道
+            // 它一直在下发。加上本条 warn 后第一次真实运行就抓到了它，随后实测
+            // 确认其内容只有 `stopReason`（见上面 `Metadata` 变体的说明）。
+            // 教训不在于「丢了重要数据」，而在于**我们当时无从判断丢的是什么**。
             other => {
                 tracing::warn!(
                     event_type = %other,

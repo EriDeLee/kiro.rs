@@ -225,7 +225,7 @@ fn count_all_tokens_local(
 /// 估算单个 Anthropic content block 的 token 数。
 ///
 /// 此前只统计 `text` 字段，`tool_use.input` / `tool_result.content` / `image` /
-/// `thinking` 全部漏算。opencode 依赖 `/v1/messages/count_tokens` 决定何时压缩
+/// `thinking` 全部漏算。客户端依赖 `/v1/messages/count_tokens` 决定何时压缩
 /// 上下文，低估会让它压缩得太晚、直接撞上游窗口上限。
 ///
 /// `tool_result.content` 本身可以是字符串或嵌套 block 数组，故递归处理。
@@ -318,7 +318,7 @@ mod tests {
     use serde_json::json;
 
     /// 回归锁：入站统计必须覆盖 tool_use / tool_result / thinking / image，
-    /// 只数 text 会让 opencode 严重低估上下文、压缩过晚。
+    /// 只数 text 会让客户端严重低估上下文、压缩过晚。
     #[test]
     fn count_content_block_tokens_covers_non_text_blocks() {
         let long = "x".repeat(400);

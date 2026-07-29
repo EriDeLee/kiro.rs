@@ -113,12 +113,6 @@ pub struct TraceRecord {
     /// 输出 token
     #[serde(default)]
     pub output_tokens: u64,
-    /// 缓存创建 token
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    /// 缓存读取 token
-    #[serde(default)]
-    pub cache_read_tokens: u64,
     /// 费用（上游 meteringEvent 累计的 credits）
     #[serde(default)]
     pub credits: f64,
@@ -256,11 +250,9 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 7] = [
+        let columns: [(&str, &str); 5] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
-            ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
@@ -327,9 +319,9 @@ impl TraceStore {
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
-                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
+                 input_tokens, output_tokens, \
                  credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -347,8 +339,6 @@ impl TraceStore {
                     rec.interrupted_after_bytes.map(|v| v as i64),
                     rec.input_tokens as i64,
                     rec.output_tokens as i64,
-                    rec.cache_creation_tokens as i64,
-                    rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
                 ],
@@ -481,7 +471,7 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
+             input_tokens, output_tokens, credits, first_token_ms \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -504,10 +494,8 @@ impl TraceStore {
                 interrupted_after_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                 input_tokens: row.get::<_, i64>(13)? as u64,
                 output_tokens: row.get::<_, i64>(14)? as u64,
-                cache_creation_tokens: row.get::<_, i64>(15)? as u64,
-                cache_read_tokens: row.get::<_, i64>(16)? as u64,
-                credits: row.get::<_, f64>(17)?,
-                first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                credits: row.get::<_, f64>(15)?,
+                first_token_ms: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;
@@ -681,8 +669,6 @@ CREATE TABLE IF NOT EXISTS traces (
     interrupted_after_bytes INTEGER,
     input_tokens      INTEGER NOT NULL DEFAULT 0,
     output_tokens     INTEGER NOT NULL DEFAULT 0,
-    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
     first_token_ms    INTEGER
 );
@@ -740,8 +726,6 @@ mod tests {
             interrupted_after_bytes: None,
             input_tokens: 1093,
             output_tokens: 779,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
             attempts: vec![
@@ -802,8 +786,6 @@ mod tests {
         // token 分项往返
         assert_eq!(out[0].input_tokens, 1093);
         assert_eq!(out[0].output_tokens, 779);
-        assert_eq!(out[0].cache_read_tokens, 101760);
-        assert_eq!(out[0].cache_creation_tokens, 0);
     }
 
     #[test]

@@ -23,49 +23,6 @@ use super::{
 
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
-
-/// 创建带有 KiroProvider 的 Anthropic API 路由
-///
-/// 给嵌入到其他 Rust 项目的下游使用者预留的扩展点。
-#[allow(dead_code)]
-pub fn create_router_with_provider(
-    kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
-    tool_compatibility_mode: ToolCompatibilityMode,
-) -> Router {
-    create_router(
-        kiro_provider,
-        extract_thinking,
-        tool_compatibility_mode,
-        None,
-        None,
-        None,
-        None,
-    )
-}
-
-/// 创建 Anthropic API 路由（供 main.rs 使用）
-#[allow(clippy::too_many_arguments)]
-pub fn create_router(
-    kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
-    tool_compatibility_mode: ToolCompatibilityMode,
-    client_keys: Option<SharedClientKeyManager>,
-    usage_recorder: Option<SharedRecorder>,
-    usage_aggregator: Option<SharedAggregator>,
-    trace_store: Option<SharedTraceStore>,
-) -> Router {
-    create_router_with_shared_provider(
-        kiro_provider.map(Arc::new),
-        extract_thinking,
-        tool_compatibility_mode,
-        client_keys,
-        usage_recorder,
-        usage_aggregator,
-        trace_store,
-    )
-}
-
 /// 创建共享 KiroProvider 的路由，供主程序同时挂载 API 与 Admin 控制面。
 #[allow(clippy::too_many_arguments)]
 pub fn create_router_with_shared_provider(

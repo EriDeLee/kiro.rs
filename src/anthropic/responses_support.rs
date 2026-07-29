@@ -1,9 +1,7 @@
-//! `/v1/responses` 所需的最小共享辅助
+//! `/v1/responses` 的响应解析辅助
 //!
-//! 原先这些符号住在 `openai.rs` 里（788 行，含整套 `/v1/chat/completions`
-//! 实现）。本部署不提供 `chat/completions` —— 唯一的 OpenAI 端点是
-//! `/v1/responses`（Codex CLI / opencode 走它请求 gpt-5.6-sol），所以只把
-//! `responses.rs` 真正用到的几个辅助搬过来，其余整体删除。
+//! 把内部 Anthropic 形态的响应拆成 OpenAI Responses 所需的各个片段
+//! （文本、工具调用、思考、web_search 展示、credit 计量）。
 
 use serde_json::{Value, json};
 
@@ -15,15 +13,14 @@ pub(super) struct ParsedResponse {
     pub(super) prompt_tokens: i64,
     pub(super) completion_tokens: i64,
     /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
-    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
-    /// Responses 路径渲染为 reasoning summary item。
+    /// `kiro_thinking` 带外字段），渲染为 reasoning summary item。
     pub(super) thinking: String,
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
     /// Responses 路径渲染为 web_search_call item。
     pub(super) web_searches: Vec<(String, String)>,
     /// 上游 meteringEvent 透传的 credit_usage，未下发时为 None。
-    /// 与 kiro-rs /v1/chat/completions 行为对齐：仅在拿到 meteringEvent 时
-    /// 才把 credit_usage / credit_unit / credit_unit_plural 写入响应 usage。
+    /// 仅在真正拿到 meteringEvent 时才把 credit_* 三个字段写入响应 usage —— 
+    /// 上游没给就不写，不造默认值。
     pub(super) credit_usage: Option<f64>,
     pub(super) credit_unit: Option<String>,
     pub(super) credit_unit_plural: Option<String>,

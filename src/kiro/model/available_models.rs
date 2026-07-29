@@ -20,7 +20,7 @@ pub struct ListAvailableModelsResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpstreamModel {
-    /// 模型 ID（如 "claude-sonnet-4.5"）
+    /// 模型 ID（如 "claude-opus-5"）
     pub model_id: String,
 
     /// 模型展示名（可能不存在）

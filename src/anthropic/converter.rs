@@ -233,8 +233,15 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 本端点只服务 `claude-opus-5`（1M in / 128k out）。
 pub fn get_context_window_size(model: &str) -> i32 {
+    use crate::model::allowlist::{MODEL_GPT_56_SOL, MODEL_OPUS_5};
     match map_model(model).as_deref() {
-        Some(crate::model::allowlist::MODEL_OPUS_5) => 1_000_000,
+        Some(MODEL_OPUS_5) => 1_000_000,
+        // 实测 `ListAvailableModels`：gpt-5.6-sol 的 maxInputTokens 是 272,000
+        // （官方 1.05M，Kiro 卡在 272k）。这个值参与 contextUsageEvent 的百分比 →
+        // 绝对 token 数换算，取错会让上报的 input_tokens 系统性偏小 ~26%，
+        // 进而误导客户端的上下文压缩时机。
+        Some(MODEL_GPT_56_SOL) => 272_000,
+        // 白名单之外的模型走不到这里（map_model 已返回 None），保留保守默认值。
         _ => 200_000,
     }
 }
@@ -250,7 +257,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
 /// 取出一条消息里的可见文本（拼接所有 text 块）。
 ///
 /// 用于 assistant prefill 转换：只关心 text，其余块类型（thinking / tool_use /
-/// image）在 prefill 场景下不会出现 —— opencode 的 MAX_STEPS_PROMPT 是纯 text。
+/// image）在 prefill 场景下不会出现 —— 客户端的预填指令是纯 text。
 fn collect_message_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
@@ -382,10 +389,10 @@ fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
     }
 }
 
-/// 把请求的 effort 裁剪到该模型支持的枚举内。
+/// 校验并归一 effort：命中该模型支持的枚举则原样下发，否则**报错**。
 ///
-/// 命中则原样下发；无法识别或该模型不支持则回落 `high`（上游 default），
-/// 不会静默拉到最高档 —— 拉高档位同样是篡改客户端意图。
+/// 不回落也不拉高 —— 静默改写档位等于篡改客户端请求的推理强度，调用方会拿到
+/// 200 却以为自己设的档位生效了。错误消息里列出该模型支持的全部档位。
 fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Result<Option<String>, String> {
     let trimmed = raw_effort.trim();
     if trimmed.is_empty() {
@@ -458,7 +465,7 @@ fn build_additional_model_request_fields(
 /// `xhigh`/`max` 时连 `disabled` 也被拒。冲突时**整体不下发 thinking 字段**，让上游
 /// 走默认行为 —— 绝不改写 effort（改 effort 等于篡改客户端请求的推理强度）。
 ///
-/// `display` 原样透传：上游缺省 `omitted` 会吞掉思考文本，opencode 会主动发
+/// `display` 原样透传：上游缺省 `omitted` 会吞掉思考文本，客户端 SDK 会主动发
 /// `summarized` 要回来。
 fn build_kiro_thinking(req: &MessagesRequest, effort: &str) -> Option<KiroThinkingConfig> {
     let thinking = req.thinking.as_ref()?;
@@ -636,10 +643,9 @@ pub fn convert_request_with_mode(
 
     // 2.5. assistant prefill：Kiro 上游没有预填槽位，转成末尾 user 指令而非丢弃。
     //
-    // opencode 在 agent 达到 `steps` 上限时会发一条末尾 assistant 消息
-    // （`session/prompt.ts` 的 MAX_STEPS_PROMPT，内容形如「已达最大步数，只许输出
-    // 文字」）—— 这是它的**合法正常流程**，不是客户端错误。默认四个内置 agent 都
-    // 没配 `steps`，但用户一旦配了，无条件 400 会把会话打死且错误信息难以溯源。
+    // 客户端在 agent 达到步数上限时会发一条末尾 assistant 消息（内容形如「已达
+    // 最大步数，只许输出文字」）—— 这是 Anthropic 协议的合法形态，不是客户端错误。
+    // 无条件 400 会把会话打死，且错误信息难以溯源。
     //
     // prefill 的语义是「约束模型接下来的输出」，转成 user 消息末尾的指令语义损失
     // 最小，也不丢任何信息。这不是静默降级：转换会记 warn。
@@ -1133,8 +1139,37 @@ fn claude_code_tool_name_to_kiro(name: &str) -> Option<&'static str> {
     }
 }
 
-fn is_claude_code_mode(mode: ToolCompatibilityMode) -> bool {
-    mode == ToolCompatibilityMode::ClaudeCode
+/// opencode 内置工具名 → Kiro 内置工具名。
+///
+/// 工具 id 取自 opencode 源码 `packages/opencode/src/tool/`（`Tool.define("<id>", ..)`）：
+/// `edit` / `write` / `read` / `bash`（`shell/id.ts` 的 `ToolID = "bash"`）/ `glob` /
+/// `grep` / `websearch`。注意与 ClaudeCode 模式的差异：全小写，且
+/// `websearch` 没有下划线、无 `LS`（opencode 用 `glob` 覆盖列目录场景）。
+fn opencode_tool_name_to_kiro(name: &str) -> Option<&'static str> {
+    match name {
+        "write" => Some("fs_write"),
+        "edit" => Some("str_replace"),
+        "bash" => Some("execute_bash"),
+        "read" => Some("read_file"),
+        "glob" => Some("file_search"),
+        "grep" => Some("grep_search"),
+        "websearch" => Some("web_search"),
+        _ => None,
+    }
+}
+
+/// 按模式把客户端内置工具名映射为 Kiro 内置工具名。`Raw` 模式永远返回 `None`。
+fn client_tool_name_to_kiro(name: &str, mode: ToolCompatibilityMode) -> Option<&'static str> {
+    match mode {
+        ToolCompatibilityMode::ClaudeCode => claude_code_tool_name_to_kiro(name),
+        ToolCompatibilityMode::OpenCode => opencode_tool_name_to_kiro(name),
+        ToolCompatibilityMode::Raw => None,
+    }
+}
+
+/// 是否启用内置工具适配（`Raw` 之外的模式都启用）。
+fn is_builtin_mapping_mode(mode: ToolCompatibilityMode) -> bool {
+    mode != ToolCompatibilityMode::Raw
 }
 
 /// 出站工具名映射：ClaudeCode 模式命中内置则改名并记录 `kiro名 → 客户端名`；
@@ -1144,9 +1179,7 @@ fn map_client_tool_name_to_kiro(
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
 ) -> String {
-    if is_claude_code_mode(mode)
-        && let Some(kiro_name) = claude_code_tool_name_to_kiro(name)
-    {
+    if let Some(kiro_name) = client_tool_name_to_kiro(name, mode) {
         tool_name_map
             .entry(kiro_name.to_string())
             .or_insert_with(|| name.to_string());
@@ -1188,10 +1221,7 @@ fn map_tool_input_to_kiro(
     input: serde_json::Value,
     mode: ToolCompatibilityMode,
 ) -> Result<serde_json::Value, ConversionError> {
-    if !is_claude_code_mode(mode) {
-        return Ok(input);
-    }
-    let Some(kiro_name) = claude_code_tool_name_to_kiro(client_name) else {
+    let Some(kiro_name) = client_tool_name_to_kiro(client_name, mode) else {
         return Ok(input);
     };
     let serde_json::Value::Object(obj) = input else {
@@ -1199,27 +1229,31 @@ fn map_tool_input_to_kiro(
     };
 
     let mut out = serde_json::Map::new();
-    match (client_name, kiro_name) {
-        ("Write", "fs_write") => {
-            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+    // 分支只按 **kiro_name** 匹配：客户端名已由 client_tool_name_to_kiro 归一，
+    // 所以 ClaudeCode 与 OpenCode 两种模式共用同一套转换。键名候选同时覆盖
+    // Claude Code 的 snake_case（file_path/old_string）与 opencode 的
+    // camelCase（filePath/oldString）。
+    match kiro_name {
+        "fs_write" => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "filePath", "path"]));
             maybe_insert(&mut out, "text", take_first(&obj, &["content", "text"]));
         }
-        ("Edit", "str_replace") => {
-            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
-            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
-            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+        "str_replace" => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "filePath", "path"]));
+            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldString", "oldStr"]));
+            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newString", "newStr"]));
         }
-        ("Bash", "execute_bash") => {
+        "execute_bash" => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
-        ("Read", "read_file") => {
+        "read_file" => {
             if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
                 return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
+                    "Read.pages has no Kiro read_file equivalent".to_string(),
                 ));
             }
-            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "filePath", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
             if let Some(start) = offset {
@@ -1233,7 +1267,7 @@ fn map_tool_input_to_kiro(
             out.entry("explanation".to_string())
                 .or_insert_with(|| default_explanation(client_name));
         }
-        ("Glob", "file_search") => {
+        "file_search" => {
             maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
             maybe_insert(
                 &mut out,
@@ -1252,12 +1286,12 @@ fn map_tool_input_to_kiro(
             out.entry("explanation".to_string())
                 .or_insert_with(|| default_explanation(client_name));
         }
-        ("Grep", "grep_search") => {
+        "grep_search" => {
             maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
             maybe_insert(
                 &mut out,
                 "includePattern",
-                take_first(&obj, &["glob", "includePattern"]),
+                take_first(&obj, &["glob", "include", "includePattern"]),
             );
             maybe_insert(
                 &mut out,
@@ -1271,14 +1305,14 @@ fn map_tool_input_to_kiro(
             );
             maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
         }
-        ("LS", "list_directory") => {
+        "list_directory" => {
             maybe_insert(&mut out, "path", take_first(&obj, &["path"]));
             maybe_insert(&mut out, "depth", take_first(&obj, &["depth"]));
             maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
             out.entry("explanation".to_string())
                 .or_insert_with(|| default_explanation(client_name));
         }
-        ("WebSearch", "web_search") => {
+        "web_search" => {
             maybe_insert(&mut out, "query", take_first(&obj, &["query"]));
         }
         _ => return Ok(serde_json::Value::Object(obj)),
@@ -1499,9 +1533,9 @@ fn convert_tools(
     let mut out = Vec::new();
 
     for t in tools {
-        // ClaudeCode 模式隐藏 Kiro 不支持的 fs_append。
-        if is_claude_code_mode(mode) && t.name == "fs_append" {
-            tracing::debug!("Claude Code 兼容模式隐藏 fs_append 工具");
+        // 内置映射模式下隐藏 Kiro 不支持的 fs_append。
+        if is_builtin_mapping_mode(mode) && t.name == "fs_append" {
+            tracing::debug!("内置工具兼容模式隐藏 fs_append 工具");
             continue;
         }
 
@@ -1512,18 +1546,17 @@ fn convert_tools(
             continue;
         }
 
-        let is_builtin =
-            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+        let is_builtin = client_tool_name_to_kiro(&t.name, mode).is_some();
 
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
         } else {
             let mut description = t.description.clone();
-            // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
+            // 非内置（含 Raw 模式）：按客户端原始名附加写入/编辑/执行类提示。
             let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
+                "Write" | "write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" | "edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                "Bash" | "bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
                 _ => "",
             };
             if !suffix.is_empty() {
@@ -2199,6 +2232,115 @@ mod tests {
             max_uses: None,
             cache_control: None,
         }
+    }
+
+    /// opencode 模式的工具名映射。
+    ///
+    /// id 取自 opencode 源码 `packages/opencode/src/tool/` 的 `Tool.define("<id>", ..)`：
+    /// 全小写，`websearch` 无下划线，且**没有 `LS`**（用 `glob` 覆盖列目录场景）。
+    #[test]
+    fn opencode_builtin_name_table() {
+        assert_eq!(opencode_tool_name_to_kiro("write"), Some("fs_write"));
+        assert_eq!(opencode_tool_name_to_kiro("edit"), Some("str_replace"));
+        assert_eq!(opencode_tool_name_to_kiro("bash"), Some("execute_bash"));
+        assert_eq!(opencode_tool_name_to_kiro("read"), Some("read_file"));
+        assert_eq!(opencode_tool_name_to_kiro("glob"), Some("file_search"));
+        assert_eq!(opencode_tool_name_to_kiro("grep"), Some("grep_search"));
+        assert_eq!(opencode_tool_name_to_kiro("websearch"), Some("web_search"));
+        // opencode 无 LS 工具；PascalCase 是 ClaudeCode 模式的命名，此处不认
+        assert_eq!(opencode_tool_name_to_kiro("LS"), None);
+        assert_eq!(opencode_tool_name_to_kiro("Write"), None);
+        assert_eq!(opencode_tool_name_to_kiro("web_search"), None);
+    }
+
+    /// 两种模式互不串用：各自只认自己的命名风格。
+    #[test]
+    fn tool_name_mapping_is_mode_scoped() {
+        use ToolCompatibilityMode::*;
+        assert_eq!(client_tool_name_to_kiro("Write", ClaudeCode), Some("fs_write"));
+        assert_eq!(client_tool_name_to_kiro("Write", OpenCode), None);
+        assert_eq!(client_tool_name_to_kiro("write", OpenCode), Some("fs_write"));
+        assert_eq!(client_tool_name_to_kiro("write", ClaudeCode), None);
+        // Raw 模式永不映射
+        assert_eq!(client_tool_name_to_kiro("Write", Raw), None);
+        assert_eq!(client_tool_name_to_kiro("write", Raw), None);
+    }
+
+    /// opencode 的入参是 camelCase（`filePath`/`oldString`），必须能转成 Kiro 键名。
+    #[test]
+    fn opencode_input_camel_case_maps_to_kiro() {
+        // write: filePath + content -> path + text
+        let out = map_tool_input_to_kiro(
+            "write",
+            serde_json::json!({"filePath": "/a.txt", "content": "hi"}),
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(out, serde_json::json!({"path": "/a.txt", "text": "hi"}));
+
+        // edit: oldString/newString -> oldStr/newStr
+        let out = map_tool_input_to_kiro(
+            "edit",
+            serde_json::json!({"filePath": "/a.rs", "oldString": "a", "newString": "b"}),
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(out["path"], serde_json::json!("/a.rs"));
+        assert_eq!(out["oldStr"], serde_json::json!("a"));
+        assert_eq!(out["newStr"], serde_json::json!("b"));
+
+        // read: offset/limit -> start_line/end_line（与 ClaudeCode 同算法）
+        let out = map_tool_input_to_kiro(
+            "read",
+            serde_json::json!({"filePath": "/a", "offset": 10, "limit": 5}),
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(out["start_line"], serde_json::json!(10));
+        assert_eq!(out["end_line"], serde_json::json!(14));
+
+        // bash: command/timeout 直通
+        let out = map_tool_input_to_kiro(
+            "bash",
+            serde_json::json!({"command": "ls", "timeout": 5000}),
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(out["command"], serde_json::json!("ls"));
+
+        // grep: opencode 用 include（Claude Code 用 glob）
+        let out = map_tool_input_to_kiro(
+            "grep",
+            serde_json::json!({"pattern": "fn main", "include": "*.rs"}),
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        assert_eq!(out["query"], serde_json::json!("fn main"));
+        assert_eq!(out["includePattern"], serde_json::json!("*.rs"));
+    }
+
+    /// opencode 模式下工具声明改名并替换为 Kiro 内置 schema。
+    #[test]
+    fn opencode_convert_tools_maps_names_and_schema() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool("write"), cc_tool("read"), cc_tool("fs_append")]),
+            &mut map,
+            ToolCompatibilityMode::OpenCode,
+        )
+        .unwrap();
+        let names: Vec<&str> = out
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(names.contains(&"fs_write"), "write 应映射为 fs_write");
+        assert!(names.contains(&"read_file"), "read 应映射为 read_file");
+        assert!(!names.contains(&"fs_append"), "fs_append 应被隐藏");
+        // 反向映射记录客户端原始名，供入站还原
+        assert_eq!(map.get("fs_write").map(|s| s.as_str()), Some("write"));
+        // 内置 schema 被替换（含 path/text）
+        let s = serde_json::to_string(&out[0]).unwrap();
+        assert!(s.contains("\"path\""), "应使用 Kiro 内置 schema");
     }
 
     #[test]
@@ -3025,9 +3167,8 @@ mod tests {
 
     /// 回归锁：assistant prefill 转成末尾 user 指令，不丢内容也不报错。
     ///
-    /// opencode 在 agent 达到 `steps` 上限时会发末尾 assistant 消息
-    /// （MAX_STEPS_PROMPT），那是它的合法流程。Kiro 上游没有预填槽位，
-    /// 转成 user 指令语义损失最小。
+    /// 客户端在 agent 步数上限时会发末尾 assistant 消息约束下一轮输出，
+    /// 那是协议的合法形态。Kiro 上游没有预填槽位，转成 user 指令语义损失最小。
     #[test]
     fn assistant_prefill_is_converted_to_trailing_user_directive() {
         use super::super::types::Message as AnthropicMessage;

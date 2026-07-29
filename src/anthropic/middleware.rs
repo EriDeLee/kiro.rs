@@ -52,7 +52,6 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
-    #[allow(dead_code)]
     pub fn new(
         extract_thinking: bool,
         tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,

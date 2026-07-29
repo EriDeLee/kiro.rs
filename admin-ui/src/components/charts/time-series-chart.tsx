@@ -21,23 +21,16 @@ interface Props {
 const COLORS = {
   input: '#3b82f6',
   output: '#10b981',
-  cacheCreation: '#f59e0b',
-  cacheRead: '#06b6d4',
-  cacheHitRate: '#a855f7',
   credits: '#ec4899',
 } as const
 
 const SERIES = [
   { key: 'inputTokens', name: '输入', color: COLORS.input, axis: 'left' as const, kind: 'tokens' as const },
   { key: 'outputTokens', name: '输出', color: COLORS.output, axis: 'left' as const, kind: 'tokens' as const },
-  { key: 'cacheCreationTokens', name: '缓存写', color: COLORS.cacheCreation, axis: 'left' as const, kind: 'tokens' as const },
-  { key: 'cacheReadTokens', name: '缓存读', color: COLORS.cacheRead, axis: 'left' as const, kind: 'tokens' as const },
-  { key: 'cacheHitRate', name: '命中率', color: COLORS.cacheHitRate, axis: 'right' as const, kind: 'percent' as const },
 ]
 
 interface ChartPoint extends TimeSeriesPoint {
   label: string
-  cacheHitRate: number
 }
 
 function formatTs(ts: string, granularity: StatsGranularity): string {
@@ -45,13 +38,6 @@ function formatTs(ts: string, granularity: StatsGranularity): string {
   const md = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   if (granularity === 'day') return `${d.getFullYear()}-${md}`
   return `${d.getFullYear()}-${md} ${String(d.getHours()).padStart(2, '0')}:00`
-}
-
-/** 命中率 = cacheRead / (input + cacheRead)，无缓存读取时为 0 */
-function calcHitRate(p: TimeSeriesPoint): number {
-  const denom = p.inputTokens + p.cacheReadTokens
-  if (denom <= 0) return 0
-  return (p.cacheReadTokens / denom) * 100
 }
 
 function pickXAxisInterval(len: number): number | 'preserveStartEnd' {
@@ -124,7 +110,7 @@ function TooltipRow({
   value?: number
 }) {
   if (value == null) return null
-  const valueStr = entry.kind === 'percent' ? `${value.toFixed(1)}%` : formatNumber(value)
+  const valueStr = formatNumber(value)
   return (
     <div style={TOOLTIP_ROW_STYLE}>
       <span style={{ ...TOOLTIP_SWATCH_BASE_STYLE, background: entry.color }} />
@@ -157,7 +143,6 @@ function TimeSeriesChartImpl({ data, granularity }: Props) {
       data.map((p) => ({
         ...p,
         label: formatTs(p.ts, granularity),
-        cacheHitRate: calcHitRate(p),
       })),
     [data, granularity],
   )
@@ -167,10 +152,7 @@ function TimeSeriesChartImpl({ data, granularity }: Props) {
     () =>
       formatted.every(
         (p) =>
-          p.inputTokens === 0 &&
-          p.outputTokens === 0 &&
-          p.cacheCreationTokens === 0 &&
-          p.cacheReadTokens === 0,
+          p.inputTokens === 0 && p.outputTokens === 0,
       ),
     [formatted],
   )
@@ -216,16 +198,6 @@ function chartAxes({
       ticks={leftAllZero ? [0] : undefined}
       allowDecimals={false}
     />,
-    <YAxis
-      key="right"
-      yAxisId="right"
-      orientation="right"
-      tick={{ fontSize: 11, fill: COLORS.cacheHitRate }}
-      domain={[0, 100]}
-      ticks={[0, 20, 40, 60, 80, 100]}
-      tickFormatter={(v: number) => `${v}%`}
-      width={36}
-    />,
   ]
 }
 
@@ -248,8 +220,7 @@ function chartLines() {
       stroke={s.color}
       name={s.name}
       dot={false}
-      strokeWidth={s.kind === 'percent' ? 1.8 : 2}
-      strokeDasharray={s.kind === 'percent' ? '4 4' : undefined}
+      strokeWidth={2}
       isAnimationActive
       animationDuration={550}
       animationEasing="ease-out"

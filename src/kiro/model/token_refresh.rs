@@ -130,8 +130,7 @@ pub struct CreateTokenResponse {
 #[derive(Debug, Deserialize)]
 pub struct OidcErrorResponse {
     pub error: String,
-    // 详细描述供日志使用，反序列化时保留以便排错
-    #[allow(dead_code)]
+    /// OIDC 规范的人类可读失败原因，用于错误消息（见 auth/idc.rs 的轮询错误分支）。
     #[serde(default)]
     pub error_description: Option<String>,
 }

@@ -29,7 +29,7 @@ pub const MODEL_GPT_56_SOL: &str = "gpt-5.6-sol";
 /// 请求所用的客户端协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
-    /// `/v1/messages`、`/cc/v1/messages`、`/v1/messages/count_tokens`
+    /// `/v1/messages`、`/v1/messages/count_tokens`
     Anthropic,
     /// `/v1/responses`
     OpenAiResponses,
@@ -41,13 +41,6 @@ impl Protocol {
         match self {
             Self::Anthropic => MODEL_OPUS_5,
             Self::OpenAiResponses => MODEL_GPT_56_SOL,
-        }
-    }
-
-    pub const fn endpoint(self) -> &'static str {
-        match self {
-            Self::Anthropic => "/v1/messages",
-            Self::OpenAiResponses => "/v1/responses",
         }
     }
 }

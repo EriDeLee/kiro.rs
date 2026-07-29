@@ -110,15 +110,6 @@ impl GroupManager {
     }
 
     /// 校验一组名字是否全部已注册；返回未注册的名字列表（调用方据此决定是否拒绝写入）
-    #[allow(dead_code)]
-    pub fn missing<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-        let inner = self.inner.read();
-        names
-            .into_iter()
-            .filter(|n| !inner.entries.contains_key(*n))
-            .map(|s| s.to_string())
-            .collect()
-    }
 
     /// 创建分组。重名直接报错，不会静默覆盖（避免误创建丢备注）
     pub fn create(&self, name: String, description: Option<String>) -> anyhow::Result<Group> {
@@ -275,15 +266,6 @@ mod tests {
         assert!(mgr.create("a".repeat(65), None).is_err());
     }
 
-    #[test]
-    fn missing_reports_unregistered() {
-        let mgr = GroupManager::new();
-        mgr.create("known".into(), None).unwrap();
-        let missing = mgr.missing(["known", "ghost", "another-ghost"].iter().copied());
-        assert_eq!(missing.len(), 2);
-        assert!(missing.contains(&"ghost".to_string()));
-        assert!(missing.contains(&"another-ghost".to_string()));
-    }
 
     #[test]
     fn rename_swaps_key() {

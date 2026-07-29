@@ -17,55 +17,23 @@ impl Default for TlsBackend {
     }
 }
 
-/// 工具兼容模式。
+/// 工具兼容模式：把客户端的内置工具名与入参双向适配为 Kiro 内置工具，
+/// 并用 Kiro 的内置 schema 替换客户端 schema（上游对内置工具有固定形状要求）。
 ///
-/// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
-///   的工具名与入参双向适配为 Kiro 内置工具（fs_write/str_replace/... ），并替换为 Kiro 内置 schema。
-/// - `Raw`：保留旧行为，直接透传客户端工具名/schema，用于排障。
+/// - `ClaudeCode`（默认）：`Write`/`Edit`/`Bash`/`Read`/`Glob`/`Grep`/`LS`/`WebSearch`
+///   （PascalCase，Claude Code 与 Anthropic 官方示例的命名约定）
+/// - `OpenCode`：`write`/`edit`/`bash`/`read`/`glob`/`grep`/`websearch`
+///   （小写，工具 id 与参数取自 opencode 源码 `packages/opencode/src/tool/`）
+/// - `Raw`：直接透传客户端工具名/schema，不做任何适配，用于排障
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolCompatibilityMode {
     #[default]
     ClaudeCode,
+    OpenCode,
     Raw,
 }
 
-/// 自定义模型定义。
-///
-/// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
-/// 模型 ID 的映射及元数据。**已失效**（见 `Config::custom_models`）。原先由
-/// `id`（大小写不敏感）精确匹配，优先于内置的模糊映射逻辑——既能新增模型，也能
-/// 覆盖内置模型的映射。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomModel {
-    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
-    pub id: String,
-
-    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
-    pub backend_id: String,
-
-    /// `/v1/models` 展示名（可选，缺省用 `id`）。
-    #[serde(default)]
-    pub display_name: Option<String>,
-
-    /// 上下文窗口大小（可选，缺省 200000）。
-    #[serde(default)]
-    pub context_window: Option<i32>,
-
-    /// 单次响应最大 token 数，用于 `/v1/models` 展示（可选，缺省 64000）。
-    #[serde(default)]
-    pub max_tokens: Option<i32>,
-
-    /// 是否支持原生 reasoning / `output_config`（可选，缺省 false）。
-    /// 命中的自定义模型置 true 时，会按 backend_id 放行 `additionalModelRequestFields`。
-    #[serde(default)]
-    pub supports_reasoning: Option<bool>,
-
-    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
-    #[serde(default)]
-    pub owned_by: Option<String>,
-}
 
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,15 +183,17 @@ pub struct Config {
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
 
-    /// 是否开启非流式响应的 thinking 块提取（默认 true）
+    /// 是否把上游推理内容作为 thinking 块返回给客户端（默认 true）。
     ///
-    /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
-    /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
+    /// 关闭后，`reasoningContentEvent` 的思考文本会并入正文 text 块而不单独成块。
+    /// 注意：`<thinking>` XML 标签的提取路径已移除（实测 claude-opus-5 全场景走
+    /// 原生 `reasoningContentEvent`），此开关只影响原生推理内容的呈现形式。
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
-    /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
+    /// 工具兼容模式。默认 `claude-code`（PascalCase 工具名）；`open-code`
+    /// 对应 opencode 的小写工具名与 camelCase 入参；`raw` 直接透传客户端
+    /// 工具名/schema，用于排障。详见 [`ToolCompatibilityMode`]。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
@@ -259,10 +229,6 @@ pub struct Config {
     /// （完全向后兼容）。**当前已忽略**，
     /// 供 `map_model` / `get_context_window_size` / `/v1/models` 查询。
     #[serde(default)]
-    /// **已失效**：本部署用严格白名单（`model::allowlist`）只服务
-    /// `claude-opus-5` 与 `gpt-5.6-sol`，自定义模型不再参与路由或 `/v1/models`
-    /// 列表。字段保留仅为兼容老配置文件的反序列化，配置值会被忽略。
-    pub custom_models: Vec<CustomModel>,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -402,7 +368,6 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
-            custom_models: Vec::new(),
             config_path: None,
         }
     }

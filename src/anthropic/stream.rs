@@ -16,10 +16,13 @@ use crate::kiro::model::events::{Event, MeteringEvent};
 /// 否则 SDK / 服务端会拒绝请求并报：
 /// `The content[].thinking in the thinking mode must be passed back to the API`。
 ///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
-/// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
-/// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
+/// 上游 Kiro **确实下发真实签名**（实测 308~10920 字符 base64），正常情况下
+/// 直接透传真值；只有上游本轮未给签名时才用这个占位串顶上，以满足客户端
+/// 「thinking 块的 signature 必须非空」的本地校验。
+///
+/// 入站侧 `converter` 会识别并**剔除**携带本占位串的历史 thinking 块 ——
+/// 把自造的假签名回传给上游必然触发 `THINKING_SIGNATURE_INVALID`，
+/// 而真签名则逐字节原样回传。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
 
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
@@ -726,7 +729,8 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
 /// 返回的 content block 形态与调用方现有约定一致：
 ///   - 文本：`{"type":"text","text": "..."}`
 ///   - 工具：`{"type":"tool_use","id":"toolu_...","name":"...","input": {...}}`
-/// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
+/// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败**上抛**
+/// `InvalidJson`（绝不降级成 `{}`——空参数会让客户端拿错误入参执行工具）。
 ///
 /// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
 /// 经统一入口 `CompletedToolUse::from_kiro`；映射为空或命中失败时按原名返回。
@@ -859,7 +863,7 @@ impl CompletedToolUse {
 ///
 /// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
 /// 客户端拿到无法解析或语义错误的参数去执行工具。这里显式暴露为错误，由上层
-/// 决定回 502（非流式 / 缓冲流）或在 SSE 里补一个 `error` 事件（实时流）。
+/// 决定回 502（非流式）或在 SSE 里补一个 `error` 事件（流式）。
 #[derive(Debug, Clone)]
 pub enum ToolJsonAccumulatorError {
     InvalidJson {
@@ -1363,14 +1367,10 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
-    /// 最终上报口径的 input_tokens。
+    /// 最终上报的 input_tokens：优先用 contextUsage 换算出的真值
+    /// （上游百分比 × 模型窗口），拿不到时回退客户端估算值。
     ///
-    /// 上游 Kiro 私有协议既不接受请求侧 `cachePoint`，也不回传 `tokenUsage`
-    /// （2026-07 端到端实测：同形状未知字段同样返 200 = 静默丢弃；`metadataEvent`
-    /// 仅含 `stopReason`），故不存在可上报的 cache 明细。
-    ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`。
+    /// 上游不回传 cache 明细，故无 cache 字段可分摊（见 AGENTS.md §4.1）。
     pub fn resolved_usage(&self) -> i32 {
         self.context_input_tokens.unwrap_or(self.input_tokens)
     }
@@ -1624,7 +1624,7 @@ impl StreamContext {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         // 如果 thinking 尚未提取，且安全内容只是空白字符，
                         // 则不发送为 text_delta，继续保留在缓冲区等待更多内容。
-                        // 这避免了 4.6 模型中 <thinking> 标签跨事件分割时，
+                        // 这避免了 <thinking> 标签跨事件分割时，
                         // 前导空白（如 "\n\n"）被错误地创建为 text 块，
                         // 导致 text 块先于 thinking 块出现的问题。
                         if !safe_content.is_empty() && !safe_content.trim().is_empty() {
@@ -2175,7 +2175,7 @@ impl StreamContext {
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
     /// 上游 Kiro **确实下发真实签名**（2026-07 实测：`reasoningContentEvent.signature`
-    /// 长度 340~10920 字符的 base64，流式时在思考文本之后单独下发）。签名会被
+    /// 长度 308~10920 字符的 base64，流式时在思考文本之后单独下发）。签名会被
     /// `pending_thinking_signature` 暂存，并原样回传到上游历史的
     /// `assistantResponseMessage.reasoningContent.reasoningText.signature` ——
     /// 上游解密它来重建思维链，所以**必须逐字节保真**。

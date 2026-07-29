@@ -75,7 +75,7 @@ pub struct Thinking {
     pub budget_tokens: i32,
     /// 思考内容展示方式：`summarized` / `omitted`。
     ///
-    /// 上游 claude-opus-5 缺省 `omitted`（不回传思考文本）；opencode v1.18.5 会主动
+    /// 上游 claude-opus-5 缺省 `omitted`（不回传思考文本）；客户端 SDK 会主动
     /// 发 `summarized` 要回来，所以必须接住并透传，否则思考内容会被上游吞掉。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
@@ -256,9 +256,8 @@ pub struct Tool {
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
     ///
-    /// 使用 `BTreeMap` 而非 `HashMap`：key 按字典序稳定迭代，保证序列化
-    /// 输出可复现。这对 prompt cache 至关重要——tool 签名参与缓存前缀
-    /// 指纹，若顶层 key 顺序抖动会导致后续 system/messages 断点连锁失效。
+    /// 使用 `BTreeMap` 而非 `HashMap`：key 按字典序稳定迭代，保证序列化输出
+    /// 可复现。上游按请求前缀做隐式缓存，key 顺序抖动会让缓存命不中。
     #[serde(default)]
     pub input_schema: BTreeMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
