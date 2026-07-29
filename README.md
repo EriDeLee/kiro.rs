@@ -33,7 +33,7 @@
 | 工具 JSON 累积器 | ✅ 全路径 | ✅ 主路径 | ❌ | ✅ |
 | 日志脱敏 | ✅ | ❌ | ❌ | ✅ |
 | legacy 端点 | 无 | `/v1/chat/completions`、`/cc/v1/*` | `/cc/v1/*` | `/cc/v1/*` |
-| 源码规模 | 40.7k 行 | 43.3k | 15.3k | 34.6k |
+| 源码规模 | 42.4k 行 | 44.9k | 15.3k | 34.6k |
 
 <sup>1</sup> Anthropic 官方明确：模型靠解密 `signature` 重建思维链，`thinking` 字段的明文**被忽略**。拼进 content 只会浪费上下文，并诱导模型把内部推理写进可见输出。
 
@@ -115,7 +115,7 @@ cargo build --release
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（518 个）
+cargo test --release                      # 后端测试（542 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端
