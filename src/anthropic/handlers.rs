@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -671,14 +671,12 @@ pub async fn post_messages(
             hook,
             payload_stream,
             key_ctx.group.clone(),
-            state.tool_compatibility_mode,
         )
         .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -692,10 +690,6 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0.0, "error");

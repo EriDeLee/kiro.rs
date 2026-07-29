@@ -81,7 +81,6 @@ cargo build --release
 | `loadBalancingMode` | `priority` | `priority`（固定优先级）或 `balanced`（均衡） |
 | `traceEnabled` | `false` | 请求链路记录，供 Admin 面板查询 |
 | `proxyUrl` | 无 | 全局 HTTP 代理，日志中自动脱敏 |
-| `toolCompatibilityMode` | `claude-code` | 内置工具名/入参适配：`claude-code`（PascalCase）、`open-code`（opencode 的小写名 + camelCase 入参）、`raw`（不适配） |
 
 多凭据故障处理（上游 v0.7.4 引入，用于打断 403 死循环）：
 

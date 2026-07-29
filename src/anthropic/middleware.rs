@@ -37,8 +37,6 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
-    /// 工具兼容模式（ClaudeCode 内置工具名/入参双向适配 / Raw 透传）
-    pub tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
     /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
     pub client_keys: Option<SharedClientKeyManager>,
     /// 用量日志记录器
@@ -52,14 +50,10 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
-    pub fn new(
-        extract_thinking: bool,
-        tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
-    ) -> Self {
+    pub fn new(extract_thinking: bool) -> Self {
         Self {
             kiro_provider: None,
             extract_thinking,
-            tool_compatibility_mode,
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,

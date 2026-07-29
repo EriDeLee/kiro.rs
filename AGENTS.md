@@ -34,16 +34,14 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 
 Admin 面板（`/api/admin` + `/admin` UI，43 个端点）保留。四条认证路径（`idc` / `social` / `external_idp` / `api_key`）保留——Admin 的 9 个 OAuth 登录端点依赖它们。
 
-**工具兼容模式**（`config.toolCompatibilityMode`）把客户端内置工具名与入参适配为 Kiro 内置工具：
+**工具 schema 原样透传，不做内置工具名映射。** 客户端声明什么工具名与 `input_schema`，
+就原样发给上游；工具调用的 input 一个键都不改写。仅保留两项与客户端无关的必要处理：
+超长工具名缩短（上游限制 63 字符，入站按反向表还原）与按小写名去重。
 
-| 模式 | 工具名风格 | 入参风格 |
-|---|---|---|
-| `claude-code`（默认） | `Write`/`Edit`/`Bash`/`Read`/`Glob`/`Grep`/`LS`/`WebSearch` | snake_case（`file_path`/`old_string`） |
-| `open-code` | `write`/`edit`/`bash`/`read`/`glob`/`grep`/`websearch`（无 `LS`） | camelCase（`filePath`/`oldString`） |
-| `raw` | 原样透传，不适配 | 原样 |
-
-两种映射模式共用同一套参数转换（按 Kiro 名单键匹配），键名候选同时覆盖两种命名风格。
-`open-code` 的工具 id 取自 opencode 源码 `packages/opencode/src/tool/` 的 `Tool.define("<id>", ..)`。
+理由：曾有过「工具兼容模式」按客户端类型枚举内置工具名并改写入参（claude-code 一套、
+open-code 第二套）。那个机制的前提假设 —— 客户端内置工具集可枚举 —— 是错的：加第二个
+客户端就已证伪它，再来一个还得加第三套。与其做枚举式适配，不如把理解工具语义的成本
+转嫁给足够强的上游模型。
 
 ---
 
@@ -226,22 +224,22 @@ graceful shutdown 失效。
 | 3 | 推理档位全矩阵 | opus 五档全 200、`none`/非法值 400；gpt 六档全 200、非法 400 |
 | 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>` |
 | 5 | signature 端到端 | 真签名回传后模型能基于历史推理续算；占位签名被剔除不打死会话 |
-| 6 | 工具兼容模式 | 出站改名 + 入站还原双向；`fs_append` 隐藏 |
+| 6 | 工具 schema 透传 | 工具名与 input_schema 原样下发；仅超长名缩短 + 入站还原 |
 | 7 | 静默降级已移除 | prefill 转换 200 + warn；坏 JSON / 空 messages 400 |
 | 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0 |
 | 9 | graceful shutdown | SIGTERM → 落盘计数与日志吻合 |
 | 10 | 全局代理现取 | 见 §3.8 反向判据 |
 
-配置项类改动（如 `toolCompatibilityMode`）需要**单独起实例**，它们只在启动时读取。
+配置项类改动（如 `extractThinking`、`traceEnabled`）需要**单独起实例**，它们只在启动时读取。
 测试客户端行为时不必安装该客户端 —— 从其源码读出真实的工具 id / 参数形状后手工
-构造请求即可（本仓库的 opencode 模式就是这样验的）。
+构造请求即可。
 
 ### 3.11 Rebase 上游后必须做双向验证
 
 只验一个方向会漏。两个方向都要查：
 
 1. **我方改造是否被回退** —— 逐项确认核心改动仍在（路由数、白名单、签名回传、
-   各模式开关…）。git 能自动合并的代码，语义上可能已被上游覆盖
+   工具 schema 透传…）。git 能自动合并的代码，语义上可能已被上游覆盖
 2. **上游功能是否完整吸收** —— 确认新配置项、新逻辑真的存在。最有力的证据是
    **测试数变化**（本轮 518 → 542，说明上游 24 个新测试全部纳入并通过）
 3. **已删符号是否复活** —— 上游改动可能把删掉的字段/函数带回来

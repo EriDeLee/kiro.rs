@@ -13,7 +13,6 @@ use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages},
@@ -24,17 +23,15 @@ use super::{
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建共享 KiroProvider 的路由，供主程序同时挂载 API 与 Admin 控制面。
-#[allow(clippy::too_many_arguments)]
 pub fn create_router_with_shared_provider(
     kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
-    tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
-    let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
+    let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_shared_kiro_provider(provider);
     }

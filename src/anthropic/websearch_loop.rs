@@ -26,8 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
-use crate::model::config::ToolCompatibilityMode;
+use super::converter::{ConversionError, convert_request, get_context_window_size};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -317,9 +316,8 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
-    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
+    let conversion = match convert_request(payload) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -332,10 +330,6 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("unsupported tool mapping: {}", reason),
-                ),
             };
             hook.record(0, 0, 0, 0.0, "error");
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
@@ -661,7 +655,6 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
-    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -687,7 +680,6 @@ pub(super) async fn run_web_search_loop(
                     &hook,
                     fallback_input_tokens,
                     group.as_deref(),
-                    tool_compatibility_mode,
                 )
                 .await
                 {

@@ -17,24 +17,6 @@ impl Default for TlsBackend {
     }
 }
 
-/// 工具兼容模式：把客户端的内置工具名与入参双向适配为 Kiro 内置工具，
-/// 并用 Kiro 的内置 schema 替换客户端 schema（上游对内置工具有固定形状要求）。
-///
-/// - `ClaudeCode`（默认）：`Write`/`Edit`/`Bash`/`Read`/`Glob`/`Grep`/`LS`/`WebSearch`
-///   （PascalCase，Claude Code 与 Anthropic 官方示例的命名约定）
-/// - `OpenCode`：`write`/`edit`/`bash`/`read`/`glob`/`grep`/`websearch`
-///   （小写，工具 id 与参数取自 opencode 源码 `packages/opencode/src/tool/`）
-/// - `Raw`：直接透传客户端工具名/schema，不做任何适配，用于排障
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ToolCompatibilityMode {
-    #[default]
-    ClaudeCode,
-    OpenCode,
-    Raw,
-}
-
-
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,12 +173,6 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 工具兼容模式。默认 `claude-code`（PascalCase 工具名）；`open-code`
-    /// 对应 opencode 的小写工具名与 camelCase 入参；`raw` 直接透传客户端
-    /// 工具名/schema，用于排障。详见 [`ToolCompatibilityMode`]。
-    #[serde(default = "default_tool_compatibility_mode")]
-    pub tool_compatibility_mode: ToolCompatibilityMode,
-
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -307,10 +283,6 @@ fn default_extract_thinking() -> bool {
     true
 }
 
-fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
-    ToolCompatibilityMode::ClaudeCode
-}
-
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -362,7 +334,6 @@ impl Default for Config {
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
-            tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
