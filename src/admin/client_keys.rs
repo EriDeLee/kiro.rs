@@ -38,9 +38,6 @@ pub struct ClientKey {
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
-    /// 累计 credit 计费量（meteringEvent.usage 累加）
-    #[serde(default)]
-    pub total_credits: f64,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -170,7 +167,6 @@ impl ClientKeyManager {
             total_calls: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
-            total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
         };
@@ -211,7 +207,6 @@ impl ClientKeyManager {
                     total_calls: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
-                    total_credits: 0.0,
                     group: None,
                     is_system: true,
                 },
@@ -409,7 +404,6 @@ impl ClientKeyManager {
                 e.total_calls = 0;
                 e.total_input_tokens = 0;
                 e.total_output_tokens = 0;
-                e.total_credits = 0.0;
                 true
             }
             None => false,
@@ -443,14 +437,15 @@ impl ClientKeyManager {
     }
 
     /// 在请求结束时累计 Token 用量并落盘
-    pub fn record_usage(&self, id: u64, input_tokens: u64, output_tokens: u64, credits: f64) {
+    /// 在请求结束时累计 Token 用量并落盘。
+    ///
+    /// 不记 credits：该字段此前只写不读（Admin API 与前端都不暴露它），
+    /// 属死字段已移除。credit 计量在 usage_log / trace 里仍有完整记录。
+    pub fn record_usage(&self, id: u64, input_tokens: u64, output_tokens: u64) {
         let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get_mut(&id) {
             entry.total_input_tokens += input_tokens;
             entry.total_output_tokens += output_tokens;
-            if credits.is_finite() && credits > 0.0 {
-                entry.total_credits += credits;
-            }
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
         self.save_locked(&inner);
@@ -529,8 +524,8 @@ mod tests {
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
-        mgr.record_usage(entry.id, 100, 50, 0.0);
-        mgr.record_usage(entry.id, 200, 30, 1.5);
+        mgr.record_usage(entry.id, 100, 50);
+        mgr.record_usage(entry.id, 200, 30);
         let list = mgr.list();
         let e = list.iter().find(|x| x.id == entry.id).unwrap();
         assert_eq!(e.total_input_tokens, 300);
@@ -548,7 +543,7 @@ mod tests {
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
-        mgr.record_usage(entry.id, 100, 50, 1.5);
+        mgr.record_usage(entry.id, 100, 50);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
         assert_ne!(rotated.key, old_key);
@@ -590,7 +585,7 @@ mod tests {
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
         );
-        mgr.record_usage(0, 100, 50, 1.5);
+        mgr.record_usage(0, 100, 50);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
         mgr.set_disabled(0, true);
 

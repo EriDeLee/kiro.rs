@@ -100,12 +100,7 @@ impl UsageRecordHook {
         }
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {
-                m.record_usage(
-                    self.key_id,
-                    rec.input_tokens,
-                    rec.output_tokens,
-                    rec.credits,
-                );
+                m.record_usage(self.key_id, rec.input_tokens, rec.output_tokens);
             }
         }
     }

@@ -257,7 +257,6 @@ impl TraceStore {
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
         ];
-        let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
             if !existing.contains(name) {
                 conn.execute_batch(&format!(
@@ -266,12 +265,20 @@ impl TraceStore {
                 ))?;
             }
         }
-        // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
-        if key_source_added {
-            conn.execute_batch(
-                "UPDATE traces SET key_source = CASE WHEN key_id = 0 \
-                 THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
-            )?;
+        // 回填 key_source 的残留 NULL，按 key_id 语义：master apiKey (key_id=0) 之外
+        // 都视为客户端 Key。
+        //
+        // **必须无条件执行**，不能只在「本次刚 ALTER 添加该列」时做：别的分支/旧版本
+        // 可能已经加了这一列却没回填（实测某生产库 7822 行里 4849 行为 NULL，占 62%），
+        // 此时读取会 `Invalid column type Null at index: 3` 直接让 trace 查询全军覆没。
+        // 本语句幂等——没有 NULL 时是空操作。
+        let backfilled = conn.execute(
+            "UPDATE traces SET key_source = CASE WHEN key_id = 0 \
+             THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL",
+            [],
+        )?;
+        if backfilled > 0 {
+            tracing::info!("traces 迁移：回填 {} 行 key_source", backfilled);
         }
         Ok(())
     }
