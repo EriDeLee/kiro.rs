@@ -112,7 +112,13 @@ fn tool_query(tu: &CompletedToolUse) -> Option<String> {
         .or_else(|| normalized_query_value(&tu.input))
 }
 
-fn log_invalid_web_search_input(tu: &CompletedToolUse) {
+/// 模型给的 web_search 入参里找不到可用 query 时，构造上抛的错误。
+///
+/// **不降级成空结果。** 上游此处是 `warn` + `searched.push(None)`，那等于告诉模型
+/// 「搜过了，没找到」——而真实情况是「我们没搜」。模型会据此得出「这事没有相关信息」
+/// 的结论并写进回答，这正是 AGENTS.md §2.5 所禁的：替客户端制造一个不存在的结果。
+/// 入参畸形是模型输出的问题，让它显式失败比让它以为搜过更有用。
+fn invalid_web_search_input_error(tu: &CompletedToolUse) -> anyhow::Error {
     let (input_kind, input_details) = match &tu.input {
         Value::Object(object) => {
             let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -129,8 +135,15 @@ fn log_invalid_web_search_input(tu: &CompletedToolUse) {
         tool_use_id = %tu.id,
         input_kind,
         input_details = %input_details,
-        "web_search tool input has no usable non-empty query; returning an empty result without calling MCP"
+        "web_search tool input has no usable non-empty query; failing the request instead of faking an empty result"
     );
+    anyhow::anyhow!(
+        "web_search tool_use {} carries no usable non-empty query (input kind: {}{}{})",
+        tu.id,
+        input_kind,
+        if input_details.is_empty() { "" } else { ", keys/len: " },
+        input_details
+    )
 }
 
 fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
@@ -758,9 +771,15 @@ pub(super) async fn run_web_search_loop(
             let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 let Some(query) = tool_query(tu) else {
-                    log_invalid_web_search_input(tu);
-                    searched.push(None);
-                    continue;
+                    let err = invalid_web_search_input_error(tu);
+                    hook.record(
+                        last_credential_id,
+                        fallback_input_tokens,
+                        0,
+                        total_credits,
+                        "error",
+                    );
+                    return map_provider_error(err);
                 };
                 log_normalized_web_search_query(tu, &query);
                 let (_id, mcp_request) = websearch::create_mcp_request(&query);
@@ -805,9 +824,15 @@ pub(super) async fn run_web_search_loop(
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
                 let Some(query) = tool_query(tu) else {
-                    log_invalid_web_search_input(tu);
-                    searched.push(None);
-                    continue;
+                    let err = invalid_web_search_input_error(tu);
+                    hook.record(
+                        last_credential_id,
+                        fallback_input_tokens,
+                        0,
+                        total_credits,
+                        "error",
+                    );
+                    return map_provider_error(err);
                 };
                 log_normalized_web_search_query(tu, &query);
                 let (_id, mcp_request) = websearch::create_mcp_request(&query);
@@ -1106,6 +1131,37 @@ mod tests {
         assert_eq!(tool_query(&tu_with_input(json!({"other": true}))), None);
     }
 
+    /// 回归锁：模型给的 web_search 入参无可用 query 时，**必须失败**，
+    /// 不得降级成空搜索结果。
+    ///
+    /// 上游此处是 `warn` + `searched.push(None)`，那等于对模型说「搜过了，没找到」，
+    /// 而真实情况是「我们没搜」——模型会据此断言「查无此事」。这是 AGENTS.md §2.5
+    /// 禁止的「替客户端制造不存在的结果」。留 warn 不够，必须让请求显式失败。
+    #[test]
+    fn invalid_web_search_input_is_an_error_not_an_empty_result() {
+        for input in [
+            json!({"query": "   "}),
+            json!({"query": 42}),
+            json!({"other": true}),
+            json!({}),
+            json!(null),
+        ] {
+            let tu = tu_with_input(input.clone());
+            assert!(
+                tool_query(&tu).is_none(),
+                "{input} 不该被解析出 query"
+            );
+            // 该形态下必须走 map_provider_error，落到非 2xx。
+            let resp = map_provider_error(invalid_web_search_input_error(&tu));
+            assert!(
+                !resp.status().is_success(),
+                "{input}: 畸形入参必须失败，不得伪造空结果"
+            );
+        }
+    }
+
+    /// 与上一条互补：MCP 明确回「无结果」是**正常业务态**，不是错误 ——
+    /// 上游确实搜了，只是没命中。这种情况继续用空结果是对的。
     #[test]
     fn no_results_mcp_error_is_nonfatal() {
         assert!(is_no_results_mcp_error(&anyhow::anyhow!("MCP error: -32602 - Tool returned no results")));
