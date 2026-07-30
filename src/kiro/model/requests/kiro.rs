@@ -114,12 +114,7 @@ mod tests {
                     "userInputMessage": {
                         "content": "Test message",
                         "modelId": "claude-3-5-sonnet",
-                        "userInputMessageContext": {
-                            "envState": {
-                                "operatingSystem": "macos",
-                                "currentWorkingDirectory": "/workspace"
-                            }
-                        }
+                        "userInputMessageContext": {}
                     }
                 }
             }

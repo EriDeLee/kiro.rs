@@ -93,7 +93,7 @@ impl CurrentMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
-    /// 用户输入消息上下文（始终序列化，envState 是 CLI endpoint 必填字段）
+    /// 用户输入消息上下文（承载工具声明与工具执行结果）
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
@@ -138,41 +138,12 @@ impl UserInputMessage {
     }
 }
 
-/// 环境状态（kiro-cli 始终发送此字段，CLI endpoint 要求）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvState {
-    pub operating_system: String,
-    pub current_working_directory: String,
-}
-
-impl Default for EnvState {
-    /// 中性占位值，**不探测也不泄露中转机信息**。
-    ///
-    /// 2026-07-29 实测（`/generateAssistantResponse`）：删掉 `envState` 字段、
-    /// 置为 `{}`、乃至删掉整个 `userInputMessageContext` 全部返回 200 ——
-    /// 「envState 是必填字段」对 ide endpoint 不成立。唯一会 400 的是
-    /// 「字段存在但两个值都是空串」（Smithy `@length(min:1)`）。
-    ///
-    /// 此前这里发的是硬编码 `"macos"`（而宿主实际是 Linux —— 在向上游谎报环境）
-    /// 与 `std::env::current_dir()`（**中转机真实路径**，每个请求都告诉 Amazon
-    /// 部署目录布局）。两者都与客户端无关。
-    fn default() -> Self {
-        Self {
-            operating_system: "linux".to_string(),
-            current_working_directory: "/".to_string(),
-        }
-    }
-}
-
 /// 用户输入消息上下文
 ///
 /// 包含工具定义和工具执行结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessageContext {
-    /// 环境状态（kiro-cli 始终携带）
-    pub env_state: EnvState,
     /// 工具执行结果列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResult>,
@@ -184,7 +155,6 @@ pub struct UserInputMessageContext {
 impl Default for UserInputMessageContext {
     fn default() -> Self {
         Self {
-            env_state: EnvState::default(),
             tool_results: Vec::new(),
             tools: Vec::new(),
         }
