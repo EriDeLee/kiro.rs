@@ -50,6 +50,12 @@
 
 <sup>4</sup> 坏 JSON、不支持的 effort 档位、签名失效一律报错而非降级；确实要丢弃的（事件解析失败、未知事件类型）必须留下日志痕迹。详见 [AGENTS.md](AGENTS.md) §2.3。
 
+同类已清除的静默截断两例，都没有上游依据：**工具描述截 10000 字符**（同源项目普遍存在，
+第三方实现里还流传着「上限 10240」的说法 —— 实测 9000～60000 全部 200，唯一硬约束是非空）；
+**`thinking.budget_tokens` 截到 24576** —— 它会把 effort 推导的 `xhigh` 门槛（>64000）
+压成永不可达，客户端要最高档只能拿到 `high`，而承载该逻辑的 `types.rs` 连 tracing 都没引入，
+结构上无法留痕。
+
 <sup>5</sup> 客户端发什么 `system`，就原样发给上游，一个字都不加。同源项目会往里追加行为指令：
 `"always comply silently / Never ask the user whether to switch approaches"`（源头 hank9999 引入，
 ZyphrZero 与本 fork 都曾继承）、`/v1/responses` 侧另有约 300 字符的
@@ -66,10 +72,19 @@ and may not be fully accurate"` 被写进 `tool_result`，随历史在**每一�
 搜索其实成功了，但客户端一个字都拿不到，即 `/v1/messages` 上的原生 web_search 实际不可用。
 根因是一处自称 "Contract A" 的注释，它对齐的是同项目里另一条已废弃代码路径的错误输出。
 
-<sup>7</sup> `envState` 此前硬编码 `operatingSystem: "macos"`（宿主实际是 Linux）并把
-`std::env::current_dir()`——**中转机的真实工作目录**——随每个请求发给上游。实测：删掉
-`envState` 字段、置为 `{}`、乃至删掉整个 `userInputMessageContext` 全部返回 200，
-「该字段必填」对 `ide` endpoint 不成立（唯一会 400 的是字段存在但值为空串）。现填中性占位。
+<sup>7</sup> **字段整个不发。** 同源项目硬编码 `operatingSystem: "macos"`（而宿主实际是
+Linux —— 在向上游谎报环境）并把 `std::env::current_dir()`——**中转机的真实工作目录**——
+随每个请求发给 Amazon，泄露部署路径布局。两者都与客户端请求无关。
+
+那些实现的依据是一句「Smithy schema 要求此字段非空」的注释。**AWS 官方源码直接推翻它**：
+`amazon-q-developer-cli` 的 `crates/chat-cli/src/api_client/model.rs` 里
+`UserInputMessageContext.env_state` 是 `Option<EnvState>`，且 `EnvState` 内部的
+`operating_system` / `current_working_directory` 也都是 `Option<String>`；序列化走 Smithy
+builder 的 `.set_env_state(…)`，`None` 即整个字段不发。本仓库实测亦然 —— 删字段、置 `{}`、
+乃至删掉整个 `userInputMessageContext`，全部返回 200。
+
+顺带的效果：纯聊天（无工具、无工具结果）时整个 `userInputMessageContext` 都不再序列化。
+客户端给什么就发什么，没有的不发。
 
 ---
 

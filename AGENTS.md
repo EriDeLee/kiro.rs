@@ -332,6 +332,22 @@ graceful shutdown 失效。
 `SendMessageStreaming`），`profileArn` 注入在 **body 根对象**（不是 query）；
 且 `provider.rs` 的诊断日志打的是 **endpoint 注入前**的中间产物，照抄会 400。
 
+**被生态广泛照抄的两个错误假设**（2026-07-30 以 AWS 官方源码 + 实测双向推翻）：
+
+| 流传的说法 | 真相 | 依据 |
+|---|---|---|
+| `envState` 是必填字段，必须带 `operatingSystem` + `currentWorkingDirectory` | **全部可选** | AWS 官方 `amazon-q-developer-cli`（`crates/chat-cli/src/api_client/model.rs`）：`UserInputMessageContext.env_state: Option<EnvState>`，且 `EnvState` 内部 `operating_system: Option<String>`、`current_working_directory: Option<String>` 也都是 `Option`；序列化走 Smithy builder 的 `.set_env_state(…)`，`None` 即整个字段不发。本仓库实测亦然（删字段 / `{}` / 删整个 context 全部 200） |
+| 工具 `description` 有 10240 字符上限，超出须截断 | **无此上限** | 实测 9000 / 10000 / 10001 / 15000 / 30000 / 60000 全部 200。唯一硬约束是非空（Smithy `@length(min:1)`） |
+
+第一条在本仓库的来源是 `cfd132e` 的提交信息「CLI endpoint 的 Smithy schema 要求此字段
+非空」。那次提交同时修了两件事 —— 工具空描述触发的 `ValidationException` 与新增
+`envState`，作者把前者的报错**误归因**到了后者。同一提交里「工具描述非空」那条是真的
+（已实测复现）。第二条出现在第三方项目 `mucsbr/amq2api` 的注释里，同样无实测支撑。
+
+教训：同源项目之间会互相照抄未经验证的协议假设，而错误假设一旦写进注释就会被当成
+既定事实。**判断上游协议约束时，优先查 AWS 官方客户端源码（它就是 Smithy 生成的
+权威定义），其次自己发变异请求实测；同源 fork 的注释不能作为依据。**
+
 **响应侧必填字段**：`web_search_tool_result.tool_use_id` 必须存在且等于同组
 `server_tool_use.id`。`@ai-sdk/anthropic` 的 zod schema 是 `tool_use_id: z.string()`
 （无 `.nullish()`），缺了它 SDK 以 `Invalid JSON response` 拒绝**整个响应** ——
