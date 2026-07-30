@@ -61,17 +61,20 @@ pub struct ModelsResponse {
 // === Messages 端点类型 ===
 
 /// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
-    #[serde(
-        default = "default_budget_tokens",
-        deserialize_with = "deserialize_budget_tokens"
-    )]
+    /// 客户端原样保留，**不截断**。
+    ///
+    /// 曾有 `.min(24576)` 静默截断，把 `effort_from_budget_tokens` 的 `xhigh`
+    /// 门槛（>64000）锁成永不可达 —— 客户端发 64000 想要最高档，实际只拿到
+    /// `high`，且无任何痕迹（`types.rs` 连 tracing 都没引入，结构上无法 warn）。
+    /// 该字段本身不下发上游（两族 schema 都不含它），只用于旧式客户端
+    /// （`thinking.type="enabled"`，SDK 4.0.24 实测仍会发）推导 effort 档位。
+    #[serde(default = "default_budget_tokens")]
     pub budget_tokens: i32,
     /// 思考内容展示方式：`summarized` / `omitted`。
     ///
@@ -90,13 +93,6 @@ impl Thinking {
 
 fn default_budget_tokens() -> i32 {
     20000
-}
-fn deserialize_budget_tokens<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
 }
 
 /// OutputConfig 配置

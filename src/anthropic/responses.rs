@@ -57,18 +57,7 @@ const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 /// 未显式给出 max_output_tokens 时的默认输出上限
 const DEFAULT_MAX_TOKENS: i32 = 32000;
 
-/// 无 codex 工具时的严格提示（保持既有已验证的纯聊天/搜索行为）
-const NUDGE_STRICT: &str = "You have a web_search tool that returns live results. For anything \
-time-sensitive — current events, news, recent sports results, prices, releases, or facts \
-that may be newer than your training data — call web_search before answering, and never \
-claim something did not happen without searching first. Do not call any other tool.";
 
-/// 有 codex 工具时的软化提示（其它工具照常使用）
-const NUDGE_SOFT: &str = "You have a web_search tool that returns live results. For anything \
-time-sensitive — current events, news, recent sports results, prices, releases, or facts \
-that may be newer than your training data — call web_search before answering, and never \
-claim something did not happen without searching first. Use your other tools normally for \
-all other work.";
 
 // ============================ 工具声明类型 ============================
 
@@ -301,37 +290,20 @@ fn responses_to_anthropic(
     let mut tool_kinds: ToolKindMap = HashMap::new();
     let mut tool_list = convert_responses_tools(&declared_entries, &mut tool_kinds, None);
 
-    if tool_list.is_empty() {
-        // 无 codex 工具（纯聊天流）：保持既有已验证行为——noop 占位 +
-        // 原生 web_search（占位保证 tool_count > 1，走 agentic loop 而非
-        // 单工具 fast-path）+ 严格提示。
-        tool_list = vec![
-            Tool {
-                tool_type: None,
-                name: "noop".to_string(),
-                description: "Placeholder tool; never call this.".to_string(),
-                input_schema: Default::default(),
-                max_uses: None,
-                cache_control: None,
-            },
-            native_web_search_tool(),
-        ];
-        system.push(SystemMessage {
-            text: NUDGE_STRICT.to_string(),
-            cache_control: None,
-        });
-    } else {
-        // 有 codex 工具：追加原生 web_search（除非客户端已声明同名工具，
-        // 避免名字冲突破坏 tool_name 还原逻辑），并使用软化提示。
-        // 注入后 has_web_search_among_tools 命中 → 走 agentic loop，
-        // loop 会把非 web_search 的 client 工具 tool_use 原样透传。
-        if !tool_list.iter().any(|t| t.name == "web_search") {
-            tool_list.push(native_web_search_tool());
-        }
-        system.push(SystemMessage {
-            text: NUDGE_SOFT.to_string(),
-            cache_control: None,
-        });
+    // 追加原生 web_search（除非客户端已声明同名工具，避免破坏 tool_name 还原）。
+    //
+    // **不注入任何提示词，也不注入占位工具。** 2026-07-29 实测（只改「是否带
+    // NUDGE 文本」这一个变量）：模型只要在 tools 里看到 web_search 就会主动调用，
+    // 无需提示词督促；连 `noop` 占位都不需要 —— 单独一个 web_search 同样被调用。
+    //
+    // 此前这里会 push 约 300 字符的行为指令（"never claim something did not happen
+    // without searching first"、"Do not call any other tool"，后者甚至否定客户端
+    // 自己声明的工具），以及一个名为 `noop` 的假工具。`noop` 的唯一目的是把
+    // tools.len() 顶到 2 以逃离 `has_web_search_tool` 的单工具快速路径 ——
+    // 那是为操纵本进程的 if 判断而向上游发假数据，已改为直接修正判断条件
+    // （见 `websearch::has_web_search_among_tools`）。
+    if !tool_list.iter().any(|t| t.name == "web_search") {
+        tool_list.push(native_web_search_tool());
     }
 
     let custom_count = tool_kinds
@@ -1399,40 +1371,64 @@ mod tests {
         );
     }
 
+    /// 回归锁：客户端未声明工具时，只注入原生 web_search —— **不加占位工具，
+    /// 也不注入任何提示词**。
+    ///
+    /// 此前这里会额外发一个名为 `noop` 的假工具（唯一目的是把 tools.len() 顶到 2
+    /// 以逃离单工具快速路径），并 push 约 300 字符行为指令。2026-07-29 实测：
+    /// 模型只要在 tools 里看到 web_search 就会主动调用，两者都不需要。
     #[test]
-    fn noop_fallback_when_no_codex_tools() {
+    fn tool_less_flow_injects_only_web_search_without_nudge() {
         let req = req_with(json!([]), simple_input());
         let (anth, kinds) = responses_to_anthropic(req).unwrap();
         assert!(kinds.is_empty());
         let tools = anth.tools.as_ref().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["noop", "web_search"]);
-        // 严格提示保留
+        assert_eq!(names, vec!["web_search"], "不得再注入 noop 占位工具");
+        // 代理不得往 system 里塞任何行为指令
         let sys = system_texts(&anth);
-        assert!(
-            sys.iter()
-                .any(|t| t.contains("Do not call any other tool")),
-            "strict nudge must be kept for tool-less flows"
-        );
+        for banned in [
+            "Do not call any other tool",
+            "never claim something did not happen",
+            "Use your other tools normally",
+            "You have a web_search tool",
+        ] {
+            assert!(
+                !sys.iter().any(|t| t.contains(banned)),
+                "代理注入了提示词: {banned}"
+            );
+        }
     }
 
     #[test]
-    fn nudge_softened_when_codex_tools_present() {
+    /// 回归锁：客户端有自带工具时，web_search 照常追加，但 system **保持客户端原样**。
+    fn client_tools_flow_keeps_system_verbatim() {
         let req = req_with(
             json!([{ "type": "function", "name": "shell", "parameters": {} }]),
             simple_input(),
         );
         let (anth, _) = responses_to_anthropic(req).unwrap();
+        let tools = anth.tools.as_ref().unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "shell"),
+            "客户端工具必须透传"
+        );
+        assert!(
+            tools.iter().any(|t| t.name == "web_search"),
+            "原生 web_search 仍应追加"
+        );
         let sys = system_texts(&anth);
-        assert!(
-            !sys.iter().any(|t| t.contains("Do not call any other tool")),
-            "strict nudge must be removed when codex tools are forwarded"
-        );
-        assert!(
-            sys.iter()
-                .any(|t| t.contains("Use your other tools normally")),
-            "soft nudge must be present"
-        );
+        for banned in [
+            "Do not call any other tool",
+            "never claim something did not happen",
+            "Use your other tools normally",
+            "You have a web_search tool",
+        ] {
+            assert!(
+                !sys.iter().any(|t| t.contains(banned)),
+                "代理注入了提示词: {banned}"
+            );
+        }
     }
 
     #[test]

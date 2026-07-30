@@ -95,7 +95,29 @@ open-code 第二套）。那个机制的前提假设 —— 客户端内置工�
 
 本仓库已有三条注释被实测推翻（见 §5），这类错误陈述会让后来者基于假前提做决策。
 
-### 2.5 告警噪音会让告警失效
+### 2.5 不改写客户端请求的内容
+
+**客户端发什么，就发什么给上游。** 不追加提示词、不注入客户端未声明的工具、不伪造对话轮次、
+不改写入参键名、不截断文本。这条比 §2.3（不静默降级）更严格：降级至少是在处理异常，
+而改写请求是在**替客户端做它没要求的决定**，且客户端完全无从察觉。
+
+2026-07-29 一次穷尽审查在本仓库（继承自 hank9999 → ZyphrZero）挖出 11 处，逐项实测后
+删掉 9 处。典型形态与它们当初的"理由"：
+
+| 形态 | 实例 | 实测结论 |
+|---|---|---|
+| 往 system 追加行为指令 | `"always comply silently / Never ask the user whether to switch approaches / without commentary"` | 方向与本项目原则正相反；客户端不知情；且它假设的 `Write`/`Edit` 工具名在工具映射删除后已不存在 |
+| 注入约 300 字符的搜索督促 | `"never claim something did not happen without searching first / Do not call any other tool"` | 只改「是否带该文本」一个变量实测：模型看到 `web_search` 工具就会主动调用，**提示词不改变行为**；而 `Do not call any other tool` 直接否定客户端自己声明的工具 |
+| 注入客户端未声明的工具 | 名为 `noop` 的假工具 | 唯一目的是把 `tools.len()` 顶到 2 以绕开自家的单工具分支 —— **为操纵本进程的 if 判断而向上游发假数据** |
+| 伪造对话轮次 | system 后跟 `assistant("I will follow these instructions.")`、末尾孤立 user 后补 `assistant("OK")` | 实测上游**不要求** user/assistant 交替：相邻两条 user、孤立 user、孤立 assistant 全部 200 |
+| 结果里掺入自己的话 | 搜索摘要尾部 `"Please note that these are web search results and may not be fully accurate"` | 它进 `tool_result` → `payload.messages`，**每一轮**都在历史里重复；中文会话里插英文句子 |
+| 静默截断 | `budget_tokens.min(24576)`、工具描述 `.nth(10000)` | 前者把 `effort` 推导的 `xhigh` 门槛（>64000）锁成永不可达；后者实测上游 60000 字符照样 200 |
+| 伪造环境信息 | `envState{operatingSystem:"macos", cwd:std::env::current_dir()}` | `macos` 是硬编码而宿主是 Linux；cwd 把**中转机真实路径**发给上游。实测该字段整个可省 |
+
+判据：**如果这段代码的效果无法从客户端的请求推导出来，它就是改写。** 唯一例外是上游协议
+硬性要求（要有实测支撑，写进 §4），且必须在注释里写明是哪条约束。
+
+### 2.6 告警噪音会让告警失效
 
 已知无害的事件不能每次告警，否则日志常驻噪音，真正的协议变更会被埋没。正确流程：
 
@@ -289,6 +311,31 @@ graceful shutdown 失效。
 - `effort=xhigh|max` 与 `thinking.type=disabled` 冲突时**整体不下发 thinking 字段**，绝不反向改写 effort
 
 **窗口大小**（`tokenLimits`，2026-07-29 实测）：
+
+**上游并不要求的东西**（2026-07-29 直连 `/generateAssistantResponse` 变异测试，
+以代理的真实成功请求为模板，每次只改一处）：
+
+| 变异 | 结果 | 推论 |
+|---|---|---|
+| 删掉 `envState` 字段 | 200 | 「envState 是 CLI endpoint 必填字段」对 `ide` endpoint **不成立** |
+| `envState = {}` | 200 | 同上 |
+| 删掉整个 `userInputMessageContext` | 200 | 同上 |
+| `envState` 两字段都是空串 | **400** `REQUEST_BODY_INVALID` | 唯一的硬约束：字段若存在则值不能为空串（Smithy `@length(min:1)`） |
+| history 里相邻两条 `userInputMessage` | 200 | **不要求 user/assistant 交替** |
+| history 只有一条 user（末尾孤立） | 200 | 不需要补 `assistant("OK")` |
+| history 只有一条 assistant | 200 | 同上 |
+| `assistantResponseMessage.content` 为空串 | 200 | — |
+| 工具 `description` 9000 / 10000 / 10001 / 15000 / 30000 / 60000 字符 | 全部 200 | **没有 10000 字符上限**，那个截断无依据 |
+| 工具 `description` 为空串 | **400** `Invalid tool use format` | 非空是硬要求（`ToolSpecification.description` 非 Option） |
+
+排查这类问题时的两个坑：上游端点是 **`/generateAssistantResponse`**（不是
+`SendMessageStreaming`），`profileArn` 注入在 **body 根对象**（不是 query）；
+且 `provider.rs` 的诊断日志打的是 **endpoint 注入前**的中间产物，照抄会 400。
+
+**响应侧必填字段**：`web_search_tool_result.tool_use_id` 必须存在且等于同组
+`server_tool_use.id`。`@ai-sdk/anthropic` 的 zod schema 是 `tool_use_id: z.string()`
+（无 `.nullish()`），缺了它 SDK 以 `Invalid JSON response` 拒绝**整个响应** ——
+搜索成功但客户端一个字都拿不到。同源项目全都缺这个字段。
 
 | 模型 | maxInputTokens | maxOutputTokens |
 |---|---|---|

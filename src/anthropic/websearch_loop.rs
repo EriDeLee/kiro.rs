@@ -426,15 +426,22 @@ fn append_search_round(
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
         }));
 
-        // Client presentation: server_tool_use + web_search_tool_result (Contract A)
+        // Client presentation: server_tool_use + web_search_tool_result。
+        //
+        // `tool_use_id` **必填**，且必须等于同组 `server_tool_use` 的 `id` ——
+        // Anthropic 官方 schema 如此规定，`@ai-sdk/anthropic` 的 zod schema 里是
+        // `tool_use_id: z.string()`（无 `.nullish()`）。此前这里不带该字段，注释
+        // 自称 "Contract A"，依据是已删除的 `generate_websearch_events`（单工具
+        // 快速路径的产物）。实测：SDK 直接以 `Invalid JSON response` 拒绝整个响应，
+        // 客户端拿不到任何内容。
         let (srv_id, _mcp) = websearch::create_mcp_request(&query);
         presentation.push(json!({
             "type": "server_tool_use", "id": srv_id, "name": "web_search",
             "input": {"query": query}
         }));
-        // Contract A: web_search_tool_result has only type + content (no tool_use_id), consistent with generate_websearch_events
         presentation.push(json!({
             "type": "web_search_tool_result",
+            "tool_use_id": srv_id,
             "content": build_result_block(results)
         }));
     }
@@ -634,8 +641,10 @@ fn build_flush_content(
                 "input": {"query": query}
             }));
             let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
+            // tool_use_id 必填且须与上面的 server_tool_use.id 一致（官方 schema）。
             content.push(json!({
                 "type": "web_search_tool_result",
+                "tool_use_id": srv_id,
                 "content": build_result_block(results)
             }));
         } else {
@@ -1327,13 +1336,30 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// 回归锁：MCP 搜索被上游限流时，必须原样传出 429 + `Retry-After`，
+    /// **不能降级成「搜到 0 条」的 200**。
+    ///
+    /// 该断言原先挂在 `websearch::finish_mcp_call` 上（单工具快速路径的收尾函数）。
+    /// 快速路径已删除，限流现在经 agentic loop 的 `map_provider_error` 传出，
+    /// 语义不变，故断言随之搬来这里 —— 不是删测试，是让它跟着被测路径走。
+    #[test]
+    fn mcp_rate_limit_passes_through_429_with_retry_after() {
+        let err = crate::kiro::error::UpstreamRateLimitError::new(Some("60".to_string()));
+        let resp = map_provider_error(err.into());
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "60"
+        );
+    }
+
     // ---- build_sse_events: present server_tool_use + result, and the exec tool_use is not swallowed ----
 
     #[test]
     fn sse_events_render_search_presentation_and_keep_exec() {
         let content = vec![
             json!({"type": "server_tool_use", "id": "srvtoolu_x", "name": "web_search", "input": {"query": "q"}}),
-            json!({"type": "web_search_tool_result", "content": []}),
+            json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_x", "content": []}),
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
@@ -1420,6 +1446,27 @@ mod tests {
                 .iter()
                 .any(|c| c["type"] == "web_search_tool_result"),
             "web_search must carry a web_search_tool_result block"
+        );
+
+        // 回归锁：`web_search_tool_result.tool_use_id` 必填，且必须等于同组
+        // `server_tool_use.id`。Anthropic 官方 schema 要求它；`@ai-sdk/anthropic`
+        // 的 zod 是 `tool_use_id: z.string()`（无 nullish），缺了它 SDK 会以
+        // `Invalid JSON response` 拒绝**整个响应**，客户端一个字都拿不到。
+        let srv = content
+            .iter()
+            .find(|c| c["type"] == "server_tool_use")
+            .expect("server_tool_use 块必须存在");
+        let res = content
+            .iter()
+            .find(|c| c["type"] == "web_search_tool_result")
+            .expect("web_search_tool_result 块必须存在");
+        assert!(
+            res["tool_use_id"].is_string(),
+            "web_search_tool_result 必须带 tool_use_id"
+        );
+        assert_eq!(
+            res["tool_use_id"], srv["id"],
+            "tool_use_id 必须与同组 server_tool_use.id 一致"
         );
         assert!(
             content
@@ -1731,7 +1778,7 @@ mod tests {
         let content = vec![
             json!({"type":"text","text":"answer"}),
             json!({"type":"server_tool_use","id":"s","name":"web_search","input":{"query":"q"}}),
-            json!({"type":"web_search_tool_result","content":[]}),
+            json!({"type":"web_search_tool_result","tool_use_id":"srvtoolu_x","content":[]}),
         ];
         assert_eq!(resolve_flush_stop_reason(None, true, &content), "end_turn");
     }

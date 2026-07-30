@@ -33,11 +33,14 @@
 | **模型白名单 + 协议隔离** | ✅ 一协议一组模型，跨协议 400 | ❌ 未知模型透传 | ❌ | ❌ |
 | **prompt cache 计量** | 已移除<sup>3</sup> | 本地伪造 | 本地伪造 | 本地伪造 |
 | **静默降级** | 全部移除<sup>4</sup> | 存在 | 存在 | 存在 |
+| **不改写客户端提示词** | ✅ 零注入<sup>5</sup> | ❌ 5 类注入 | ❌ 3 类 | ❌ 2 类 |
+| **原生 `web_search` 响应合规** | ✅ 带 `tool_use_id` | ❌ 缺失<sup>6</sup> | ❌ 缺失 | ❌ 缺失 |
+| **不伪造环境信息** | ✅<sup>7</sup> | ❌ 谎报 `macos` + 发真实 cwd | — | ❌ 谎报 `macos` + 发真实 cwd |
 | `<invoke>` XML 泄漏捞回 | ✅ | ✅ | ❌ | ❌ |
 | 工具 JSON 累积器 | ✅ 全路径 | ✅ 主路径 | ❌ | ✅ |
 | 日志脱敏 | ✅ | ❌ | ❌ | ✅ |
 | legacy 端点 | 无 | `/v1/chat/completions`、`/cc/v1/*` | `/cc/v1/*` | `/cc/v1/*` |
-| 源码规模 | 42.4k 行 | 44.9k | 15.3k | 34.6k |
+| 源码规模 | 41.6k 行 | 44.9k | 15.3k | 34.6k |
 
 <sup>1</sup> Anthropic 官方明确：模型靠解密 `signature` 重建思维链，`thinking` 字段的明文**被忽略**。拼进 content 只会浪费上下文，并诱导模型把内部推理写进可见输出。
 
@@ -46,6 +49,27 @@
 <sup>3</sup> 端到端实证：请求侧 `cachePoint` 被静默丢弃（同形状 bogus 字段同样返回 200），响应侧 `metadataEvent` 只含 `stopReason`、无 `tokenUsage`。上游缓存隐式生效且免费（重复长前缀 credit ×0.528），但中转层拿不到明细，任何计量都是本地伪造。
 
 <sup>4</sup> 坏 JSON、不支持的 effort 档位、签名失效一律报错而非降级；确实要丢弃的（事件解析失败、未知事件类型）必须留下日志痕迹。详见 [AGENTS.md](AGENTS.md) §2.3。
+
+<sup>5</sup> 客户端发什么 `system`，就原样发给上游，一个字都不加。同源项目会往里追加行为指令：
+`"always comply silently / Never ask the user whether to switch approaches"`（源头 hank9999 引入，
+ZyphrZero 与本 fork 都曾继承）、`/v1/responses` 侧另有约 300 字符的
+`"never claim something did not happen without searching first / Do not call any other tool"`
+——后者甚至否定客户端自己声明的工具。另有一条 `"Please note that these are web search results
+and may not be fully accurate"` 被写进 `tool_result`，随历史在**每一轮**重复出现。
+实测（只改「是否带该提示词」这一个变量）：模型只要在 `tools` 里看到 `web_search` 就会主动调用，
+提示词并不改变行为，纯属污染上下文。同理不注入客户端未声明的工具（同源项目会发一个名叫
+`noop` 的假工具，唯一目的是把 `tools.len()` 顶到 2 以绕开自家的单工具分支）。
+
+<sup>6</sup> Anthropic 官方 schema 要求 `web_search_tool_result.tool_use_id` **必填**且等于同组
+`server_tool_use.id`（`@ai-sdk/anthropic` 的 zod 是 `tool_use_id: z.string()`，无 `.nullish()`）。
+同源项目全都不带该字段，导致 SDK 以 `Invalid JSON response` 拒绝**整个响应**——
+搜索其实成功了，但客户端一个字都拿不到，即 `/v1/messages` 上的原生 web_search 实际不可用。
+根因是一处自称 "Contract A" 的注释，它对齐的是同项目里另一条已废弃代码路径的错误输出。
+
+<sup>7</sup> `envState` 此前硬编码 `operatingSystem: "macos"`（宿主实际是 Linux）并把
+`std::env::current_dir()`——**中转机的真实工作目录**——随每个请求发给上游。实测：删掉
+`envState` 字段、置为 `{}`、乃至删掉整个 `userInputMessageContext` 全部返回 200，
+「该字段必填」对 `ide` endpoint 不成立（唯一会 400 的是字段存在但值为空串）。现填中性占位。
 
 ---
 
@@ -118,7 +142,7 @@ cargo build --release
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（540 个）
+cargo test --release                      # 后端测试（536 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

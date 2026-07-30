@@ -631,34 +631,17 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0.0, status);
-        return resp;
-    }
+    // 注意：这里曾有一条「纯 WebSearch 快速路径」——当 tools 恰好只有一个原生
+    // web_search 时，直接由 `handle_websearch_request` 代答。它已删除，原因：
+    //
+    // 1. 它用 `extract_search_query` **从消息文本里猜搜索词**，模型完全不参与
+    //    决策 —— 替客户端做了它没要求的决定；
+    // 2. 「按工具数量分流」逼得 `/v1/responses` 侧为了逃离这条路径而向上游注入
+    //    一个名为 `noop` 的假工具（只为把 len() 顶到 2）。判断条件修正后，
+    //    那个假工具也随之删除。
+    //
+    // 现在只要 tools 里含原生 web_search 就统一走下面的 agentic loop：由模型
+    // 自己决定何时搜、搜什么，代理只负责执行搜索并把结果回喂。
 
     let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,

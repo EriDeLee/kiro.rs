@@ -147,13 +147,20 @@ pub struct EnvState {
 }
 
 impl Default for EnvState {
+    /// 中性占位值，**不探测也不泄露中转机信息**。
+    ///
+    /// 2026-07-29 实测（`/generateAssistantResponse`）：删掉 `envState` 字段、
+    /// 置为 `{}`、乃至删掉整个 `userInputMessageContext` 全部返回 200 ——
+    /// 「envState 是必填字段」对 ide endpoint 不成立。唯一会 400 的是
+    /// 「字段存在但两个值都是空串」（Smithy `@length(min:1)`）。
+    ///
+    /// 此前这里发的是硬编码 `"macos"`（而宿主实际是 Linux —— 在向上游谎报环境）
+    /// 与 `std::env::current_dir()`（**中转机真实路径**，每个请求都告诉 Amazon
+    /// 部署目录布局）。两者都与客户端无关。
     fn default() -> Self {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/".to_string());
         Self {
-            operating_system: "macos".to_string(),
-            current_working_directory: cwd,
+            operating_system: "linux".to_string(),
+            current_working_directory: "/".to_string(),
         }
     }
 }
@@ -318,7 +325,15 @@ pub struct HistoryAssistantMessage {
 }
 
 impl HistoryAssistantMessage {
-    /// 创建新的历史助手消息
+    /// 用纯文本构造一条历史 assistant 消息。**仅测试使用**。
+    ///
+    /// 生产路径不再有调用者：客户端真实的 assistant 消息经
+    /// `converter::convert_assistant_message` 构造（要携带 tool_uses /
+    /// reasoningContent），而代理**不再伪造** assistant 轮次 ——
+    /// 此前 system 后面跟一条 `"I will follow these instructions."`、
+    /// 末尾孤立 user 后面补一条 `"OK"`，两者都已删除（实测上游不要求
+    /// user/assistant 交替：相邻两条 user、孤立 user、孤立 assistant 全部 200）。
+    #[cfg(test)]
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             assistant_response_message: AssistantMessage::new(content),
