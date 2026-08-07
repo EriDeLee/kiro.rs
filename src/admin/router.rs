@@ -9,21 +9,21 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
+        add_credential, add_proxy, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
-        check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
+        check_proxy, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config, get_all_credentials,
         get_credential_balance, get_credential_models, get_current_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
-        get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
-        poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
+        list_client_keys, list_groups, list_traces, poll_idc_login,
+        poll_idc_relogin, poll_social_login, poll_social_relogin,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
-        rollback_image_update, rotate_client_key, set_account_throttle_config,
+        rotate_client_key, set_account_throttle_config,
         set_client_key_disabled, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
-        set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
+        set_log_governance_config, set_proxy_enabled, set_self_heal_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries, test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
@@ -120,16 +120,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/global-proxy",
             get(get_global_proxy).put(set_global_proxy),
         )
-        .route(
-            "/config/update",
-            get(get_update_config).put(set_update_config),
-        )
         .route("/config/admin-key", put(update_admin_key))
-        .route("/system/update/pull", post(pull_update_image))
-        .route("/system/update/apply", post(apply_image_update))
-        .route("/system/update/rollback", post(rollback_image_update))
-        .route("/system/update/check", get(check_update))
-        .route("/system/update/rate-limit", post(check_rate_limit))
         .route("/auth/idc/start", post(start_idc_login))
         .route("/auth/idc/poll/{session_id}", post(poll_idc_login))
         .route("/auth/social/start", post(start_social_login))

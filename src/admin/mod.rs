@@ -23,7 +23,6 @@ pub mod proxy_pool;
 mod router;
 mod service;
 pub mod types;
-mod binary_update;
 pub mod client_keys;
 pub mod groups;
 pub mod usage_stats;

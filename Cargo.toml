@@ -43,7 +43,4 @@ thiserror = "1"
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
-flate2 = "1"        # tar.gz 解压（在线更新）
-tar = "0.4"         # tar 解析（在线更新）
-zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）

@@ -30,11 +30,6 @@ import type {
   CompleteSocialLoginRequest,
   GlobalProxyResponse,
   SetGlobalProxyRequest,
-  UpdateConfigResponse,
-  SetUpdateConfigRequest,
-  ImageUpdateResponse,
-  UpdateCheckInfo,
-  GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
 } from '@/types/api'
 
@@ -524,56 +519,6 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
-  return data
-}
-
-// 获取镜像在线更新配置
-export async function getUpdateConfig(): Promise<UpdateConfigResponse> {
-  const { data } = await api.get<UpdateConfigResponse>('/config/update')
-  return data
-}
-
-// 设置镜像在线更新配置
-export async function setUpdateConfig(req: SetUpdateConfigRequest): Promise<UpdateConfigResponse> {
-  const { data } = await api.put<UpdateConfigResponse>('/config/update', req)
-  return data
-}
-
-// 拉取配置的 GHCR 镜像
-export async function pullUpdateImage(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/pull')
-  return data
-}
-
-// 拉取镜像并通过 Docker Compose 应用更新
-export async function applyImageUpdate(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/apply')
-  return data
-}
-
-// 通过本地备份 tag 回退到上一次更新前的镜像版本
-export async function rollbackImageUpdate(): Promise<ImageUpdateResponse> {
-  const { data } = await api.post<ImageUpdateResponse>('/system/update/rollback')
-  return data
-}
-
-// 检查 GitHub Releases 是否有新版本（带后端 30 分钟缓存；force=true 强制刷新）
-export async function checkSystemUpdate(force = false): Promise<UpdateCheckInfo> {
-  const { data } = await api.get<UpdateCheckInfo>('/system/update/check', {
-    params: force ? { force: 'true' } : undefined,
-  })
-  return data
-}
-
-// 查询 GitHub API 当前限流状态（可附带 token 用于"保存前先验证"）
-export async function checkGitHubRateLimit(
-  githubToken?: string,
-): Promise<GitHubRateLimitInfo> {
-  const body = githubToken ? { githubToken } : {}
-  const { data } = await api.post<GitHubRateLimitInfo>(
-    '/system/update/rate-limit',
-    body,
-  )
   return data
 }
 

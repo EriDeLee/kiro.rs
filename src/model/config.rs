@@ -87,31 +87,6 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
-    /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
-    #[serde(default)]
-    pub update_previous_version: Option<String>,
-
-    /// GitHub Personal Access Token（可选）。设置后 GitHub Releases 接口会带上
-    /// `Authorization: Bearer <token>`，把限流从匿名 60/h 提到认证 5000/h。
-    /// 仅需 `public_repo` 读取权限即可。
-    #[serde(default)]
-    pub github_token: Option<String>,
-
-    /// 上一次成功完成在线更新的时间（RFC3339）。前端用于显示「上次更新于 …」。
-    #[serde(default)]
-    pub update_last_applied_at: Option<String>,
-
-    /// 是否启用无人值守自动更新。开启后服务会在每天的 `update_auto_apply_time`
-    /// 时刻检查 GitHub Releases，发现新版本即自动下载二进制并替换重启。
-    #[serde(default)]
-    pub update_auto_apply: bool,
-
-    /// 自动更新的每日触发时间（本地时区，`HH:MM` 24 小时制）。
-    /// 默认 03:00 凌晨执行，对在线服务影响最小。
-    #[serde(default = "default_update_auto_apply_time")]
-    pub update_auto_apply_time: String,
-
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -275,10 +250,6 @@ fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
 
-fn default_update_auto_apply_time() -> String {
-    "03:00".to_string()
-}
-
 fn default_extract_thinking() -> bool {
     true
 }
@@ -320,11 +291,6 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
-            update_previous_version: None,
-            github_token: None,
-            update_last_applied_at: None,
-            update_auto_apply: false,
-            update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
@@ -375,13 +341,6 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
-
-        // 用户手工把字符串字段清空（如 `"updateAutoApplyTime": ""`）时，serde 默认值不会
-        // 介入；这里把"看起来像空"的关键字段回退到默认值，避免后续业务用到
-        // 空字符串导致难以诊断的错误。
-        if config.update_auto_apply_time.trim().is_empty() {
-            config.update_auto_apply_time = default_update_auto_apply_time();
-        }
 
         Ok(config)
     }

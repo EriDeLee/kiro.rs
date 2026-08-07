@@ -25,8 +25,7 @@ use super::{
         CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        SetSelfHealConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
@@ -691,73 +690,6 @@ pub async fn set_global_proxy(
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => e.into_http_response(),
     }
-}
-
-/// GET /api/admin/config/update
-/// 获取在线更新配置（不回显 GitHub Token 明文）
-pub async fn get_update_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_update_config())
-}
-
-/// PUT /api/admin/config/update
-/// 设置在线更新配置
-pub async fn set_update_config(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetUpdateConfigRequest>,
-) -> impl IntoResponse {
-    match state.service.set_update_config(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => e.into_http_response(),
-    }
-}
-
-/// POST /api/admin/system/update/pull
-/// 下载新版二进制并校验（不替换当前进程）
-pub async fn pull_update_image(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.pull_update_image().await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => e.into_http_response(),
-    }
-}
-
-/// POST /api/admin/system/update/apply
-/// 下载新版二进制、替换 exe，进程退出由容器重启策略接管
-pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.apply_image_update().await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => e.into_http_response(),
-    }
-}
-
-/// POST /api/admin/system/update/rollback
-/// 用 `<exe>.backup` 还原可执行文件并退出进程
-pub async fn rollback_image_update(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.rollback_image_update().await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => e.into_http_response(),
-    }
-}
-
-/// GET /api/admin/system/update/check?force=true
-/// 查询 GitHub Releases 是否有新版本（带 30 分钟缓存）
-pub async fn check_update(
-    State(state): State<AdminState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let force = matches!(params.get("force").map(String::as_str), Some("true" | "1"));
-    let info = state.service.check_update(force).await;
-    Json(info).into_response()
-}
-
-/// POST /api/admin/system/update/rate-limit
-/// 查询 GitHub API 当前限流配额（可附带 token 用于"保存前先验证"）
-pub async fn check_rate_limit(
-    State(state): State<AdminState>,
-    payload: Option<Json<super::types::CheckRateLimitRequest>>,
-) -> impl IntoResponse {
-    let req = payload.map(|Json(p)| p).unwrap_or_default();
-    let info = state.service.check_rate_limit(req).await;
-    Json(info).into_response()
 }
 
 /// POST /api/admin/credentials/:id/relogin/social/start

@@ -252,69 +252,6 @@ export interface SetGlobalProxyRequest {
   proxyUrl: string | null
 }
 
-// 在线更新配置
-export interface UpdateConfigResponse {
-  /** 上一次更新前正在运行的版本号（带 v 前缀）；存在时可调用回退接口 */
-  previousVersion?: string
-  /** 上一次成功完成在线更新的时间（RFC3339） */
-  lastAppliedAt?: string
-  /** 是否已配置 GitHub Token（仅返回布尔，不回明文） */
-  githubTokenSet: boolean
-  /** 是否开启无人值守自动更新 */
-  autoApply: boolean
-  /** 自动更新触发时间（本地时区，HH:MM 24 小时制） */
-  autoApplyTime: string
-}
-
-export interface SetUpdateConfigRequest {
-  /** GitHub Personal Access Token；空字符串表示清除 */
-  githubToken?: string
-  autoApply?: boolean
-  autoApplyTime?: string
-}
-
-/** GitHub API 限流状态（含 token 验证结果） */
-export interface GitHubRateLimitInfo {
-  /** 提供的 token 是否有效（无 token 时为 false 但仍能查到匿名限额） */
-  valid: boolean
-  /** 是否带 token 调用（false = 匿名查询） */
-  authenticated: boolean
-  /** 限流上限（匿名 60，认证 5000） */
-  limit: number
-  /** 剩余可用次数 */
-  remaining: number
-  /** 已用次数 */
-  used: number
-  /** 限流窗口重置时间（Unix 秒） */
-  reset: number
-  /** token 对应的用户名（可能为空） */
-  login?: string
-  /** 失败时的提示信息 */
-  warning?: string
-}
-
-export interface ImageUpdateResponse {
-  success: boolean
-  message: string
-  output?: string
-  applied: boolean
-  needRestart: boolean
-}
-
-export interface UpdateCheckInfo {
-  currentVersion: string
-  latestVersion: string
-  hasUpdate: boolean
-  buildType: string
-  releaseName?: string
-  releaseNotes?: string
-  releaseUrl?: string
-  publishedAt?: string
-  checkedAt: string
-  cached: boolean
-  warning?: string
-}
-
 // 登录API密钥修改（adminApiKey —— 管理面板登录密钥）
 export interface UpdateAdminKeyRequest {
   newKey: string

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -34,26 +34,20 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
+    BatchAddProxyRequest, BatchImportEvent, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    ExportedCredentials, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
     SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
+    SetSelfHealConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
-
-/// 在线检查更新结果缓存时间（秒），30 分钟。
-/// 在线检查更新结果缓存时间（秒），30 分钟。
-/// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
-/// 看到红点提醒，又能避免短时间内重复请求被限流。
-const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,50 +156,6 @@ impl ImportItemResult {
     }
 }
 
-/// 缓存的"检查更新"结果
-#[derive(Debug, Clone)]
-struct CachedUpdateCheck {
-    /// 缓存时间
-    cached_at: DateTime<Utc>,
-    /// 拉取到的更新信息
-    info: UpdateCheckInfo,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeUpdateConfig {
-    previous_version: Option<String>,
-    last_applied_at: Option<String>,
-    github_token: Option<String>,
-    auto_apply: bool,
-    auto_apply_time: String,
-}
-
-impl RuntimeUpdateConfig {
-    fn from_config(config: &Config) -> Self {
-        Self {
-            previous_version: config.update_previous_version.clone(),
-            last_applied_at: config.update_last_applied_at.clone(),
-            github_token: config.github_token.clone(),
-            auto_apply: config.update_auto_apply,
-            auto_apply_time: config.update_auto_apply_time.clone(),
-        }
-    }
-
-    fn response(&self) -> UpdateConfigResponse {
-        UpdateConfigResponse {
-            previous_version: self.previous_version.clone(),
-            last_applied_at: self.last_applied_at.clone(),
-            github_token_set: self
-                .github_token
-                .as_deref()
-                .map(|t| !t.trim().is_empty())
-                .unwrap_or(false),
-            auto_apply: self.auto_apply,
-            auto_apply_time: self.auto_apply_time.clone(),
-        }
-    }
-}
-
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -218,10 +168,6 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     /// 代理 IP 池管理器
     proxy_pool: ProxyPoolManager,
-    /// 在线镜像更新运行时配置
-    update_config: Mutex<RuntimeUpdateConfig>,
-    /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
-    update_check_cache: Mutex<Option<CachedUpdateCheck>>,
     /// 进行中的 IdC 设备授权会话
     idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
     /// 进行中的 Social 登录会话
@@ -273,131 +219,6 @@ fn idc_provider_for(start_url: &str) -> &'static str {
         "BuilderId"
     } else {
         "Enterprise"
-    }
-}
-
-/// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
-/// 例如 `3:0`；解析失败时返回原字符串，便于错误信息提示。
-fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(AdminServiceError::InvalidCredential(
-            "自动更新时间不能为空".to_string(),
-        ));
-    }
-    let mut parts = trimmed.splitn(2, ':');
-    let hour_str = parts.next().unwrap_or("");
-    let minute_str = parts.next().unwrap_or("");
-    let hour: u32 = hour_str.parse().map_err(|_| {
-        AdminServiceError::InvalidCredential(format!(
-            "自动更新时间格式无效：{}（应为 HH:MM）",
-            value
-        ))
-    })?;
-    let minute: u32 = minute_str.parse().map_err(|_| {
-        AdminServiceError::InvalidCredential(format!(
-            "自动更新时间格式无效：{}（应为 HH:MM）",
-            value
-        ))
-    })?;
-    if hour > 23 || minute > 59 {
-        return Err(AdminServiceError::InvalidCredential(format!(
-            "自动更新时间超出范围：{}（HH 0-23，MM 0-59）",
-            value
-        )));
-    }
-    Ok((hour, minute))
-}
-
-/// 把 HH:MM 规范化成 `HH:MM`（两位补零），方便存储和比较。
-fn normalize_auto_apply_time(value: &str) -> Result<String, AdminServiceError> {
-    let (h, m) = parse_auto_apply_time(value)?;
-    Ok(format!("{:02}:{:02}", h, m))
-}
-
-/// GitHub `repos/{owner}/{repo}/releases/tags/{tag}` 返回 JSON 中我们关心
-/// 的字段，用于在「检查更新」结果里附带本次发布的 changelog。
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    html_url: String,
-    #[serde(default)]
-    published_at: String,
-    #[serde(default)]
-    tag_name: String,
-}
-
-/// 比较两个 semver 字符串。仅按 `MAJOR.MINOR.PATCH` 三段数字比较，忽略
-/// 预发布后缀；解析失败的段当作 0 处理（最坏情况下"无更新"）。
-fn compare_semver(current: &str, latest: &str) -> std::cmp::Ordering {
-    parse_semver_core(current).cmp(&parse_semver_core(latest))
-}
-
-/// 解析 semver 三段数字，解析失败的段作 0；用于 latest tag 的稳定排序。
-fn parse_semver_core(value: &str) -> [u32; 3] {
-    let core = value
-        .trim_start_matches('v')
-        .split(|c: char| c == '-' || c == '+')
-        .next()
-        .unwrap_or("");
-    let mut out = [0u32; 3];
-    for (i, part) in core.splitn(3, '.').enumerate() {
-        if i >= 3 {
-            break;
-        }
-        out[i] = part.parse::<u32>().unwrap_or(0);
-    }
-    out
-}
-
-/// 当前构建类型。在线更新走"下载 GitHub Releases 二进制 + 进程退出由
-/// docker restart policy 接管重启"的方案。
-const BUILD_TYPE: &str = "binary";
-
-/// 暂存路径：下载到 `<exe>.staged`，原子替换前再 mv 到 `<exe>`。
-/// 暂存路径：下载到 `<exe>.staged-<version>`，原子替换前再 mv 到 `<exe>`。
-/// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
-fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
-    let mut s = exe.as_os_str().to_os_string();
-    s.push(format!(
-        ".staged-{}",
-        version.trim().trim_start_matches('v')
-    ));
-    std::path::PathBuf::from(s)
-}
-
-/// 清理目标版本之外的所有 staged 文件，避免之前下载的旧版本残留干扰。
-fn cleanup_other_staged(exe: &std::path::Path, keep_version: &str) {
-    let dir = match exe.parent() {
-        Some(d) => d,
-        None => return,
-    };
-    let exe_name = match exe.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return,
-    };
-    let keep = format!(
-        "{}.staged-{}",
-        exe_name,
-        keep_version.trim().trim_start_matches('v')
-    );
-    let prefix = format!("{}.staged-", exe_name);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let name = match entry.file_name().into_string() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        if name.starts_with(&prefix) && name != keep {
-            let _ = std::fs::remove_file(entry.path());
-        }
     }
 }
 
@@ -532,10 +353,6 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
     }
 }
 
-/// GitHub Release 仓库名（owner/repo）。
-/// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
-
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
@@ -549,7 +366,6 @@ impl AdminService {
         let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
-        let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
 
         let svc = Self {
             token_manager,
@@ -558,8 +374,6 @@ impl AdminService {
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
-            update_config: Mutex::new(update_config),
-            update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
@@ -1100,84 +914,6 @@ impl AdminService {
         });
     }
 
-    /// 启动无人值守自动更新调度器。
-    ///
-    /// 任务始终运行，每分钟唤醒一次：
-    /// - `update_auto_apply` 关闭时只是记录"未到点"，不做任何远端调用。
-    /// - 开启时，比较当前本地时间与 `update_auto_apply_time`，命中目标分钟
-    ///   就触发一次 `apply_image_update`。同一目标版本只会被自动应用一次。
-    pub fn start_auto_update_scheduler(self: &Arc<Self>) {
-        let svc = Arc::clone(self);
-        tokio::spawn(async move {
-            // 给 Docker socket / compose 元数据探测留点准备时间
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-            // 同一分钟避免重复触发；记录最近一次应用过的"日期 + 版本"
-            let mut last_run_marker: Option<String> = None;
-            let mut last_applied_version: Option<String> = None;
-
-            loop {
-                let runtime = svc.update_config.lock().clone();
-                if runtime.auto_apply {
-                    let target = parse_auto_apply_time(&runtime.auto_apply_time).ok();
-                    if let Some((target_hour, target_minute)) = target {
-                        let now = chrono::Local::now();
-                        let date_minute_marker = format!(
-                            "{}-{:02}:{:02}",
-                            now.format("%Y-%m-%d"),
-                            now.hour(),
-                            now.minute()
-                        );
-
-                        let hit = now.hour() == target_hour && now.minute() == target_minute;
-                        let already_ran_this_minute =
-                            last_run_marker.as_deref() == Some(date_minute_marker.as_str());
-
-                        if hit && !already_ran_this_minute {
-                            last_run_marker = Some(date_minute_marker);
-                            let info = svc.check_update(true).await;
-                            if info.has_update
-                                && !info.latest_version.is_empty()
-                                && last_applied_version.as_deref()
-                                    != Some(info.latest_version.as_str())
-                            {
-                                tracing::info!(
-                                    "自动更新：到达计划时间 {}，发现新版本 {}（当前 {}），开始应用",
-                                    runtime.auto_apply_time,
-                                    info.latest_version,
-                                    info.current_version
-                                );
-                                match svc.apply_image_update().await {
-                                    Ok(res) => {
-                                        tracing::info!("自动更新完成：{}", res.message);
-                                        last_applied_version = Some(info.latest_version);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("自动更新失败：{}", e);
-                                    }
-                                }
-                            } else {
-                                tracing::info!(
-                                    "自动更新：到达计划时间 {}，但当前已是最新版本（{}）",
-                                    runtime.auto_apply_time,
-                                    info.current_version
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            "自动更新时间配置无效：{}，跳过本轮检查",
-                            runtime.auto_apply_time
-                        );
-                    }
-                }
-
-                // 30 秒粒度足以可靠命中目标分钟，又不会在系统时间漂移下错过
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
-        });
-    }
-
     /// 添加新凭据
     pub async fn add_credential(
         &self,
@@ -1482,545 +1218,6 @@ impl AdminService {
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.api_key = Some(key));
-    }
-
-    /// 获取在线更新配置（GitHub Token 只返回是否已配置）
-    pub fn get_update_config(&self) -> UpdateConfigResponse {
-        self.update_config.lock().response()
-    }
-
-    /// 更新在线更新配置。
-    pub fn set_update_config(
-        &self,
-        req: SetUpdateConfigRequest,
-    ) -> Result<UpdateConfigResponse, AdminServiceError> {
-        // 在写入运行时之前先校验时间格式，并规范化成两位补零的 HH:MM
-        let normalized_time = match req.auto_apply_time.as_deref() {
-            Some(value) => Some(normalize_auto_apply_time(value)?),
-            None => None,
-        };
-
-        // GitHub Token：空字符串表示清除，None 表示保持原值
-        let token_update: Option<Option<String>> = req.github_token.as_ref().map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-
-        {
-            let mut runtime = self.update_config.lock();
-            if let Some(auto_apply) = req.auto_apply {
-                runtime.auto_apply = auto_apply;
-            }
-            if let Some(time) = &normalized_time {
-                runtime.auto_apply_time = time.clone();
-            }
-            if let Some(token) = &token_update {
-                runtime.github_token = token.clone();
-            }
-        }
-
-        self.update_config_file(move |c| {
-            if let Some(auto_apply) = req.auto_apply {
-                c.update_auto_apply = auto_apply;
-            }
-            if let Some(time) = normalized_time {
-                c.update_auto_apply_time = time;
-            }
-            if let Some(token) = token_update {
-                c.github_token = token;
-            }
-        });
-
-        Ok(self.get_update_config())
-    }
-
-    /// 下载新版二进制并通过校验和验证（对应前端「拉取镜像」按钮）。
-    /// 不替换当前可执行文件，便于用户在正式应用前先确认下载成功。
-    /// 下载产物保存到 `<exe>.staged-<version>`，下次 apply 命中同版本时复用。
-    pub async fn pull_update_image(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let (proxy, token) = {
-            let runtime = self.update_config.lock();
-            (
-                self.token_manager.proxy().map(|p| p.url.clone()),
-                runtime.github_token.clone(),
-            )
-        };
-        let exe = super::binary_update::current_executable()?;
-
-        let version = self.resolve_target_version(false).await?;
-        let staged = staged_binary_path(&exe, &version);
-
-        // 已经下载过同版本时直接复用，避免重复网络请求
-        let reused = staged.exists();
-        if !reused {
-            super::binary_update::download_release_binary(
-                &version,
-                proxy.as_deref(),
-                token.as_deref(),
-                &staged,
-            )
-            .await?;
-        }
-        // 清理其它版本的旧 staged 文件，避免占用磁盘
-        cleanup_other_staged(&exe, &version);
-
-        Ok(ImageUpdateResponse {
-            success: true,
-            message: if reused {
-                format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
-            } else {
-                format!("已下载并校验 v{} 二进制，可直接执行「更新并重启」", version)
-            },
-            output: Some(format!(
-                "{}: v{}\nstaged: {}",
-                if reused { "reused" } else { "downloaded" },
-                version,
-                staged.display()
-            )),
-            applied: false,
-            need_restart: false,
-        })
-    }
-
-    /// 下载新版二进制并替换当前可执行文件，随后让进程退出由
-    /// `restart: unless-stopped` 接管重启（对应前端「更新并重启」按钮）。
-    /// 若 pull 已经把目标版本下载到 `<exe>.staged-<version>`，跳过重复下载。
-    pub async fn apply_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let (proxy, token) = {
-            let runtime = self.update_config.lock();
-            (
-                self.token_manager.proxy().map(|p| p.url.clone()),
-                runtime.github_token.clone(),
-            )
-        };
-        let exe = super::binary_update::current_executable()?;
-
-        let version = self.resolve_target_version(true).await?;
-        let staged = staged_binary_path(&exe, &version);
-
-        let reused = staged.exists();
-        if !reused {
-            super::binary_update::download_release_binary(
-                &version,
-                proxy.as_deref(),
-                token.as_deref(),
-                &staged,
-            )
-            .await?;
-        }
-        cleanup_other_staged(&exe, &version);
-
-        // 记录当前版本作为「上一版本」，供前端展示「回退」按钮
-        let previous_version = env!("CARGO_PKG_VERSION").to_string();
-        super::binary_update::install_binary(&exe, &staged)?;
-
-        let prev_label = format!("v{}", previous_version);
-        let applied_at = chrono::Utc::now().to_rfc3339();
-        {
-            let mut runtime = self.update_config.lock();
-            runtime.previous_version = Some(prev_label.clone());
-            runtime.last_applied_at = Some(applied_at.clone());
-        }
-        let prev_to_persist = prev_label.clone();
-        let applied_at_to_persist = applied_at.clone();
-        self.update_config_file(move |c| {
-            c.update_previous_version = Some(prev_to_persist);
-            c.update_last_applied_at = Some(applied_at_to_persist);
-        });
-
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
-
-        Ok(ImageUpdateResponse {
-            success: true,
-            message: format!(
-                "已替换为 v{}，进程将在 2 秒后退出，由容器重启策略接管",
-                version
-            ),
-            output: Some(format!(
-                "previous: v{}\n{}: v{}",
-                previous_version,
-                if reused { "reused-staged" } else { "installed" },
-                version
-            )),
-            applied: true,
-            need_restart: true,
-        })
-    }
-
-    /// 把可执行文件回退到 `<exe>.backup`，再重启进程。
-    pub async fn rollback_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let previous_label = self
-            .update_config
-            .lock()
-            .previous_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential(
-                    "尚未记录可回退的版本，请先执行一次在线更新".to_string(),
-                )
-            })?
-            .to_string();
-
-        let exe = super::binary_update::current_executable()?;
-        super::binary_update::restore_backup(&exe)?;
-        // 回退后清掉所有 staged：用户已表态"上一次更新是错的"，残留只会误导
-        cleanup_other_staged(&exe, "");
-
-        // 回退视为撤销最近一次更新：清空 previous_version 和 last_applied_at
-        {
-            let mut runtime = self.update_config.lock();
-            runtime.previous_version = None;
-            runtime.last_applied_at = None;
-        }
-        self.update_config_file(|c| {
-            c.update_previous_version = None;
-            c.update_last_applied_at = None;
-        });
-
-        super::binary_update::schedule_self_exit(std::time::Duration::from_secs(2));
-
-        Ok(ImageUpdateResponse {
-            success: true,
-            message: format!(
-                "已回退到 {}，进程将在 2 秒后退出，由容器重启策略接管",
-                previous_label
-            ),
-            output: Some(format!("rolled back to: {}", previous_label)),
-            applied: true,
-            need_restart: true,
-        })
-    }
-
-    /// 返回 GitHub Releases 上的最新可用版本号（无 `v` 前缀）。
-    /// 失败时返回 `InternalError`，调用方应直接返回给前端。
-    /// 返回 GitHub Releases 上的最新可用版本号（无 `v` 前缀）。
-    /// 失败时返回 `InternalError`，调用方应直接返回给前端。
-    ///
-    /// `require_update` 为 true 时，若当前版本已经是最新（无更新可用），
-    /// 直接返回错误而不是返回相同版本号——避免 apply 流程下载并替换同一版本。
-    async fn resolve_target_version(
-        &self,
-        require_update: bool,
-    ) -> Result<String, AdminServiceError> {
-        let info = self.check_update(true).await;
-        if let Some(warn) = info.warning {
-            return Err(AdminServiceError::InternalError(warn));
-        }
-        if info.latest_version.is_empty() {
-            return Err(AdminServiceError::InternalError(
-                "无法解析最新版本号（GitHub Releases 返回空）".to_string(),
-            ));
-        }
-        if require_update && !info.has_update {
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "当前已是最新版本 v{}，无需更新",
-                info.current_version
-            )));
-        }
-        Ok(info.latest_version)
-    }
-
-    /// 检查 GitHub Releases 上是否存在新版本。
-    ///
-    /// `force=false` 时优先返回 30 分钟内的缓存结果；`force=true` 时强制查询
-    /// 远端。查询失败但有旧缓存时，返回旧缓存并附带 warning。
-    pub async fn check_update(&self, force: bool) -> UpdateCheckInfo {
-        if !force {
-            if let Some(cached) = self.update_check_cache.lock().clone() {
-                let age = Utc::now()
-                    .signed_duration_since(cached.cached_at)
-                    .num_seconds();
-                if age < UPDATE_CHECK_TTL_SECS {
-                    let mut info = cached.info.clone();
-                    info.cached = true;
-                    return info;
-                }
-            }
-        }
-
-        match self.fetch_latest_release().await {
-            Ok(info) => {
-                self.update_check_cache.lock().replace(CachedUpdateCheck {
-                    cached_at: Utc::now(),
-                    info: info.clone(),
-                });
-                info
-            }
-            Err(err) => {
-                let warning = format!("检查更新失败：{}", err);
-                if let Some(cached) = self.update_check_cache.lock().clone() {
-                    let mut info = cached.info.clone();
-                    info.cached = true;
-                    info.warning = Some(warning);
-                    return info;
-                }
-                UpdateCheckInfo {
-                    current_version: env!("CARGO_PKG_VERSION").to_string(),
-                    latest_version: String::new(),
-                    has_update: false,
-                    build_type: BUILD_TYPE.to_string(),
-                    release_name: None,
-                    release_notes: None,
-                    release_url: None,
-                    published_at: None,
-                    checked_at: Utc::now().to_rfc3339(),
-                    cached: false,
-                    warning: Some(warning),
-                }
-            }
-        }
-    }
-
-    async fn fetch_latest_release(&self) -> Result<UpdateCheckInfo, AdminServiceError> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            GITHUB_RELEASES_REPO
-        );
-        let token = self.update_config.lock().github_token.clone();
-        // 必须走全局代理：同类 GitHub 调用（限流查询、二进制下载）都过
-        // `build_http_client(proxy)`，只有这里曾用裸 `Client::new()`。在需要代理
-        // 出网的部署里那会让「检查更新」永久失败，而 `resolve_target_version`
-        // 一见到 warning 就返回 Err → pull / apply / 自动更新整条链不可用，
-        // 且报错方向完全指错（下载和限流查询其实是通的）。
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
-        let client = super::binary_update::build_http_client(proxy.as_deref())
-            .map_err(|e| AdminServiceError::InternalError(format!("创建 HTTP 客户端失败: {e}")))?;
-        let mut req = client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "kiro-rs-update-checker")
-            .timeout(std::time::Duration::from_secs(15));
-        if let Some(t) = token.as_deref() {
-            let trimmed = t.trim();
-            if !trimmed.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", trimmed));
-            }
-        }
-        let resp = req.send().await.map_err(|e| {
-            AdminServiceError::InternalError(format!("请求 GitHub API 失败: {}", e))
-        })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AdminServiceError::InternalError(format!(
-                "GitHub API 返回 {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-
-        let release: GitHubRelease = resp.json().await.map_err(|e| {
-            AdminServiceError::InternalError(format!("解析 GitHub release 失败: {}", e))
-        })?;
-
-        let current = env!("CARGO_PKG_VERSION").to_string();
-        let latest_version = release.tag_name.trim().trim_start_matches('v').to_string();
-        let has_update =
-            !latest_version.is_empty() && compare_semver(&current, &latest_version).is_lt();
-
-        Ok(UpdateCheckInfo {
-            current_version: current,
-            latest_version,
-            has_update,
-            build_type: BUILD_TYPE.to_string(),
-            release_name: Some(release.name).filter(|v| !v.is_empty()),
-            release_notes: Some(release.body).filter(|v| !v.is_empty()),
-            release_url: Some(release.html_url).filter(|v| !v.is_empty()),
-            published_at: Some(release.published_at).filter(|v| !v.is_empty()),
-            checked_at: Utc::now().to_rfc3339(),
-            cached: false,
-            warning: None,
-        })
-    }
-
-    /// 查询 GitHub API 当前限流配额。
-    ///
-    /// `req.github_token` 不为空时使用该 token 验证（用于"保存前先试一下"），
-    /// 否则使用配置中已保存的 `config.github_token`，再缺则匿名查询。
-    /// `/rate_limit` 端点本身不消耗任何配额。
-    pub async fn check_rate_limit(&self, req: CheckRateLimitRequest) -> GitHubRateLimitInfo {
-        // 优先用入参 token；空字符串视作"尝试匿名"；缺省回退到已保存 token
-        let token = req
-            .github_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| {
-                self.update_config
-                    .lock()
-                    .github_token
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-            });
-        let authenticated = token.is_some();
-
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
-        let client = match super::binary_update::build_http_client(proxy.as_deref()) {
-            Ok(c) => c,
-            Err(e) => {
-                return GitHubRateLimitInfo {
-                    valid: false,
-                    authenticated,
-                    limit: 0,
-                    remaining: 0,
-                    used: 0,
-                    reset: 0,
-                    login: None,
-                    warning: Some(format!("构造 HTTP 客户端失败: {}", e)),
-                };
-            }
-        };
-
-        let mut req_builder = client
-            .get("https://api.github.com/rate_limit")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "kiro-rs-update-checker")
-            .timeout(std::time::Duration::from_secs(10));
-        if let Some(t) = token.as_deref() {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", t));
-        }
-
-        let resp = match req_builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return GitHubRateLimitInfo {
-                    valid: false,
-                    authenticated,
-                    limit: 0,
-                    remaining: 0,
-                    used: 0,
-                    reset: 0,
-                    login: None,
-                    warning: Some(format!("请求 GitHub API 失败: {}", e)),
-                };
-            }
-        };
-
-        let status = resp.status();
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return GitHubRateLimitInfo {
-                valid: false,
-                authenticated,
-                limit: 0,
-                remaining: 0,
-                used: 0,
-                reset: 0,
-                login: None,
-                warning: Some("GitHub Token 无效或已过期".to_string()),
-            };
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return GitHubRateLimitInfo {
-                valid: false,
-                authenticated,
-                limit: 0,
-                remaining: 0,
-                used: 0,
-                reset: 0,
-                login: None,
-                warning: Some(format!(
-                    "GitHub API 返回 {}: {}",
-                    status,
-                    body.chars().take(200).collect::<String>()
-                )),
-            };
-        }
-
-        let payload: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return GitHubRateLimitInfo {
-                    valid: false,
-                    authenticated,
-                    limit: 0,
-                    remaining: 0,
-                    used: 0,
-                    reset: 0,
-                    login: None,
-                    warning: Some(format!("解析 GitHub 响应失败: {}", e)),
-                };
-            }
-        };
-
-        // /rate_limit 返回结构：{ resources: { core: { limit, remaining, used, reset } }, rate: {...} }
-        // 其中 `core` 是 REST API 整体配额，最贴合在线更新的实际消耗
-        let core = payload
-            .get("resources")
-            .and_then(|r| r.get("core"))
-            .or_else(|| payload.get("rate"));
-        let limit = core
-            .and_then(|c| c.get("limit"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let remaining = core
-            .and_then(|c| c.get("remaining"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let used = core
-            .and_then(|c| c.get("used"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let reset = core
-            .and_then(|c| c.get("reset"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        // 同时尝试拿 token 对应的用户名；失败不影响主结果
-        let login = if authenticated {
-            self.fetch_github_login(&client, token.as_deref()).await
-        } else {
-            None
-        };
-
-        GitHubRateLimitInfo {
-            valid: true,
-            authenticated,
-            limit,
-            remaining,
-            used,
-            reset,
-            login,
-            warning: None,
-        }
-    }
-
-    async fn fetch_github_login(
-        &self,
-        client: &reqwest::Client,
-        token: Option<&str>,
-    ) -> Option<String> {
-        let mut req = client
-            .get("https://api.github.com/user")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "kiro-rs-update-checker")
-            .timeout(std::time::Duration::from_secs(10));
-        if let Some(t) = token {
-            req = req.header("Authorization", format!("Bearer {}", t));
-        }
-        let resp = req.send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let payload: serde_json::Value = resp.json().await.ok()?;
-        payload
-            .get("login")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
     }
 
     /// 获取负载均衡模式
@@ -3477,15 +2674,6 @@ mod tests {
             classified.status_code(),
             axum::http::StatusCode::BAD_REQUEST
         );
-    }
-
-    #[test]
-    fn semver_compares_correctly() {
-        use std::cmp::Ordering;
-        assert_eq!(compare_semver("0.3.0", "0.3.1"), Ordering::Less);
-        assert_eq!(compare_semver("v0.3.1", "0.3.1"), Ordering::Equal);
-        assert_eq!(compare_semver("1.0.0", "0.99.99"), Ordering::Greater);
-        assert_eq!(compare_semver("0.3.1-rc.1", "0.3.1"), Ordering::Equal);
     }
 
     #[test]
