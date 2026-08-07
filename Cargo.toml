@@ -41,6 +41,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 base64 = "0.22"
 thiserror = "1"
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
-rust-embed = "8"      # 嵌入静态文件
+# debug-embed：debug 构建也把 admin-ui/dist 编进二进制。不开的话 debug 下 rust-embed
+# 从编译期记录的绝对路径读盘，二进制换机器/换目录就 404 —— 破坏便携运行。
+rust-embed = { version = "8", features = ["debug-embed"] }  # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）

@@ -33,13 +33,27 @@ async fn main() {
         )
         .init();
 
-    // 解析配置/凭证路径
+    // 解析配置/凭证路径。
+    // 便携运行：未显式指定路径时，一律落到 exe 同级目录的 `data/` 子目录——
+    // 这样无论双击启动还是从任意工作目录调用，所有数据文件（config.json、
+    // credentials.json、usage_log.*、traces.db、kiro_stats.json 等）都只写在
+    // data 目录里，整个目录可以原样拷贝到别的机器运行。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let data_dir = exe_dir.join("data");
     let config_path = args
         .config
-        .unwrap_or_else(|| Config::default_config_path().to_string());
+        .unwrap_or_else(|| data_dir.join(Config::default_config_path()).to_string_lossy().into_owned());
     let credentials_path = args
         .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+        .unwrap_or_else(|| {
+            data_dir
+                .join(KiroCredentials::default_credentials_path())
+                .to_string_lossy()
+                .into_owned()
+        });
 
     // 文件不存在时自动初始化（Docker 首次部署友好）
     ensure_config_files(&config_path, &credentials_path);
@@ -306,10 +320,6 @@ async fn main() {
                 .service
                 .start_proxy_health_checker(std::time::Duration::from_secs(300));
 
-            // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
-            // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
-            admin_state.service.start_auto_update_scheduler();
-
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -384,7 +394,8 @@ async fn shutdown_signal() {
 /// 文件不存在时初始化配置/凭证文件
 ///
 /// - `config.json`：写入带随机 `apiKey`（每次启动同步为系统 Key）/ `adminApiKey`（管理面板登录密钥）
-///   的最小默认配置；`host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
+///   的最小默认配置；`host` 设为 `127.0.0.1`（本机回环，便携运行不触发防火墙提示），
+///   端口/默认端点等其余字段沿用代码默认值。容器部署时请自行提供配置文件并显式指定监听地址。
 /// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
 ///
 /// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` / `CredentialsConfig::load`
@@ -402,7 +413,7 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         let api_key = format!("sk-kiro-rs-{}", random_token(24));
         let admin_api_key = format!("sk-admin-{}", random_token(24));
         let default = serde_json::json!({
-            "host": "0.0.0.0",
+            "host": "127.0.0.1",
             "port": 8990,
             "apiKey": api_key,
             "adminApiKey": admin_api_key,

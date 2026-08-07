@@ -215,6 +215,9 @@ impl TraceStore {
         // WAL：并发读不阻塞写；synchronous=NORMAL：写吞吐与崩溃安全的平衡
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // temp_store=MEMORY：排序/VACUUM 等操作的临时文件留在内存，不落系统 TEMP。
+        // 便携运行要求进程只写 data/ 目录，SQLite 默认的 temp 目录会破坏这一点。
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
@@ -227,6 +230,8 @@ impl TraceStore {
     /// 内存数据库（traces.db 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
+        // 同上：内存库的排序临时文件也不许落盘
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
