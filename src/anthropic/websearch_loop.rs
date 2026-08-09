@@ -26,8 +26,14 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
+// 别名 `trace_outcome`：本文件里 `outcome` 已被 run_round 的局部变量占用
+//（`let mut outcome = decode_round(...)`），同名会让读者分不清是模块还是变量。
+use crate::admin::trace_db::outcome as trace_outcome;
+
 use super::converter::{ConversionError, convert_request, get_context_window_size};
-use super::handlers::{UsageRecordHook, map_provider_error};
+use super::handlers::{
+    RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
+};
 use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
@@ -46,6 +52,35 @@ enum EmptyToolResultDisposition {
     Accept,
     Retry,
     Fail,
+}
+
+/// 与 `hook.record(..., "error")` 成对：把本轮失败落成一条 trace 行。
+///
+/// 每条失败路径都必须调用它一次且仅一次 —— `RequestTracer::finalize` 会
+/// `mem::take` 掉 attempts，调两次会多出一条 0 跳的假记录。`store` 为 None
+/// （未启用 trace）时整体是空操作。
+fn trace_error(
+    tracer: &RequestTracer,
+    error_type: &str,
+    message: &str,
+    input_tokens: i32,
+    credits: f64,
+) {
+    tracer.finalize(
+        "error",
+        Some(error_type),
+        Some(message),
+        None,
+        TraceUsage {
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: 0,
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
+        },
+    );
 }
 
 /// Result of buffer-decoding one round of the upstream response
@@ -207,10 +242,15 @@ fn empty_tool_result_disposition(
 }
 
 /// Buffer-decode one round of the upstream streaming response
+///
+/// `tracer` 只用来标记首个上游 chunk 的到达时刻（`first_token_ms`）。它必须在
+/// 这里打点而不是在 `call_api_stream` 返回处：后者只代表响应头到达，写进
+/// first_token 会让 Admin 面板上的首字延迟系统性偏小。
 async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -238,6 +278,8 @@ async fn decode_round(
                 break;
             }
         };
+        // 多轮时只有第一轮的第一个 chunk 生效（mark_first_token 幂等）。
+        tracer.mark_first_token();
         if let Err(e) = decoder.feed(&chunk) {
             tracing::warn!("buffer overflow: {}", e);
         }
@@ -329,6 +371,7 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request(payload) {
         Ok(c) => c,
@@ -345,6 +388,7 @@ async fn run_round(
                 }
             };
             hook.record(0, 0, 0, 0.0, "error");
+            trace_error(tracer, trace_outcome::BAD_REQUEST, &msg, 0, 0.0);
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
         }
     };
@@ -357,25 +401,48 @@ async fn run_round(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
+            let message = format!("failed to serialize request: {}", e);
             hook.record(0, 0, 0, 0.0, "error");
+            trace_error(tracer, trace_outcome::UNKNOWN, &message, 0, 0.0);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
+                Json(ErrorResponse::new("internal_error", message)),
             )
                 .into_response());
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    // TraceSink 必须传进去：provider 在重试循环里每跳登记一条 attempt，
+    // 传 None 等于把整条链路（换了几个凭据、每跳为什么失败）全部丢弃。
+    let call_result = match provider
+        .call_api_stream(&request_body, Some(tracer), group)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
+            let message = e.to_string();
             hook.record(0, fallback_input_tokens, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(tracer),
+                Some(&message),
+                None,
+                TraceUsage {
+                    input_tokens: fallback_input_tokens.max(0) as u64,
+                    ..TraceUsage::zero()
+                },
+            );
             return Err(map_provider_error(e));
         }
     };
     let credential_id = call_result.credential_id;
-    let mut outcome =
-        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
+    let mut outcome = decode_round(
+        call_result.response,
+        &payload.model,
+        &conversion.tool_name_map,
+        tracer,
+    )
+    .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;
@@ -384,23 +451,39 @@ async fn run_round(
     if outcome.stream_error {
         // The upstream stream was cut off mid-round; the decoded content is partial,
         // so fail the round instead of feeding truncated text/tool_use back into the loop.
+        let message =
+            "Upstream response stream ended unexpectedly during the web_search loop.".to_string();
         hook.record(0, fallback_input_tokens, 0, 0.0, "error");
+        // interrupted_after_bytes 传 None：本路径一个字节都没发给客户端
+        //（整轮缓冲解码后才渲染），填数字会谎报「已发出 N 字节后断开」。
+        trace_error(
+            tracer,
+            trace_outcome::STREAM_INTERRUPTED,
+            &message,
+            fallback_input_tokens,
+            0.0,
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "upstream_error",
-                "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
-            )),
+            Json(ErrorResponse::new("upstream_error", message)),
         )
             .into_response());
     }
     // 上游 tool JSON 非法 / 半截：与断流同等对待。降级成空参数再交给客户端执行，
     // 等于让它拿错误的参数真的去动文件或跑命令。
     if let Some(e) = &outcome.tool_json_error {
+        let message = e.message();
         hook.record(0, fallback_input_tokens, 0, 0.0, "error");
+        trace_error(
+            tracer,
+            trace_outcome::BAD_REQUEST,
+            &message,
+            fallback_input_tokens,
+            0.0,
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(e.error_type(), e.message())),
+            Json(ErrorResponse::new(e.error_type(), message)),
         )
             .into_response());
     }
@@ -671,12 +754,16 @@ fn build_flush_content(
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
+/// `tracer`: 由 `post_messages` 在分支前构造，本函数负责在**每条**出口调用一次
+/// `finalize`（含 `run_round` 内部提前返回的失败路径）。少调一次，Admin 日志页
+/// 就会整类请求隐身；多调一次，则会多出一条 0 跳的假记录。
 pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    tracer: Arc<RequestTracer>,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -702,9 +789,11 @@ pub(super) async fn run_web_search_loop(
                     &hook,
                     fallback_input_tokens,
                     group.as_deref(),
+                    tracer.as_ref(),
                 )
                 .await
                 {
+                    // run_round 的失败路径已自行 finalize，这里不能再补一次。
                     Ok(v) => v,
                     Err(resp) => return resp,
                 };
@@ -730,6 +819,9 @@ pub(super) async fn run_web_search_loop(
                 }
                 EmptyToolResultDisposition::Fail => {
                     let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+                    let message =
+                        "Upstream returned no assistant text or tool call after a tool result."
+                            .to_string();
                     hook.record(
                         last_credential_id,
                         final_input,
@@ -737,17 +829,20 @@ pub(super) async fn run_web_search_loop(
                         total_credits,
                         "error",
                     );
+                    trace_error(
+                        tracer.as_ref(),
+                        trace_outcome::UNKNOWN,
+                        &message,
+                        final_input,
+                        total_credits,
+                    );
                     tracing::error!(
                         round = round_idx,
                         "upstream repeated an empty assistant turn after tool_result"
                     );
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse::new(
-                            "upstream_error",
-                            "Upstream returned no assistant text or tool call after a tool result."
-                                .to_string(),
-                        )),
+                        Json(ErrorResponse::new("upstream_error", message)),
                     )
                         .into_response();
                 }
@@ -779,6 +874,13 @@ pub(super) async fn run_web_search_loop(
                         total_credits,
                         "error",
                     );
+                    trace_error(
+                        tracer.as_ref(),
+                        trace_outcome::BAD_REQUEST,
+                        &err.to_string(),
+                        fallback_input_tokens,
+                        total_credits,
+                    );
                     return map_provider_error(err);
                 };
                 log_normalized_web_search_query(tu, &query);
@@ -797,6 +899,16 @@ pub(super) async fn run_web_search_loop(
                             0,
                             total_credits,
                             "error",
+                        );
+                        // call_mcp 不接 TraceSink（MCP 走独立端点，不参与凭据重试
+                        // 链路的 attempt 登记），故这里没有可提升的分类，记 UNKNOWN
+                        // 并靠 error_message 带出真实原因。
+                        trace_error(
+                            tracer.as_ref(),
+                            trace_outcome::UNKNOWN,
+                            &e.to_string(),
+                            fallback_input_tokens,
+                            total_credits,
                         );
                         return map_provider_error(e);
                     }
@@ -832,6 +944,13 @@ pub(super) async fn run_web_search_loop(
                         total_credits,
                         "error",
                     );
+                    trace_error(
+                        tracer.as_ref(),
+                        trace_outcome::BAD_REQUEST,
+                        &err.to_string(),
+                        fallback_input_tokens,
+                        total_credits,
+                    );
                     return map_provider_error(err);
                 };
                 log_normalized_web_search_query(tu, &query);
@@ -850,6 +969,13 @@ pub(super) async fn run_web_search_loop(
                             0,
                             total_credits,
                             "error",
+                        );
+                        trace_error(
+                            tracer.as_ref(),
+                            trace_outcome::UNKNOWN,
+                            &e.to_string(),
+                            fallback_input_tokens,
+                            total_credits,
                         );
                         return map_provider_error(e);
                     }
@@ -870,10 +996,18 @@ pub(super) async fn run_web_search_loop(
             // 上游 `<invoke>` 泄漏里的 JSON 非法：与断流同等对待，不降级成空参数。
             Err(e) => {
                 tracing::error!("{}", e);
+                let message = e.message();
                 hook.record(0, fallback_input_tokens, 0, 0.0, "error");
+                trace_error(
+                    tracer.as_ref(),
+                    trace_outcome::BAD_REQUEST,
+                    &message,
+                    fallback_input_tokens,
+                    total_credits,
+                );
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(e.error_type(), e.message())),
+                    Json(ErrorResponse::new(e.error_type(), message)),
                 )
                     .into_response();
             }
@@ -895,6 +1029,23 @@ pub(super) async fn run_web_search_loop(
             output_tokens,
             total_credits,
             "success",
+        );
+        // 与 usage_log 同源的用量快照落进 trace 行；attempts 已由 provider 在
+        // 每一轮的重试循环里累积（跨 round 累加，一条 trace = 一次客户端请求）。
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: final_input.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                credits: if total_credits.is_finite() && total_credits > 0.0 {
+                    total_credits
+                } else {
+                    0.0
+                },
+            },
         );
 
         return if stream_client {
@@ -921,6 +1072,13 @@ pub(super) async fn run_web_search_loop(
 
     // Theoretically unreachable (the loop always returns)
     hook.record(last_credential_id, fallback_input_tokens, 0, total_credits, "error");
+    trace_error(
+        tracer.as_ref(),
+        trace_outcome::UNKNOWN,
+        "web_search loop exited unexpectedly",
+        fallback_input_tokens,
+        total_credits,
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
@@ -1098,7 +1256,51 @@ fn build_sse_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::trace_db::{TraceKeySource, TraceQuery, TraceStore};
+    use crate::anthropic::handlers::RequestTraceOptions;
+    use crate::anthropic::middleware::{AppState, KeyContext};
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+
+    /// 回归锁：web_search loop 的失败路径必须落一条 trace 行，且带上模型名与
+    /// 已知用量。
+    ///
+    /// 这条锁的由来：loop 此前完全不构造 `RequestTracer`（`call_api_stream` 传
+    /// None），于是凡是 tools 里含 web_search 的请求在 Admin 日志页一条不显示 ——
+    /// 而 `/v1/responses` 恒注入原生 web_search，等于整个 GPT 组隐身。usage 统计
+    /// 有数、链路日志没数，排查时会误判成"请求没到"。
+    #[test]
+    fn websearch_loop_failure_lands_one_trace_row() {
+        let store: crate::admin::trace_db::SharedTraceStore =
+            Arc::new(TraceStore::open_in_memory().expect("内存 trace store"));
+        let state = AppState::new(false).with_trace_store(Some(store.clone()));
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 7,
+                    group: None,
+                    key_source: TraceKeySource::ClientKey,
+                },
+                model: "gpt-5.6-sol".to_string(),
+                is_stream: false,
+            },
+        );
+
+        trace_error(&tracer, trace_outcome::UNKNOWN, "mcp call failed", 1234, 0.5);
+
+        let (rows, total) = store.query_paged(&TraceQuery {
+            model: Some("gpt-5.6-sol".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "失败路径必须恰好落一条 trace 行");
+        assert_eq!(rows[0].final_status, "error");
+        assert_eq!(rows[0].error_type.as_deref(), Some(trace_outcome::UNKNOWN));
+        assert_eq!(rows[0].error_message.as_deref(), Some("mcp call failed"));
+        // 用量不能一律记 0：input_tokens / credits 是失败请求的唯一成本线索。
+        assert_eq!(rows[0].input_tokens, 1234);
+        assert_eq!(rows[0].output_tokens, 0);
+        assert_eq!(rows[0].credits, 0.5);
+    }
 
     fn tu(name: &str) -> CompletedToolUse {
         CompletedToolUse {

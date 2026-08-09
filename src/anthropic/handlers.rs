@@ -142,14 +142,14 @@ impl TraceUsage {
     }
 }
 
-struct RequestTraceOptions {
-    key_ctx: KeyContext,
-    model: String,
-    is_stream: bool,
+pub(super) struct RequestTraceOptions {
+    pub key_ctx: KeyContext,
+    pub model: String,
+    pub is_stream: bool,
 }
 
 impl RequestTracer {
-    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
+    pub(super) fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
@@ -182,7 +182,16 @@ impl RequestTracer {
         usage: TraceUsage,
     ) {
         let Some(store) = &self.store else { return };
-        let attempts = std::mem::take(&mut *self.attempts.lock());
+        let mut attempts = std::mem::take(&mut *self.attempts.lock());
+        // 按时间顺序统一重排 attempt 编号。它是 `trace_attempts` 主键
+        // `(trace_id, attempt)` 的一半，而 provider 的编号在**每次** `call_api*`
+        // 调用时从 1 重新开始。web_search loop 的一条 trace 会跨多轮调用 provider，
+        // 沿用原编号时第二轮的 attempt=1 会被 `INSERT OR REPLACE` 顶掉第一轮的同名
+        // 行：attempts 表少行，而 traces.total_attempts 仍按内存里的条数上报，两者
+        // 对不上。单轮请求（provider 本就给出 1..n）重排后编号与原来完全一致。
+        for (idx, attempt) in attempts.iter_mut().enumerate() {
+            attempt.attempt = (idx + 1) as u32;
+        }
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
@@ -221,7 +230,7 @@ impl TraceSink for RequestTracer {
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(super) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(canonical_attempt_outcome(&last))
 }
@@ -568,7 +577,17 @@ pub async fn post_messages(
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
+    // `via` 必须区分真实 HTTP 入站与 `/v1/responses` 的内部转发。内部转发压根没有
+    // 收到过 `POST /v1/messages`（它由 `post_responses` 直接函数调用进来），若一律
+    // 打印「Received POST /v1/messages」，运维看日志会得出「客户端在用 Anthropic
+    // 协议请求 GPT 模型」的反向错误结论 —— 那条路径对外是 400，不可能出现。
+    let via = if internal_forward.is_some() {
+        "internal:/v1/responses"
+    } else {
+        "http:/v1/messages"
+    };
     tracing::info!(
+        via = %via,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -576,7 +595,7 @@ pub async fn post_messages(
         image_count = %img_stats.count,
         image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
-        "Received POST /v1/messages request"
+        "entering the /v1/messages pipeline"
     );
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
@@ -644,6 +663,19 @@ pub async fn post_messages(
     // 自己决定何时搜、搜什么，代理只负责执行搜索并把结果回喂。
 
     let payload_stream = payload.stream;
+    // 链路追踪器在**所有**分支之前构造：websearch loop 同样要落 trace 行。
+    // 它此前只在下面两条 stream/non-stream 分支里各建一次，于是走 loop 的请求
+    // 一条 trace 都没有 —— 而 `/v1/responses` 恒注入原生 web_search，等于整个
+    // GPT 组在 Admin 日志页彻底隐身（usage 统计有、链路日志无）。
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: payload.model.clone(),
+            is_stream: payload_stream,
+        },
+    ));
+
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
@@ -656,6 +688,7 @@ pub async fn post_messages(
             hook,
             payload_stream,
             key_ctx.group.clone(),
+            tracer,
         )
         .await;
     }
@@ -678,6 +711,13 @@ pub async fn post_messages(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::BAD_REQUEST),
+                Some(&message),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -699,6 +739,13 @@ pub async fn post_messages(
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
             hook.record(0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(outcome::UNKNOWN),
+                Some(&format!("序列化请求失败: {}", e)),
+                None,
+                TraceUsage::zero(),
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -732,14 +779,6 @@ pub async fn post_messages(
 
     if payload.stream {
         // 流式响应
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_stream_request(
             provider,
             &request_body,
@@ -756,14 +795,6 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1410,6 +1441,64 @@ pub async fn count_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+    fn test_tracer(store: &SharedTraceStore, model: &str) -> RequestTracer {
+        let state = AppState::new(false).with_trace_store(Some(store.clone()));
+        RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 1,
+                    group: None,
+                    key_source: TraceKeySource::ClientKey,
+                },
+                model: model.to_string(),
+                is_stream: false,
+            },
+        )
+    }
+
+    fn test_attempt(attempt: u32, credential_id: u64) -> TraceAttempt {
+        TraceAttempt {
+            attempt,
+            credential_id,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 12,
+        }
+    }
+
+    /// 回归锁：跨多次 provider 调用的 attempt 必须重排编号后落库。
+    ///
+    /// `trace_attempts` 主键是 `(trace_id, attempt)`，而 provider 每次
+    /// `call_api*` 都从 1 开始编号。web_search loop 一条 trace 跨多轮调用
+    /// provider，不重排的话第二轮的 attempt=1 会被 `INSERT OR REPLACE` 顶掉
+    /// 第一轮同名行：attempts 表少行，traces.total_attempts 仍是内存里的条数。
+    #[test]
+    fn attempts_from_multiple_provider_calls_are_renumbered() {
+        let store: SharedTraceStore =
+            std::sync::Arc::new(TraceStore::open_in_memory().expect("内存 trace store"));
+        let tracer = test_tracer(&store, "gpt-5.6-sol");
+        // 两轮 web_search，各一跳，provider 都把它编号为 1
+        tracer.on_attempt(test_attempt(1, 11));
+        tracer.on_attempt(test_attempt(1, 22));
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let (rows, _) = store.query_paged(&TraceQuery {
+            model: Some("gpt-5.6-sol".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_attempts, 2);
+        // 落库条数必须与 total_attempts 一致，且编号按时间顺序单调
+        let numbers: Vec<u32> = rows[0].attempts.iter().map(|a| a.attempt).collect();
+        assert_eq!(numbers, vec![1, 2], "跨轮 attempt 必须重排为 1..N");
+        let credentials: Vec<u64> = rows[0].attempts.iter().map(|a| a.credential_id).collect();
+        assert_eq!(credentials, vec![11, 22], "重排不得改变时间顺序");
+    }
 
     #[test]
     fn account_suspended_attempt_is_preserved_as_request_error_type() {
