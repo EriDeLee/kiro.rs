@@ -835,7 +835,7 @@ const MAX_RPM_LIMIT = 100000
  * 请求自动故障转移到下一个可用账号；全部超限时返回 429。
  */
 function useAccountRpmLimitPanelState(resetInput: boolean) {
-  const { data: config, isLoading } = useAccountRpmLimitConfig()
+  const { data: config, isLoading, isError } = useAccountRpmLimitConfig()
   const { mutate, isPending } = useSetAccountRpmLimitConfig()
   const [limitInput, setLimitInput] = useState('')
 
@@ -845,11 +845,18 @@ function useAccountRpmLimitPanelState(resetInput: boolean) {
 
   const enabled = config?.enabled ?? false
   const limit = config?.limit ?? 60
-  const busy = isLoading || isPending
+  // 读取失败时 config 为 undefined，上面两个兜底值会把「取不到」渲染成「已关闭·60」。
+  // 那是在替服务器编状态，所以读取失败一并按 busy 处理并显式提示，不给可点的控件。
+  const busy = isLoading || isPending || isError
 
-  const save = (patch: { enabled?: boolean; limit?: number }, msg: string) => {
+  // 成功提示用服务器回显的生效值，而不是请求里带的值：后端可能因为「与现值相同」
+  // 而短路，也可能只应用了 patch 里的一个字段。
+  const save = (
+    patch: { enabled?: boolean; limit?: number },
+    msg: (applied: { enabled: boolean; limit: number }) => string,
+  ) => {
     mutate(patch, {
-      onSuccess: () => toast.success(msg),
+      onSuccess: (applied) => toast.success(msg(applied)),
       onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -868,13 +875,14 @@ function useAccountRpmLimitPanelState(resetInput: boolean) {
       toast.error(`请输入 ${MIN_RPM_LIMIT}-${MAX_RPM_LIMIT} 之间的整数（当前：${limitInput}）`)
       return
     }
-    save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)
+    save({ limit: n }, (a) => `单账号 RPM 上限已设为 ${a.limit} 次/分钟`)
     setLimitInput('')
   }
 
   return {
     busy,
     enabled,
+    isError,
     isLoading,
     limit,
     limitInput,
@@ -915,6 +923,7 @@ function AccountRpmLimitButton() {
 function AccountRpmLimitPanel({
   busy,
   enabled,
+  isError,
   limit,
   limitInput,
   save,
@@ -927,15 +936,23 @@ function AccountRpmLimitPanel({
       <div className="px-2 pb-2">
         <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
           <div className="min-w-0 text-xs">
-            <div className="font-medium">{enabled ? '已启用' : '已关闭'}</div>
+            <div className="font-medium">
+              {isError ? '读取失败' : enabled ? '已启用' : '已关闭'}
+            </div>
             <div className="text-muted-foreground leading-snug">
-              单账号超过每分钟上限时临时跳过并切换到下一个可用账号；全部超限则返回 429
+              {isError
+                ? '拉取限流配置失败，当前状态未知；请刷新页面重试'
+                : '单账号超过每分钟上限时临时跳过并切换到下一个可用账号；全部超限则返回 429'}
             </div>
           </div>
           <Switch
             checked={enabled}
             disabled={busy}
-            onCheckedChange={(v) => save({ enabled: v }, v ? '已开启单账号限流' : '已关闭单账号限流')}
+            onCheckedChange={(v) =>
+              save({ enabled: v }, (a) =>
+                a.enabled ? '已开启单账号限流' : '已关闭单账号限流',
+              )
+            }
           />
         </div>
       </div>
@@ -950,7 +967,12 @@ function AccountRpmLimitPanel({
               variant={limit === n ? 'default' : 'outline'}
               className="h-7 text-xs"
               disabled={busy || !enabled}
-              onClick={() => save({ limit: n }, `单账号 RPM 上限已设为 ${n} 次/分钟`)}
+              // 与 CooldownPresetButton 一致：点当前值不再发一次注定短路的 PUT，
+              // 否则后端原样返回而 toast 仍报「已设为」，看着像做了什么
+              onClick={() => {
+                if (limit === n) return
+                save({ limit: n }, (a) => `单账号 RPM 上限已设为 ${a.limit} 次/分钟`)
+              }}
             >
               {n}
             </Button>

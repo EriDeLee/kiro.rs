@@ -129,6 +129,9 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  // 批量循环直接调裸 API：走 useDeleteCredential 会在每条成功后 invalidate
+  // ['credentials']，N 条就是 N 次重新拉全表，且中途刷新会改变列表长度、触发页码复位。
+  deleteCredential as deleteCredentialApi,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
@@ -721,17 +724,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
         try {
-          await new Promise<void>((resolve, reject) => {
-            deleteCredential(id, {
-              onSuccess: () => {
-                s++;
-                resolve();
-              },
-              onError: (err) => {
-                reject(err);
-              },
-            });
-          });
+          await deleteCredentialApi(id);
+          s++;
         } catch {
           failedIds.add(id);
         }
@@ -739,6 +733,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       }
     } finally {
       setBatchDeleting(false);
+      // 整批结束后只刷一次列表
+      queryClient.invalidateQueries({ queryKey: ["credentials"] });
     }
     const f = failedIds.size;
     if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
@@ -836,21 +832,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     let s = 0,
       f = 0;
-    for (const c of disabled) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(c.id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
-          });
-        });
-      } catch {}
+    try {
+      // 同上：整批走裸 API，结束后统一刷一次
+      for (const c of disabled) {
+        try {
+          await deleteCredentialApi(c.id);
+          s++;
+        } catch {
+          f++;
+        }
+      }
+    } finally {
+      queryClient.invalidateQueries({ queryKey: ["credentials"] });
     }
     if (f === 0) toast.success(`成功清除所有 ${s} 个已禁用凭据`);
     else toast.warning(`清除已禁用凭据：成功 ${s} 个，失败 ${f} 个`);
@@ -1729,7 +1722,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="min-w-[10rem]">
                   <DropdownMenuLabel>隐藏这些状态</DropdownMenuLabel>
-                  {STATUS_OPTIONS.map((s) => (
+                  {STATUS_OPTIONS.filter(
+                    // 均衡模式下不存在「当前优先」这个概念，服务端把 currentId 一律报 0
+                    // （service.rs get_all_credentials），该选项永远命中不到任何凭据。
+                    (s) =>
+                      s.value !== "current" ||
+                      loadBalancingData?.mode !== "balanced",
+                  ).map((s) => (
                     <DropdownMenuItem
                       key={s.value}
                       onSelect={(e) => {
@@ -2036,7 +2035,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </div>
         </div>
 
-        {/* 列表 */}
+        {/* 列表。空态分两种：一条凭据都没有，和有凭据但被筛光了 —— 后者必须单独提示，
+            否则勾满状态隐藏或搜到无结果时页面只剩一片空白，用不着的人以为数据丢了 */}
         {data?.credentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center">
@@ -2046,6 +2046,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <p className="text-sm text-muted-foreground">
                 暂无凭据，点击右上角“添加凭据”开始
               </p>
+            </CardContent>
+          </Card>
+        ) : filteredCredentials.length === 0 ? (
+          <Card>
+            <CardContent className="py-16 text-center">
+              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
+                <Search className="h-5 w-5" />
+              </div>
+              <p className="text-sm text-muted-foreground">
+                没有符合当前筛选条件的凭据（共 {data?.credentials.length ?? 0} 个）
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-3"
+                onClick={() => {
+                  setGroupFilter("");
+                  setTierFilter(new Set());
+                  setHiddenStatuses(new Set());
+                  setSearchQuery("");
+                }}
+              >
+                清除全部筛选
+              </Button>
             </CardContent>
           </Card>
         ) : (
