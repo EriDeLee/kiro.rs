@@ -149,7 +149,7 @@ cargo build --release
 | `POST` | `/v1/messages/count_tokens` | Token 估算，覆盖 text / tool_use / tool_result / image / thinking |
 | `POST` | `/v1/responses` | OpenAI Responses，仅 `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` |
 | `GET` | `/v1/models` | 模型列表，仅列白名单内的 5 个 |
-| — | `/api/admin/*` | Admin API（43 个端点，需 `adminApiKey`） |
+| — | `/api/admin/*` | Admin API（57 条路由 / 70 个方法端点，需 `adminApiKey`） |
 | — | `/admin` | Admin Web UI |
 
 ---
@@ -157,7 +157,7 @@ cargo build --release
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（536 个）
+cargo test --release                      # 后端测试（548 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

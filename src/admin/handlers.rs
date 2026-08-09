@@ -23,7 +23,8 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
-        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
+        SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetSelfHealConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -558,6 +559,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// GET /api/admin/config/account-rpm-limit
+/// 获取单账号 RPM 限流配置
+pub async fn get_account_rpm_limit_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_account_rpm_limit_config())
+}
+
+/// PUT /api/admin/config/account-rpm-limit
+/// 更新单账号 RPM 限流配置
+pub async fn set_account_rpm_limit_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetAccountRpmLimitConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_rpm_limit_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
     }

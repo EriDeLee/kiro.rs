@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -895,6 +895,13 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// RPM 主动限流的滑动窗口：被选中发起真实业务请求的时间戳队列，按时间升序。
+    ///
+    /// 判据是**窗口内未过期的时间戳条数**（`rpm_exceeded`），不是队列长度：
+    /// 过期条目只在下一次 `record_request` 时从队首剔除，所以队列里可能残留过期项。
+    /// 时间戳一律在持有 `entries` 锁之后采样，以保证升序（队首即最早）。
+    /// 不持久化，进程重启后清空；限流关闭时下一次记账会清空。
+    rpm_window: VecDeque<Instant>,
     /// 当前凭据连续执行自愈的轮数。同一凭据成功后清零。
     self_heal_consecutive_rounds: u32,
     /// 当前凭据累计被自愈恢复的次数。
@@ -906,7 +913,10 @@ struct CredentialEntry {
 }
 
 impl CredentialEntry {
-    /// 清空失败计数与禁用/冷却状态，让凭据重新参与调度
+    /// 清空失败计数、禁用/冷却状态与 RPM 窗口计数，让凭据重新参与调度。
+    ///
+    /// 注意 RPM 窗口一并清零：调用方（Admin 重置/启用、IdC 重登录换号）语义上都是
+    /// 「这个凭据重新开始」，保留旧的分钟内计数会让刚恢复的凭据立刻又被限住。
     fn reset_health(&mut self) {
         self.failure_count = 0;
         self.total_failure_count = 0;
@@ -914,6 +924,7 @@ impl CredentialEntry {
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
+        self.rpm_window.clear();
         self.clear_self_heal_streak();
     }
 }
@@ -1068,6 +1079,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1139,6 +1153,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 单账号 RPM 主动限流开关（运行时可修改）
+    account_rpm_limit_enabled: AtomicBool,
+    /// 单账号每分钟请求次数上限（运行时可修改）
+    account_rpm_limit: AtomicU32,
     /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
     /// 全账号自愈总开关（运行时可修改）
@@ -1165,6 +1183,9 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
+const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1305,6 +1326,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    rpm_window: VecDeque::new(),
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
@@ -1356,6 +1378,8 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let rpm_limit_enabled = config.account_rpm_limit_enabled;
+        let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
@@ -1375,6 +1399,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
+            account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
@@ -1696,8 +1722,141 @@ impl MultiTokenManager {
                 .throttled_until
                 .map(|until| until > now)
                 .unwrap_or(false)
+            && !self.rpm_exceeded(entry, now)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+    }
+
+    /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
+    ///
+    /// 限流未开启时恒为 `false`（不参与调度判断）。只读判断，不修改窗口：
+    /// 判据是窗口内**未过期的条数**，过期项由 [`Self::record_request`] 在下次记账时
+    /// 从队首剔除；因此长期不被选中的凭据会残留过期项，但不影响这里的判断结果。
+    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        // limit 的两条写入路径（Config::load 校验、set_account_rpm_limit_config）都强制
+        // 1..=100000，此处 0 不可达。保留该分支只为不让编程错误退化成「全账号恒超限」
+        // 或 rpm_retry_after_secs 的 nth() 取空 panic；配置侧已经会明确报错，不是静默降级。
+        debug_assert!(limit >= 1, "account_rpm_limit 必须在写入时被校验为 >= 1");
+        if limit == 0 {
+            return false;
+        }
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let fresh = entry
+            .rpm_window
+            .iter()
+            .filter(|&&ts| now.duration_since(ts) < window)
+            .count();
+        fresh as u32 >= limit
+    }
+
+    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
+        if limit == 0 {
+            return None;
+        }
+
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut earliest_retry_after = None;
+
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && !entry
+                    .throttled_until
+                    .map(|until| until > now)
+                    .unwrap_or(false)
+                && credential_matches_request(&entry.credentials, model, group)
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+        }) {
+            let fresh_count = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .count();
+            if fresh_count < limit {
+                return None;
+            }
+
+            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh_count - limit;
+            let release_at = entry
+                .rpm_window
+                .iter()
+                .filter(|&&ts| now.duration_since(ts) < window)
+                .nth(release_index)
+                .copied()
+                .expect("fresh_count 与窗口迭代结果应一致")
+                + window;
+            let remaining = release_at.saturating_duration_since(now);
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest_retry_after = Some(
+                earliest_retry_after
+                    .map(|current: u64| current.min(retry_after))
+                    .unwrap_or(retry_after),
+            );
+        }
+
+        earliest_retry_after
+    }
+
+    /// 尝试为一次真实业务请求预留 RPM 额度。
+    ///
+    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
+    /// 在选择阶段同时通过检查后全部写入窗口。返回 `false` 表示额度已被其它请求
+    /// 抢先占用，调用方应重新选择凭据。
+    ///
+    /// `now` 必须在**取得锁之后**采样：若在锁外采样，两个线程可能以逆序压入队列，
+    /// 那样队首不再是最早时间戳，队首剔除会提前中断（残留过期项让 len 虚高、
+    /// 与 `rpm_exceeded` 的新鲜条数判据分叉），`rpm_retry_after_secs` 的 nth()
+    /// 也不再取到第 k 早的那个。
+    fn record_request(&self, id: u64) -> bool {
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            if !entry.rpm_window.is_empty() {
+                entry.rpm_window.clear();
+            }
+            return true;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        debug_assert!(limit >= 1, "account_rpm_limit 必须在写入时被校验为 >= 1");
+        if limit == 0 {
+            entry.rpm_window.clear();
+            return true;
+        }
+        while let Some(&front) = entry.rpm_window.front() {
+            if now.duration_since(front) >= window {
+                entry.rpm_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.rpm_window.len() >= limit as usize {
+            return false;
+        }
+        entry.rpm_window.push_back(now);
+        true
     }
 
     fn has_available_for_request(
@@ -1791,7 +1950,9 @@ impl MultiTokenManager {
     /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式。
     ///
     /// `update_current` 仅应在真实业务请求中开启。Admin 模型发现需要复用同一套
-    /// 凭据选择和 Token 刷新规则，但不应因只读查询改变调度状态。
+    /// 凭据选择和 Token 刷新规则，但不应因只读查询改变调度状态。它同时决定两件事：
+    /// 是否推进粘性 `current_id`，以及是否把本次请求计入 RPM 滑动窗口
+    /// （见 [`Self::record_request`]）——只读查询两者都不做。
     async fn acquire_context_impl(
         &self,
         model: Option<&str>,
@@ -1825,6 +1986,7 @@ impl MultiTokenManager {
                     let confirmed_available = entries.iter().any(|e| {
                         !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                            && !self.rpm_exceeded(e, now)
                             && credential_matches_request(&e.credentials, model, group)
                             && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
@@ -1836,6 +1998,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && !self.rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, model, group)
                                 && model_support != CachedModelSupport::Unsupported
                                 && (!confirmed_available
@@ -1864,6 +2027,13 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        {
+                            return Err(
+                                UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                            );
+                        }
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -1878,6 +2048,11 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
+                    if update_current && !self.record_request(id) {
+                        // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
+                        continue;
+                    }
                     return Ok((ctx, is_balanced));
                 }
                 Err(e) => {
@@ -2930,6 +3105,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -3510,6 +3686,15 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        // 记录添加时间：缺失时以当前时间入库；已有值（Token 刷新会原样带过来）不覆盖。
+        //
+        // 这是**经 add_credential 的**全部路径（单条添加 / 批量导入 / OAuth 登录回调）的
+        // 唯一收口。两点如实说明：请求体 `AddCredentialRequest` 没有 createdAt 字段，
+        // 所以目前不存在"调用方带着原值进来"的生产路径；另外 `KIRO_API_KEY` 环境变量
+        // 那条凭据在 main.rs 里直接进 credentials_list，不走这里，前端会显示"未知"。
+        validated_cred
+            .created_at
+            .get_or_insert_with(|| Utc::now().to_rfc3339());
 
         {
             let mut entries = self.entries.lock();
@@ -3546,6 +3731,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                rpm_window: VecDeque::new(),
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
@@ -4022,6 +4208,77 @@ impl MultiTokenManager {
         })
     }
 
+    /// 获取单账号 RPM 限流配置（Admin API）。返回：(是否启用, 每分钟上限)。
+    pub fn get_account_rpm_limit_config(&self) -> (bool, u32) {
+        (
+            self.account_rpm_limit_enabled.load(Ordering::Relaxed),
+            self.account_rpm_limit.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置单账号 RPM 限流配置（Admin API）。
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。关闭限流时会清空所有凭据的窗口计数，
+    /// 避免下次开启时残留旧时间戳造成误判。
+    pub fn set_account_rpm_limit_config(
+        &self,
+        enabled: Option<bool>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(value) = limit {
+            // 限定合理范围：1..=100000。0 会被视为"不限"，故不接受，避免与关闭开关语义混淆。
+            if !(1..=100_000).contains(&value) {
+                anyhow::bail!("RPM 上限必须在 1..=100000 内: {}", value);
+            }
+        }
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_enabled, prev_limit) = self.get_account_rpm_limit_config();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_limit = limit.unwrap_or(prev_limit);
+        // prev_limit 必然合法：内存值只有 Config（load 期校验）和本函数两个写入点，
+        // 所以「只传 enabled=true」沿用旧上限时不需要再校验一次。
+        debug_assert!((1..=100_000).contains(&new_limit));
+
+        if new_enabled == prev_enabled && new_limit == prev_limit {
+            return Ok(());
+        }
+
+        self.account_rpm_limit_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.account_rpm_limit.store(new_limit, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_account_rpm_limit_config(new_enabled, new_limit) {
+            // 回滚内存值
+            self.account_rpm_limit_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.account_rpm_limit.store(prev_limit, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        // 关闭限流时清空窗口，避免重新开启后残留旧计数误判。
+        if !new_enabled {
+            for entry in self.entries.lock().iter_mut() {
+                entry.rpm_window.clear();
+            }
+        }
+
+        tracing::info!(
+            "单账号 RPM 限流配置已更新: enabled={}, limit={}",
+            new_enabled,
+            new_limit
+        );
+        Ok(())
+    }
+
+    fn persist_account_rpm_limit_config(&self, enabled: bool, limit: u32) -> anyhow::Result<()> {
+        self.update_config_file(move |config| {
+            config.account_rpm_limit_enabled = enabled;
+            config.account_rpm_limit = limit;
+        })
+    }
+
     /// 获取自愈治理配置（Admin API）。
     ///
     /// 返回：(封禁识别开关, 自愈开关, 自愈冷却秒, 连续自愈上限, 当前连续自愈轮数,
@@ -4161,6 +4418,109 @@ impl MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
+    fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = enabled;
+        config.account_rpm_limit = limit;
+        let cred = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("refresh-token-".repeat(4)),
+            access_token: Some("access-token".to_string()),
+            ..KiroCredentials::default()
+        };
+        MultiTokenManager::new(config, vec![cred], None, None, true).unwrap()
+    }
+
+    #[test]
+    fn rpm_disabled_never_exceeds() {
+        let mgr = rpm_test_manager(false, 1);
+        // 即使反复记录也不应触发限流（关闭时 record 直接清空窗口）
+        for _ in 0..10 {
+            mgr.record_request(1);
+        }
+        let entries = mgr.entries.lock();
+        let entry = &entries[0];
+        assert!(!mgr.rpm_exceeded(entry, Instant::now()));
+        assert!(entry.rpm_window.is_empty());
+    }
+
+    #[test]
+    fn rpm_blocks_at_limit_and_recovers_after_window() {
+        let limit = 3;
+        let mgr = rpm_test_manager(true, limit);
+
+        // 恰好未达上限：limit-1 次后仍可用
+        for _ in 0..(limit - 1) {
+            mgr.record_request(1);
+        }
+        {
+            let entries = mgr.entries.lock();
+            assert!(!mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+
+        // 第 limit 次后达到上限：应拦截
+        mgr.record_request(1);
+        {
+            let entries = mgr.entries.lock();
+            assert!(mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+
+        // 手动把窗口内时间戳伪造成 61 秒前，模拟窗口滑出 → 恢复可用
+        {
+            let mut entries = mgr.entries.lock();
+            let old = Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 1);
+            for ts in entries[0].rpm_window.iter_mut() {
+                *ts = old;
+            }
+            assert!(!mgr.rpm_exceeded(&entries[0], Instant::now()));
+        }
+    }
+
+    #[test]
+    fn rpm_record_prunes_expired_timestamps() {
+        let mgr = rpm_test_manager(true, 100);
+        // 注入一个过期时间戳，record 时应被剔除，只留新压入的一个
+        {
+            let mut entries = mgr.entries.lock();
+            entries[0]
+                .rpm_window
+                .push_back(Instant::now() - StdDuration::from_secs(RPM_WINDOW_SECS + 5));
+        }
+        mgr.record_request(1);
+        let entries = mgr.entries.lock();
+        assert_eq!(entries[0].rpm_window.len(), 1);
+    }
+
+    #[test]
+    fn rpm_record_never_reserves_beyond_limit() {
+        let mgr = rpm_test_manager(true, 2);
+
+        // 多个请求可能在任一请求记账前都已通过选择阶段。最终记账必须再次校验
+        // 上限，确保这些并发预选请求中最多只有 limit 个获得额度。
+        for _ in 0..8 {
+            mgr.record_request(1);
+        }
+
+        let entries = mgr.entries.lock();
+        assert_eq!(entries[0].rpm_window.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rpm_exhaustion_returns_typed_rate_limit_error() {
+        let mgr = rpm_test_manager(true, 1);
+        mgr.record_request(1);
+
+        let error = match mgr.acquire_context(None, None).await {
+            Ok(_) => panic!("RPM 已耗尽时不应返回调用上下文"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("RPM 已耗尽应返回类型化限流错误，以便 HTTP 层映射为 429");
+        assert!(rate_limit.retry_after().is_some());
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -4401,6 +4761,31 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
+    /// 且值可被解析。旧凭据（未携带该字段）由调用方决定是否补齐。
+    #[tokio::test]
+    async fn test_add_credential_sets_created_at() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut api_key_cred = KiroCredentials::default();
+        api_key_cred.kiro_api_key = Some("ksk_created_at_probe".to_string());
+        api_key_cred.auth_method = Some("api_key".to_string());
+
+        manager.add_credential(api_key_cred).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.first().expect("凭据应已入库");
+        let created_at = entry
+            .created_at
+            .as_deref()
+            .expect("新凭据应写入 created_at");
+        assert!(
+            DateTime::parse_from_rfc3339(created_at).is_ok(),
+            "created_at 应为合法 RFC3339: {created_at}"
+        );
     }
 
     #[tokio::test]

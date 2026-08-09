@@ -37,7 +37,7 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 - 白名单外的任何模型 → 一律 400
 - 为兼容而生的第二条路径（legacy 端点、模糊模型匹配、自定义模型表）
 
-Admin 面板（`/api/admin` + `/admin` UI，43 个端点）保留。四条认证路径（`idc` / `social` / `external_idp` / `api_key`）保留——Admin 的 9 个 OAuth 登录端点依赖它们。
+Admin 面板（`/api/admin` + `/admin` UI，57 条路由 / 70 个方法端点）保留。四条认证路径（`idc` / `social` / `external_idp` / `api_key`）保留——Admin 的 9 个 OAuth 登录端点依赖它们。
 
 **工具 schema 原样透传，不做内置工具名映射。** 客户端声明什么工具名与 `input_schema`，
 就原样发给上游；工具调用的 input 一个键都不改写。仅保留两项与客户端无关的必要处理：

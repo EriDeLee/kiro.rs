@@ -66,6 +66,13 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 账号级风控冷却剩余秒数（未在冷却中时为 None）
+    ///
+    /// 前端的「冷却 {倒计时}」角标、「解除风控冷却」按钮与「冷却中」隐藏筛选都读这个字段；
+    /// 快照一直有值（`CredentialEntrySnapshot::throttled_remaining_secs`），但此前没有映射
+    /// 到响应里，那三处 UI 因此恒不生效。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）
@@ -80,6 +87,9 @@ pub struct CredentialStatusItem {
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -478,6 +488,28 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 单账号 RPM 限流配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRpmLimitConfigResponse {
+    /// 是否启用单账号 RPM 主动限流
+    pub enabled: bool,
+    /// 每账号每分钟请求次数上限
+    pub limit: u32,
+}
+
+/// 更新单账号 RPM 限流配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountRpmLimitConfigRequest {
+    /// 是否启用限流；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 每分钟上限；缺省表示不修改，1..=100000
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// 自愈治理配置响应

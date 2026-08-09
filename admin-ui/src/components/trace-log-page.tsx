@@ -298,10 +298,71 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 */
+/**
+ * 计费面板：以 credit（上游 meteringEvent 的真实计费）为核心，间接反映上游隐式缓存的省钱效果。
+ *
+ * 本项目不产出任何缓存 token 拆分：prompt 缓存在上游隐式生效且免费，请求侧 `cachePoint`
+ * 被静默丢弃、响应侧 `metadataEvent` 只含 `stopReason`（无 tokenUsage、无 cache 明细），
+ * 所以 cache_creation / cache_read 一律不伪造（AGENTS.md §4.1）。唯一可观测的成本信号是
+ * credit：重复长前缀第二次起 credit 实测稳定降到 ×0.528。
+ *
+ * 「每千输入 credit」的读法有前提，UI 上必须写清：分子 `credits` 是 `meteringEvent.usage`
+ * 的整请求累加（`MeteringEvent` 只有一个 usage 总数，不区分输入/输出），分母只有输入，
+ * 所以输出变长会把比值推高。只有在输入输出规模相近的同类请求之间对比，它才反映缓存命中。
+ *
+ * 注：input token 是上游 contextUsage 推算的粗粒度估算（缺失时回落本地计数），
+ * credit 才是上游真实计费口径。
+ */
+function BillingPanel({ rec }: { rec: TraceRecord }) {
+  const credit = rec.credits ?? 0
+  if (credit <= 0) return null
+  // inputTokens 即整条 prompt 的估算总量（含被上游隐式缓存命中的部分），
+  // 没有缓存拆分字段可加，直接用它做分母。
+  const promptTotal = rec.inputTokens ?? 0
+  const perK = promptTotal > 0 ? credit / (promptTotal / 1000) : null
+
+  const items: Array<{ label: string; value: string; hint?: string }> = [
+    { label: '真实计费', value: credit.toFixed(4), hint: 'credit（上游 metering）' },
+    { label: '总输入 Token', value: formatTokens(promptTotal), hint: '含缓存命中·估算' },
+  ]
+  if (perK != null) {
+    items.push({
+      label: '每千输入 credit',
+      value: perK.toFixed(4),
+      hint: '含输出成本·仅同规模请求间可比',
+    })
+  }
+
+  return (
+    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
+      <div className="mb-2 flex items-center gap-2 text-[12px] font-medium text-muted-foreground">
+        <span>计费与缓存效率</span>
+        <span className="text-[11px] font-normal text-muted-foreground/70">
+          credit 为上游整请求真实计费（含输出，无缓存明细）
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
+        {items.map((it) => (
+          <div key={it.label} className="min-w-0">
+            <div className="text-[11px] text-muted-foreground">{it.label}</div>
+            <div className="font-mono tabular-nums text-[15px] font-semibold text-pink-600 dark:text-pink-400">
+              {it.value}
+            </div>
+            {it.hint && (
+              <div className="text-[10px] text-muted-foreground/70">{it.hint}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** 展开后的链路详情：计费/缓存效率 + 错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
+      <BillingPanel rec={rec} />
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}

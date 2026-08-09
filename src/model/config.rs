@@ -103,6 +103,23 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
+    ///
+    /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
+    /// 上限时，该凭据在窗口内被临时排除出候选，请求自动故障转移到下一个可用凭据；
+    /// 所有凭据都超限时返回 429。窗口计数不持久化，进程重启后清空。
+    /// 关闭时（默认）完全不计数、不影响调度，存量用户无感知。
+    #[serde(default = "default_account_rpm_limit_enabled")]
+    pub account_rpm_limit_enabled: bool,
+
+    /// 单账号每分钟请求次数上限（默认 60）。仅在 `account_rpm_limit_enabled` 为 true 时生效。
+    ///
+    /// 合法范围 1..=100000，由 [`Config::load`] 与 Admin `PUT /config/account-rpm-limit`
+    /// 两条写入路径共同强制。0 不是「不限」——它会被 `load` 直接拒绝，因为
+    /// 「已开启但等于不限」是调用方无法察觉的静默失效。
+    #[serde(default = "default_account_rpm_limit")]
+    pub account_rpm_limit: u32,
+
     /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
     ///
     /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
@@ -230,6 +247,14 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_account_rpm_limit_enabled() -> bool {
+    false
+}
+
+fn default_account_rpm_limit() -> u32 {
+    60
+}
+
 fn default_suspended_detection_enabled() -> bool {
     true
 }
@@ -294,6 +319,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
+            account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
@@ -342,6 +369,15 @@ impl Config {
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
 
+        // 与 Admin API 同一条判据（1..=100000）。手改成 0 会让「已开启限流」实际等于不限，
+        // 调用方无从察觉——按 §2.3 宁可启动失败也不假装生效。关限流请用 enabled=false。
+        if !(1..=100_000).contains(&config.account_rpm_limit) {
+            anyhow::bail!(
+                "accountRpmLimit 必须在 1..=100000 内，当前为 {}；如需关闭单账号 RPM 限流请设 accountRpmLimitEnabled=false",
+                config.account_rpm_limit
+            );
+        }
+
         Ok(config)
     }
 
@@ -367,6 +403,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::fs;
 
     #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {
@@ -411,5 +448,60 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+
+    #[test]
+    fn account_rpm_limit_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 60);
+
+        let default = Config::default();
+        assert!(!default.account_rpm_limit_enabled);
+        assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn account_rpm_limit_accepts_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "accountRpmLimitEnabled": true,
+                "accountRpmLimit": 120
+            }"#,
+        )
+        .unwrap();
+        assert!(config.account_rpm_limit_enabled);
+        assert_eq!(config.account_rpm_limit, 120);
+    }
+
+    /// 回归锁：`accountRpmLimit` 越界必须在加载期显式失败。
+    ///
+    /// 反向判据（§3.8）：修复前 0 会让运行时的三处 RPM 判断全部短路成「不限流」，
+    /// 而开关显示「已启用」，状态码与单测都无法区分；现在 load 直接报错。
+    #[test]
+    fn account_rpm_limit_out_of_range_fails_to_load() {
+        let dir = std::env::temp_dir().join(format!("kiro-rpm-cfg-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        for bad in ["0", "100001"] {
+            let path = dir.join(format!("config-{bad}.json"));
+            fs::write(
+                &path,
+                format!(r#"{{"accountRpmLimitEnabled": true, "accountRpmLimit": {bad}}}"#),
+            )
+            .unwrap();
+            let err = Config::load(&path).expect_err("越界的 accountRpmLimit 必须加载失败");
+            assert!(
+                err.to_string().contains("accountRpmLimit"),
+                "报错应点名字段，实际: {err}"
+            );
+        }
+
+        // 合法边界值仍应加载成功
+        let ok_path = dir.join("config-ok.json");
+        fs::write(&ok_path, r#"{"accountRpmLimit": 1}"#).unwrap();
+        assert_eq!(Config::load(&ok_path).unwrap().account_rpm_limit, 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

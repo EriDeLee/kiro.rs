@@ -32,3 +32,6 @@
 .claude/
 
 # 前端构建副产物 / 包管理器锁文件（本仓库用 bun.lock 为准）
+/admin-ui/package-lock.json
+/admin-ui/pnpm-lock.yaml
+/admin-ui/yarn.lock

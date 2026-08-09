@@ -443,6 +443,25 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface AccountRpmLimitConfig {
+  enabled: boolean
+  limit: number
+}
+
+// 获取单账号 RPM 限流配置
+export async function getAccountRpmLimitConfig(): Promise<AccountRpmLimitConfig> {
+  const { data } = await api.get<AccountRpmLimitConfig>('/config/account-rpm-limit')
+  return data
+}
+
+// 更新单账号 RPM 限流配置
+export async function setAccountRpmLimitConfig(
+  patch: Partial<AccountRpmLimitConfig>,
+): Promise<AccountRpmLimitConfig> {
+  const { data } = await api.put<AccountRpmLimitConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
 // 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
 // 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {

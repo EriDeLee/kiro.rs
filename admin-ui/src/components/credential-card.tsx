@@ -71,6 +71,8 @@ interface CredentialCardProps {
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
+  /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
+  dragDisabled?: boolean;
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -85,6 +87,26 @@ function formatLastUsed(lastUsedAt: string | null): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h} 小时前`;
   return `${Math.floor(h / 24)} 天前`;
+}
+
+/** 添加时间用绝对日期展示（凭据的创建时刻是固定事实，相对时间意义不大） */
+function formatCreatedAt(createdAt: string | null | undefined): string {
+  if (!createdAt) return "未知";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "未知";
+  return date.toLocaleDateString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+/** 完整时间戳，用于 hover 提示 */
+function formatCreatedAtFull(createdAt: string | null | undefined): string {
+  if (!createdAt) return "添加时间未知（该凭据在此功能上线前导入）";
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "添加时间未知";
+  return `添加于 ${date.toLocaleString("zh-CN")}`;
 }
 
 function formatNumber(n: number): string {
@@ -198,6 +220,7 @@ export function CredentialCard({
   onRefreshBalance,
   failureStats,
   view = "card",
+  dragDisabled = false,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -228,7 +251,7 @@ export function CredentialCard({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: credential.id });
+  } = useSortable({ id: credential.id, disabled: dragDisabled });
   const dragStyle: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     // 拖拽中关掉过渡，避免 Card 基类的 transition-all 把每帧 transform 动画化导致"不跟手"；
@@ -555,19 +578,21 @@ export function CredentialCard({
           : "hover:bg-accent/40 hover:shadow-apple-sm"
       } ${stateClasses}`}
     >
-      {/* 拖拽手柄 */}
-      <Button
-        ref={setActivatorNodeRef}
-        size="icon"
-        variant="ghost"
-        data-no-rect-select
-        className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
-        title="拖拽调整优先级"
-        {...attributes}
-        {...listeners}
-      >
-        <GripVertical className="h-4 w-4 text-muted-foreground" />
-      </Button>
+      {/* 拖拽手柄（字段排序开启时隐藏，此时拖拽无意义） */}
+      {!dragDisabled && (
+        <Button
+          ref={setActivatorNodeRef}
+          size="icon"
+          variant="ghost"
+          data-no-rect-select
+          className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
+          title="拖拽调整优先级"
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical className="h-4 w-4 text-muted-foreground" />
+        </Button>
+      )}
 
       {/* 选择框 */}
       <label
@@ -745,9 +770,17 @@ export function CredentialCard({
         )}
       </div>
 
-      {/* 最后调用（中大屏） */}
-      <div className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block">
-        {formatLastUsed(credential.lastUsedAt)}
+      {/* 最后调用 + 添加时间（中大屏） */}
+      <div className="hidden w-24 shrink-0 truncate text-right text-xs md:block">
+        <div className="truncate text-muted-foreground">
+          {formatLastUsed(credential.lastUsedAt)}
+        </div>
+        <div
+          className="truncate text-[11px] tabular-nums text-muted-foreground/60"
+          title={formatCreatedAtFull(credential.createdAt)}
+        >
+          添加 {formatCreatedAt(credential.createdAt)}
+        </div>
       </div>
 
       {/* 操作区 */}
@@ -968,6 +1001,15 @@ export function CredentialCard({
                 {formatLastUsed(credential.lastUsedAt)}
               </dd>
             </div>
+            <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">添加时间</dt>
+              <dd
+                className="min-w-0 truncate text-right font-medium tabular-nums"
+                title={formatCreatedAtFull(credential.createdAt)}
+              >
+                {formatCreatedAt(credential.createdAt)}
+              </dd>
+            </div>
             {credential.maskedApiKey && (
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">API Key</dt>
@@ -1060,19 +1102,23 @@ export function CredentialCard({
           {/* 操作区 */}
           <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
             <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
-              <Button
-                ref={setActivatorNodeRef}
-                size="icon"
-                variant="ghost"
-                data-no-rect-select
-                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
-                title="拖拽调整优先级"
-                {...attributes}
-                {...listeners}
-              >
-                <GripVertical className="h-4 w-4 text-muted-foreground" />
-              </Button>
-              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+              {!dragDisabled && (
+                <>
+                  <Button
+                    ref={setActivatorNodeRef}
+                    size="icon"
+                    variant="ghost"
+                    data-no-rect-select
+                    className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
+                    title="拖拽调整优先级"
+                    {...attributes}
+                    {...listeners}
+                  >
+                    <GripVertical className="h-4 w-4 text-muted-foreground" />
+                  </Button>
+                  <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+                </>
+              )}
               <Button
                 size="sm"
                 variant="ghost"

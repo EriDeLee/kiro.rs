@@ -235,7 +235,9 @@ export function ClientKeysPage() {
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="text-right font-medium px-4 py-3">操作</th>
+                  <th className="sticky right-0 z-20 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
+                    操作
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -298,7 +300,7 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {formatRelative(k.lastUsedAt)}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="sticky right-0 z-10 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
                         <Button
                           size="icon"

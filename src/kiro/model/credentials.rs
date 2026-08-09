@@ -176,6 +176,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 凭据添加（创建）时间（RFC3339 格式）
+    ///
+    /// 由 `add_credential` 在首次入库时写入，此后随凭据一起持久化。
+    /// 旧配置文件缺失该字段时为 `None`，前端展示为"未知"。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -236,6 +244,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("created_at", &self.created_at)
             .finish()
     }
 }
@@ -665,6 +674,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -889,6 +899,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -932,6 +943,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1058,6 +1070,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            created_at: None,
         };
 
         let json = original.to_pretty_json().unwrap();

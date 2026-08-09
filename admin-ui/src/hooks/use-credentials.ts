@@ -18,6 +18,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getAccountRpmLimitConfig,
+  setAccountRpmLimitConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
@@ -234,6 +236,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取单账号 RPM 限流配置
+export function useAccountRpmLimitConfig() {
+  return useQuery({
+    queryKey: ['accountRpmLimitConfig'],
+    queryFn: getAccountRpmLimitConfig,
+  })
+}
+
+// 更新单账号 RPM 限流配置
+export function useSetAccountRpmLimitConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRpmLimitConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
     },
   })
 }

@@ -32,7 +32,8 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
@@ -40,7 +41,8 @@ use super::types::{
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -467,11 +469,13 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    throttled_remaining_secs: entry.throttled_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
+                    created_at: entry.created_at,
                 }
             })
             .collect();
@@ -1026,6 +1030,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            // 创建时间由 token_manager.add_credential 在入库时统一写入
+            created_at: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -1270,6 +1276,30 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取单账号 RPM 限流配置
+    pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
+        let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
+        AccountRpmLimitConfigResponse { enabled, limit }
+    }
+
+    /// 更新单账号 RPM 限流配置
+    pub fn set_account_rpm_limit_config(
+        &self,
+        req: SetAccountRpmLimitConfigRequest,
+    ) -> Result<AccountRpmLimitConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.limit.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 limit 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_rpm_limit_config(req.enabled, req.limit)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_rpm_limit_config())
     }
 
     /// 获取自愈治理配置
