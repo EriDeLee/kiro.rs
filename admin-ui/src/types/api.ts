@@ -435,6 +435,8 @@ export interface TraceRecord {
   keySource: 'masterApiKey' | 'clientKey'
   /** 发起请求的客户端 Key 名称（master 表示主 apiKey；管理员业务 Key 可为 null） */
   keyName?: string | null
+  /** 客户端实际请求的 API 入口；unknown 表示升级前的历史记录 */
+  apiEndpoint: 'messages' | 'responses' | 'unknown'
   model: string
   isStream: boolean
   /** success / error / interrupted */
@@ -470,6 +472,8 @@ export interface TraceQuery {
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string
+  /** 按客户端 API 入口筛选 */
+  apiEndpoint?: 'messages' | 'responses' | 'unknown'
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean

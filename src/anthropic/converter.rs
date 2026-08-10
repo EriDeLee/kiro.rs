@@ -204,19 +204,17 @@ pub fn map_model(model: &str) -> Option<String> {
         return None;
     }
     // 白名单是唯一权威：只认 Claude 组（claude-opus-5 / claude-sonnet-5）与
-    // GPT 组（gpt-5.6-sol / -terra / -luna），其余一律 None。协议与模型组的绑定
-    // 由端点层（handlers / responses）校验，这里不区分协议——converter 是两条
-    // 端点共用的下游。
+    // GPT 组（gpt-5.6-sol / -terra / -luna），其余一律 None。API 入口策略由
+    // handlers / responses 校验；converter 只按上游模型族分流。
     crate::model::allowlist::normalize(model).map(str::to_string)
 }
 
 /// 根据模型名称返回对应的上下文窗口大小（`maxInputTokens`）。
 ///
-/// 取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`，按协议族分组：
+/// 取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`：
 ///
 /// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：1,000,000
-/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：272,000
-///   （官方 1.05M，Kiro 卡在 272k）
+/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：372,000
 ///
 /// 这个值参与 contextUsageEvent 的百分比 → 绝对 token 数换算，取错会让上报的
 /// input_tokens 系统性偏差，进而误导客户端的上下文压缩时机。
@@ -224,10 +222,10 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 注：输出上限（opus-5 128k / sonnet-5 64k / gpt 族 128k）不在此函数职责内 ——
 /// `/v1/models` 的 `max_tokens` 直接取上游 `maxOutputTokens`，本函数只管输入窗口。
 pub fn get_context_window_size(model: &str) -> i32 {
-    use crate::model::allowlist::{Protocol, protocol_for_model};
-    match map_model(model).as_deref().and_then(protocol_for_model) {
-        Some(Protocol::Anthropic) => 1_000_000,
-        Some(Protocol::OpenAiResponses) => 272_000,
+    use crate::model::allowlist::{ModelFamily, family_for_model};
+    match map_model(model).as_deref().and_then(family_for_model) {
+        Some(ModelFamily::Claude) => 1_000_000,
+        Some(ModelFamily::Gpt) => 372_000,
         // 白名单之外的模型走不到这里（map_model 已返回 None），保留保守默认值。
         None => 200_000,
     }
@@ -240,8 +238,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// GPT 族只接受 `reasoning`，走另一条分支。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
     matches!(
-        crate::model::allowlist::protocol_for_model(model_id),
-        Some(crate::model::allowlist::Protocol::Anthropic)
+        crate::model::allowlist::family_for_model(model_id),
+        Some(crate::model::allowlist::ModelFamily::Claude)
     )
 }
 
@@ -367,7 +365,7 @@ impl EffortTier {
     }
 }
 
-/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema），按协议族分组。
+/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema），按模型族分组。
 ///
 /// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：low / medium / high / xhigh / max
 ///   （**无 none**）
@@ -375,9 +373,9 @@ impl EffortTier {
 ///   none / low / medium / high / xhigh / max
 fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
     use EffortTier::*;
-    use crate::model::allowlist::{Protocol, protocol_for_model};
-    match protocol_for_model(model_id) {
-        Some(Protocol::OpenAiResponses) => &[None, Low, Medium, High, XHigh, Max],
+    use crate::model::allowlist::{ModelFamily, family_for_model};
+    match family_for_model(model_id) {
+        Some(ModelFamily::Gpt) => &[None, Low, Medium, High, XHigh, Max],
         // Claude 族与白名单外的兜底都用不含 none 的五档：白名单外的模型走不到这里
         // （map_model 已 None），保守取更严格的枚举。
         _ => &[Low, Medium, High, XHigh, Max],
@@ -434,12 +432,12 @@ fn build_additional_model_request_fields(
 
     let effort = select_native_reasoning_effort(req, model_id)?;
 
-    // 两个协议族的推理字段路径完全不同（GPT 族只认 `reasoning`，Claude 族只认
+    // 两个模型族的推理字段路径完全不同（GPT 族只认 `reasoning`，Claude 族只认
     // `output_config` + `thinking`），按实测 schema 分流，不做任何互相兼容。
     // 族内所有模型的字段路径一致，因此按族判断而非逐个模型 id。
     if matches!(
-        crate::model::allowlist::protocol_for_model(model_id),
-        Some(crate::model::allowlist::Protocol::OpenAiResponses)
+        crate::model::allowlist::family_for_model(model_id),
+        Some(crate::model::allowlist::ModelFamily::Gpt)
     ) {
         return Ok(Some(AdditionalModelRequestFields {
             thinking: None,
@@ -1619,11 +1617,11 @@ mod tests {
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
-    /// 白名单从 2 个模型扩到 5 个后，档位枚举必须按**协议族**分组，而不是只认
+    /// 白名单从 2 个模型扩到 5 个后，档位枚举必须按**模型族**分组，而不是只认
     /// 当初那一个 id。漏改的后果是新模型拿到错误的枚举：sonnet-5 会被误允许 `none`
     /// （上游 400），terra/luna 会被误拒 `none`（客户端合法请求被拒）。
     #[test]
-    fn effort_tiers_are_grouped_by_protocol_family() {
+    fn effort_tiers_are_grouped_by_model_family() {
         use crate::model::allowlist::{
             MODEL_GPT_56_LUNA, MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_OPUS_5, MODEL_SONNET_5,
         };
@@ -1652,7 +1650,7 @@ mod tests {
     /// GPT 族 → 只有 `reasoning`（`output_config` / `thinking` 必须 absent，
     /// 否则上游 400 REQUEST_BODY_INVALID）。
     #[test]
-    fn reasoning_fields_route_by_protocol_family() {
+    fn reasoning_fields_route_by_model_family() {
         for model in ["claude-opus-5", "claude-sonnet-5"] {
             let req = minimal_adaptive_thinking_request_with_effort(model, "max");
             let fields = convert_request(&req)
@@ -1695,7 +1693,28 @@ mod tests {
         }
     }
 
-    /// 上下文窗口必须按族取值：错了会让 contextUsage 百分比 → 绝对 token 的换算
+    /// GPT 从公开 `/v1/messages` 进入时，客户端仍使用 Messages 线格式里的
+    /// `output_config.effort`；converter 必须按 GPT 模型族把它下发为上游
+    /// `reasoning.effort`，而不是照搬 `output_config`（后者会被上游 400）。
+    #[test]
+    fn gpt_messages_output_config_maps_to_upstream_reasoning() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let req = minimal_request_with_effort(model, "none");
+            let fields = convert_request(&req)
+                .unwrap_or_else(|e| panic!("{model} Messages 请求应转换成功: {e:?}"))
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
+            assert_eq!(
+                fields.reasoning.expect("GPT 族应下发 reasoning").effort,
+                "none",
+                "{model}"
+            );
+            assert!(fields.output_config.is_none(), "{model}");
+            assert!(fields.thinking.is_none(), "{model}");
+        }
+    }
+
+    /// 上下文窗口必须按模型实测值取值：错了会让 contextUsage 百分比 → 绝对 token 的换算
     /// 系统性偏差，误导客户端的上下文压缩时机。
     #[test]
     fn context_window_size_matches_measured_limits() {
@@ -1703,11 +1722,12 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-5-thinking"), 1_000_000);
-        // GPT 族 272k in（官方 1.05M，Kiro 卡在 272k）
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
-        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
-        assert_eq!(get_context_window_size("gpt-5-6-terra"), 272_000);
-        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+        // GPT 族三个模型实测均为 372k in。
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 372_000);
+        assert_eq!(get_context_window_size("gpt-5.6-sol-latest"), 372_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 372_000);
+        assert_eq!(get_context_window_size("gpt-5-6-terra"), 372_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 372_000);
         // 白名单外 → 保守默认值（这条路径实际走不到，端点层已 400）
         assert_eq!(get_context_window_size("claude-sonnet-4.6"), 200_000);
         assert_eq!(get_context_window_size("glm-5"), 200_000);

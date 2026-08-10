@@ -135,6 +135,19 @@ const STATUS_OPTIONS = [
   { value: 'interrupted', label: '中断' },
 ]
 
+const API_ENDPOINT_OPTIONS = [
+  { value: '', label: '全部接口' },
+  { value: 'messages', label: 'Messages' },
+  { value: 'responses', label: 'Responses' },
+  { value: 'unknown', label: '历史未知' },
+]
+
+function ApiEndpointBadge({ endpoint }: { endpoint: TraceRecord['apiEndpoint'] }) {
+  if (endpoint === 'messages') return <Badge variant="outline">Messages</Badge>
+  if (endpoint === 'responses') return <Badge variant="secondary">Responses</Badge>
+  return <Badge variant="outline" className="text-muted-foreground">未知</Badge>
+}
+
 const ERROR_TYPE_OPTIONS = [
   { value: '', label: '全部错误类型' },
   { value: 'quota_exhausted', label: '额度耗尽' },
@@ -248,6 +261,9 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
+          <ApiEndpointBadge endpoint={rec.apiEndpoint} />
+        </td>
+        <td className="py-2.5 pr-3 text-[13px]">
           <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
         </td>
         <td className="py-2.5 pr-3">
@@ -291,7 +307,7 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
 function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={12} className="px-3 py-3">
+      <td colSpan={13} className="px-3 py-3">
         <ExpandedDetail rec={rec} />
       </td>
     </tr>
@@ -536,6 +552,7 @@ const PAGE_SIZE = 50
 export function TraceLogPage() {
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
+  const [apiEndpoint, setApiEndpoint] = useState('')
   const [keyId, setKeyId] = useState('')
   const [group, setGroup] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
@@ -562,6 +579,9 @@ export function TraceLogPage() {
   const query: TraceQuery = {
     status: status || undefined,
     errorType: errorType || undefined,
+    apiEndpoint: apiEndpoint
+      ? (apiEndpoint as TraceQuery['apiEndpoint'])
+      : undefined,
     keyId: keyId ? Number(keyId) : undefined,
     group: group || undefined,
     onlyFailed: onlyFailed || undefined,
@@ -585,6 +605,11 @@ export function TraceLogPage() {
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
           <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
+          <Select
+            value={apiEndpoint}
+            onChange={resetTo(setApiEndpoint)}
+            options={API_ENDPOINT_OPTIONS}
+          />
           <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
           <Select
             value={errorType}
@@ -615,16 +640,17 @@ export function TraceLogPage() {
             <div className="p-6 text-sm text-muted-foreground">加载中…</div>
           ) : records.length === 0 ? (
             <div className="p-6 text-sm text-muted-foreground">
-              暂无记录。发起几次 /v1/messages 请求后即可看到链路。
+              暂无记录。发起几次 /v1/messages 或 /v1/responses 请求后即可看到链路。
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1080px] text-left">
+              <table className="w-full min-w-[1160px] text-left">
                 <thead>
                   <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>
+                    <th className="py-2 pr-3 font-medium">接口</th>
                     <th className="py-2 pr-3 font-medium">入口 Key</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>

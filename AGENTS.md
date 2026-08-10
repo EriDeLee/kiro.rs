@@ -17,23 +17,28 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 
 ## 一、项目目标（硬边界）
 
-只服务 5 个模型，协议与模型组**严格绑定**（一协议一组模型）：
+只服务 5 个白名单模型。客户端 API 入口与上游模型族必须解耦：
 
-| 端点 | 允许的模型 | 推理档位字段 |
+| 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5` | `output_config.effort` |
+| `POST /v1/messages` | 全部 5 个白名单模型 | `output_config.effort` |
 | `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
 同族内推理字段路径与请求体形状完全一致，扩充模型只是多几个 id，对本项目无新增成本；
 跨族则根本不同。字段路径、上下文窗口、effort 枚举一律按**族**分流
-（`allowlist::protocol_for_model`），禁止再逐个模型 `eq_ignore_ascii_case` —— 那种写法
+（`allowlist::family_for_model`），禁止用 API 入口判断上游字段，也禁止再逐个模型
+`eq_ignore_ascii_case` —— 那种写法
 在加模型时必然漏改，漏改的后果是静默走错字段路径。
+
+Messages 入口收到 GPT 的 `output_config.effort` 后，converter 必须按 GPT 模型族将其转换为
+上游 `reasoning.effort`；Responses 则先把 `reasoning.effort` 归一到同一内部请求再复用执行链路。
+两个入口必须以独立 `api_endpoint` 贯穿 CLI 日志与 Trace，禁止根据模型名反推入口。
 
 配套端点：`GET /v1/models`、`POST /v1/messages/count_tokens`。**路由总数 4 条**（模型数变化不影响路由数），新增端点需要明确理由。
 
 绝对禁止：
 
-- 跨协议请求（用 `/v1/messages` 请求 gpt、或用 `/v1/responses` 请求 claude）→ 一律 400
+- 用 `/v1/responses` 请求 Claude 模型 → 400（Claude 没有经过实测的 Responses 输出语义）
 - 白名单外的任何模型 → 一律 400
 - 为兼容而生的第二条路径（legacy 端点、模糊模型匹配、自定义模型表）
 
@@ -246,17 +251,17 @@ graceful shutdown 失效。
 
 | 批 | 覆盖 | 关键判据 |
 |---|---|---|
-| 1 | 白名单与协议隔离 | 白名单内 5 个模型各在对应端点 200（Claude 组 2 个走 `/v1/messages`、GPT 组 3 个走 `/v1/responses`）；白名单外模型全 400（含相邻版本 `claude-sonnet-4.6`、`claude-opus-4.8`）；协议交叉双向 400（Claude 组任一走 `/v1/responses`、GPT 组任一走 `/v1/messages`）；`-thinking`/`-latest`/日期戳别名 200 |
+| 1 | 白名单与入口策略 | 白名单内 5 个模型走 `/v1/messages` 全部 200；GPT 组 3 个走 `/v1/responses` 全部 200；Claude 组走 `/v1/responses` 全部 400；白名单外模型在两端点全 400（含相邻版本 `claude-sonnet-4.6`、`claude-opus-4.8`）；`-thinking`/`-latest`/日期戳别名 200 |
 | 2 | 已移除端点 absent | `/cc/v1/*`、`/v1/chat/completions` 全 404 |
 | 3 | 推理档位全矩阵 | Claude 组五档全 200、`none`/非法值 400；GPT 组六档全 200、非法 400 |
 | 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>`（Claude 组两个模型都要验） |
 | 5 | signature 端到端 | 真签名回传后模型能基于历史推理续算；占位签名被剔除不打死会话 |
 | 6 | 工具 schema 透传 | 工具名与 input_schema 原样下发；仅超长名缩短 + 入站还原 |
 | 7 | 静默降级已移除 | prefill 转换 200 + warn；坏 JSON / 空 messages 400 |
-| 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0 |
+| 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0；CLI 与 Trace 对 GPT 请求均能区分 `messages` / `responses` 入口 |
 | 9 | graceful shutdown | SIGTERM → 落盘计数与日志吻合 |
 | 10 | 全局代理现取 | 见 §3.8 反向判据 |
-| 11 | 多模型白名单 | 5 个模型 × 正确端点 200 / 错误端点 400；同族 effort 枚举一致；白名单外 11 个模型两端点全 400 |
+| 11 | 多模型白名单 | 5 个模型 × Messages 200；GPT 族 × Responses 200；Claude 族 × Responses 400；同族 effort 枚举一致；白名单外 11 个模型两端点全 400 |
 
 配置项类改动（如 `extractThinking`、`traceEnabled`）需要**单独起实例**，它们只在启动时读取。
 测试客户端行为时不必安装该客户端 —— 从其源码读出真实的工具 id / 参数形状后手工
@@ -302,7 +307,7 @@ graceful shutdown 失效。
 
 **推理档位 schema**（2026-07-26 实测 `ListAvailableModels`，2026-07-29 复测补齐 sonnet-5 / terra / luna）：
 
-推理字段路径与 effort 枚举**按协议族一致**，同族内各模型无差异；只有窗口大小逐模型不同。
+推理字段路径与 effort 枚举**按模型族一致**，同族内各模型无差异；只有窗口大小逐模型不同。
 这一条不是从 schema 推断的，而是 2026-07-29 端到端实测确认：GPT 族三个模型 `effort=none`
 全部 200、Claude 族两个模型 `effort=none` 全部 400、五个模型 `effort=bogus` 全部 400。
 
@@ -310,7 +315,8 @@ graceful shutdown 失效。
 - **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，`additionalProperties: false`。`reasoning.effort ∈ {none,low,medium,high,xhigh,max}`（default `high`）；`reasoning.mode ∈ {standard, pro}`。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`
 - `effort=xhigh|max` 与 `thinking.type=disabled` 冲突时**整体不下发 thinking 字段**，绝不反向改写 effort
 
-**窗口大小**（`tokenLimits`，2026-07-29 实测）：
+**窗口大小**（`tokenLimits`，2026-07-29 首测，GPT 族三个模型的 `maxInputTokens` 于
+2026-08-10 复测修正为 372,000 —— 表在本节末）：
 
 **上游并不要求的东西**（2026-07-29 直连 `/generateAssistantResponse` 变异测试，
 以代理的真实成功请求为模板，每次只改一处）：
@@ -357,11 +363,11 @@ graceful shutdown 失效。
 |---|---|---|
 | `claude-opus-5` | 1,000,000 | 128,000 |
 | `claude-sonnet-5` | 1,000,000 | **64,000** |
-| `gpt-5.6-sol` | 272,000 | 128,000 |
-| `gpt-5.6-terra` | 272,000 | 128,000 |
-| `gpt-5.6-luna` | 272,000 | 128,000 |
+| `gpt-5.6-sol` | **372,000** | 128,000 |
+| `gpt-5.6-terra` | **372,000** | 128,000 |
+| `gpt-5.6-luna` | **372,000** | 128,000 |
 
-`get_context_window_size` 只取 `maxInputTokens`（Claude 族 1M / GPT 族 272k），它参与 contextUsage 百分比 → 绝对 token 换算，取错会让上报的 input_tokens 系统性偏差。`maxOutputTokens` 由 `/v1/models` 从上游原样透出 —— 注意 `claude-sonnet-5` 是 64k，与同族 opus-5 的 128k 不同，不可按族推断。
+`get_context_window_size` 只取 `maxInputTokens`（Claude 族 1M；GPT 族三个模型均为 372k），它参与 contextUsage 百分比 → 绝对 token 换算，取错会让上报的 input_tokens 系统性偏差。`maxOutputTokens` 由 `/v1/models` 从上游原样透出 —— 注意 `claude-sonnet-5` 是 64k，与同族 opus-5 的 128k 不同，不可按族推断输出上限。GPT 族的 372k 是 **2026-08-10 复测**值；2026-07-29 首测记的 272k 已作废（见 §5），此后再看到 272k 的说法一律不采信。
 
 **prompt cache 不可用**（端到端实证）：
 
@@ -386,6 +392,8 @@ graceful shutdown 失效。
 
 上游确实验签：签名失效返回 `THINKING_SIGNATURE_INVALID`。本仓库据此**直接报错、不剥离重试** —— 剥离会让请求看似成功而实际丢掉整段推理。
 
+**跨族接续可行**（2026-08-10 实测）：`claude-opus-5` 的会话历史（含 thinking 块与 opus-5 的真签名）原样带上、把 `model` 换成 `gpt-5.6-*` 从 `/v1/messages` 请求，**成功接续**。即 `converter` 不按模型族过滤历史 `reasoningContent` 是安全的，GPT 族不会因为签名来自 Claude 而拒绝。此前担心的「切模型打死会话」不成立。
+
 **`claude-opus-5` 100% 走原生 `reasoningContentEvent`**：4 组场景（长推理 max / 带工具调用 / 非流式 / 无 display）共 406 个事件，`<thinking>` XML 标签模式 **0 次触发**。故 XML 提取路径已从非流式删除。
 
 **Builder ID 账号**：不支持 `ListAvailableProfiles`（固定 403 `AWS Builder ID is not supported for this operation.`），必须用占位 profileArn 并跳过探测；MCP（WebSearch）路径要用 `streaming_profile_arn()` 而非 `effective_profile_arn()`，否则 400 `profileArn is required`。
@@ -398,7 +406,7 @@ graceful shutdown 失效。
 
 易混淆点：客户端代码里写的 `{thinking, effort}` 是 **SDK 的 `providerOptions`（camelCase 中间层）**，不是 HTTP body —— SDK 会把它降级到 `output_config.effort`。读客户端源码时必须区分这两层。
 
-`MessagesRequest::effort` 字段带 `#[serde(skip_serializing)]`，是 `/v1/responses` 的**内部通路**（那条路径 `thinking`/`output_config` 恒为 None），不可从 HTTP 注入。
+`MessagesRequest::effort` 字段带 `#[serde(skip)]`，是 `/v1/responses` 的**内部通路**（那条路径 `thinking`/`output_config` 恒为 None），不可从 HTTP 反序列化注入。
 
 **历史 thinking 块会回传，字段名精确是 `signature`**，位于 `content[].type=="thinking"`。`redacted_thinking` 用 **`data`** 字段（不是 signature）。
 
@@ -433,6 +441,7 @@ graceful shutdown 失效。
 | "客户端发顶层 `effort`" | 11 个 SDK 版本抓包证明只有 `output_config.effort`；混淆了 providerOptions 与 wire format |
 | `metadataEvent` 完全静默无害 | 一直在下发，只是从未被看见；加 warn 后立刻暴露 |
 | 上游 `reasoningContent` "仅响应侧支持，请求 history 传入会 400" | Smithy 模型中该 shape 只有序列化器无反序列化器（input-only），实测回传成功 |
+| GPT 族 `maxInputTokens` 是 272,000（2026-07-29 首测所记） | 2026-08-10 复测为 **372,000**；旧值已作废。教训：`tokenLimits` 是上游随时可调的运行时数据，不是固化协议常量，跟窗口有关的换算出现偏差时先复测 `ListAvailableModels` |
 
 ---
 

@@ -1260,6 +1260,7 @@ mod tests {
     use crate::anthropic::handlers::RequestTraceOptions;
     use crate::anthropic::middleware::{AppState, KeyContext};
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+    use crate::model::allowlist::ApiEndpoint;
 
     /// 回归锁：web_search loop 的失败路径必须落一条 trace 行，且带上模型名与
     /// 已知用量。
@@ -1281,6 +1282,7 @@ mod tests {
                     group: None,
                     key_source: TraceKeySource::ClientKey,
                 },
+                api_endpoint: ApiEndpoint::Responses,
                 model: "gpt-5.6-sol".to_string(),
                 is_stream: false,
             },
@@ -1293,6 +1295,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(total, 1, "失败路径必须恰好落一条 trace 行");
+        assert_eq!(rows[0].api_endpoint, "responses");
         assert_eq!(rows[0].final_status, "error");
         assert_eq!(rows[0].error_type.as_deref(), Some(trace_outcome::UNKNOWN));
         assert_eq!(rows[0].error_message.as_deref(), Some("mcp call failed"));

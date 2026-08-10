@@ -1228,7 +1228,7 @@ pub async fn stats_by_credential(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / apiEndpoint / onlyFailed / limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1264,6 +1264,10 @@ pub async fn list_traces(
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
+        // 与上面的 model 一样原样透传（SQL 侧是参数化的 `api_endpoint = ?`）。
+        // 不做取值白名单：白名单会让 `?apiEndpoint=Messages` 这类大小写写错的请求
+        // 静默返回**全量**记录，看起来像筛选没生效；透传则返回零行，一眼看出写错了。
+        api_endpoint: params.get("apiEndpoint").filter(|s| !s.is_empty()).cloned(),
         only_failed: params
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
@@ -1332,6 +1336,7 @@ pub async fn list_traces(
                 "keyId": r.key_id,
                 "keySource": r.key_source,
                 "keyName": key_name,
+                "apiEndpoint": r.api_endpoint,
                 "model": r.model,
                 "isStream": r.is_stream,
                 "finalStatus": r.final_status,

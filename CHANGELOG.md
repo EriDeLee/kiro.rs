@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `/v1/messages` 现在接受全部 5 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
+- CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
+- 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
+
+### Fixed
+
+- 回复末尾不再出现一条内容为空的「思考」。上游会在正文之后补一个只含换行的 reasoning 分片，此前它会被当作真内容新开一个 thinking 块（客户端渲染为 `Thought: 5ms` 且正文区为空）。流式与非流式两条路径都已挡住 —— 后者也是 `/v1/responses` 的来源。thinking 块已开着时的空白照常追加，那是思考文本内部的段落间隔。
+
 ## [0.7.5] - 2026-08-05
 
 主题：**为多账号调度加入单账号 RPM 主动限流，并集中增强管理端的凭据筛选、批量操作、创建时间、请求计费与移动端可用性**。本版同时加固 WebSearch MCP 的查询参数兼容和 Enterprise / IdC 路由；新增配置默认关闭或带有 `serde(default)`，旧 `config.json` 与 `credentials.json` 无需迁移。

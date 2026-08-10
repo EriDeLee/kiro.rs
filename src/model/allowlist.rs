@@ -1,98 +1,93 @@
-//! 模型白名单与端点隔离
+//! 模型白名单、模型族与 API 入口策略
 //!
-//! 本部署只服务下列模型，且**协议与模型组严格绑定**，不做任何跨协议兼容：
+//! 本部署只服务 5 个模型。客户端入口与上游模型族是两个独立维度：
 //!
-//! | 端点                        | 允许的模型                                     | 推理字段路径           |
-//! |-----------------------------|------------------------------------------------|------------------------|
-//! | `/v1/messages`（Anthropic） | `claude-opus-5`、`claude-sonnet-5`             | `output_config.effort` |
-//! | `/v1/responses`（OpenAI）   | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort`     |
+//! | 入口 | 允许的模型 |
+//! |---|---|
+//! | `/v1/messages` | 全部 5 个白名单模型 |
+//! | `/v1/responses` | GPT 族 3 个模型 |
 //!
-//! 依据实测 `ListAvailableModels` 的 `additionalModelRequestFieldsSchema`
-//! （2026-07-26 实测 `claude-opus-5` / `gpt-5.6-sol`，2026-07-29 复测补齐另外三个）：
-//!
-//! - **Claude 族**（`claude-opus-5`、`claude-sonnet-5`）：`thinking.type ∈ {adaptive,
-//!   disabled}`、`thinking.display ∈ {summarized, omitted}`、`output_config.effort ∈
-//!   {low,medium,high,xhigh,max}`（default `high`，**无 `none`**）。窗口 1M in；
-//!   输出上限 `claude-opus-5` 128k、`claude-sonnet-5` 64k。
-//! - **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，
-//!   `additionalProperties:false` —— `reasoning.effort ∈ {none,low,medium,high,xhigh,max}`
-//!   （default `high`）、`reasoning.mode ∈ {standard, pro}`。下发 `output_config` /
-//!   `max_tokens` / `thinking` 都会被上游以 `400 REQUEST_BODY_INVALID` 拒绝。
-//!   窗口 272k in / 128k out。
-//!
-//! 同一族内推理字段路径与请求体形状完全一致，扩充模型只是多几个 id；跨族则根本不同。
-//! 因此不允许用 OpenAI 协议请求 Claude 模型，也不允许用 Anthropic 协议请求 GPT 模型：
-//! 跨协议“兼容”只会产出上游拒绝的请求，或更糟——静默丢弃客户端的推理强度设置。
-//!
-//! 白名单是穷举的，不做家族/版本号的模糊推断：上游账号里还有 `claude-opus-4.8`、
-//! `claude-sonnet-4.6`、`claude-haiku-4.5`、`glm-5`、`auto` 等模型，本部署一律 400。
-//! 模糊匹配会把 `claude-sonnet-4.6` 误判成 `claude-sonnet-5`，或把未受支持的 id
-//! 透传给上游换回一个语义不明的 400。
+//! 上游推理字段仍严格按模型族分流：Claude 族使用
+//! `output_config.effort` + `thinking.{type,display}`，GPT 族只使用
+//! `reasoning.effort`。入口不得参与上游 schema 判断。
 
-/// Anthropic `/v1/messages` 端点允许的模型（上游 Kiro modelId）。
+/// Claude 族上游 Kiro modelId。
 pub const MODEL_OPUS_5: &str = "claude-opus-5";
-/// Anthropic `/v1/messages` 端点允许的模型（上游 Kiro modelId）。
+/// Claude 族上游 Kiro modelId。
 pub const MODEL_SONNET_5: &str = "claude-sonnet-5";
-/// OpenAI `/v1/responses` 端点允许的模型（上游 Kiro modelId）。
+/// GPT 族上游 Kiro modelId。
 pub const MODEL_GPT_56_SOL: &str = "gpt-5.6-sol";
-/// OpenAI `/v1/responses` 端点允许的模型（上游 Kiro modelId）。
+/// GPT 族上游 Kiro modelId。
 pub const MODEL_GPT_56_TERRA: &str = "gpt-5.6-terra";
-/// OpenAI `/v1/responses` 端点允许的模型（上游 Kiro modelId）。
+/// GPT 族上游 Kiro modelId。
 pub const MODEL_GPT_56_LUNA: &str = "gpt-5.6-luna";
 
-/// Anthropic 协议的模型组：推理字段走 `output_config.effort` + `thinking.{type,display}`。
-const ANTHROPIC_MODELS: &[&str] = &[MODEL_OPUS_5, MODEL_SONNET_5];
-/// OpenAI Responses 协议的模型组：推理字段只走 `reasoning.effort`。
-const OPENAI_RESPONSES_MODELS: &[&str] = &[MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA];
+const CLAUDE_MODELS: &[&str] = &[MODEL_OPUS_5, MODEL_SONNET_5];
+const GPT_MODELS: &[&str] = &[MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA];
+const ALL_MODELS: &[&str] = &[
+    MODEL_OPUS_5,
+    MODEL_SONNET_5,
+    MODEL_GPT_56_SOL,
+    MODEL_GPT_56_TERRA,
+    MODEL_GPT_56_LUNA,
+];
 
-/// 请求所用的客户端协议。
+/// 上游 Kiro 模型族。推理字段路径、上下文窗口和 effort 枚举都按此分流。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    /// `/v1/messages`、`/v1/messages/count_tokens`
-    Anthropic,
-    /// `/v1/responses`
-    OpenAiResponses,
+pub enum ModelFamily {
+    Claude,
+    Gpt,
 }
 
-impl Protocol {
-    /// 该协议允许的上游模型组。
+/// 客户端实际请求的 API 入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiEndpoint {
+    Messages,
+    Responses,
+}
+
+impl ApiEndpoint {
+    /// 用于日志、Trace 数据库和 Admin API 的稳定值。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Responses => "responses",
+        }
+    }
+
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Messages => "/v1/messages",
+            Self::Responses => "/v1/responses",
+        }
+    }
+
     pub const fn allowed_models(self) -> &'static [&'static str] {
         match self {
-            Self::Anthropic => ANTHROPIC_MODELS,
-            Self::OpenAiResponses => OPENAI_RESPONSES_MODELS,
+            Self::Messages => ALL_MODELS,
+            Self::Responses => GPT_MODELS,
         }
     }
 }
 
-/// 已归一化的上游 modelId 属于哪个协议族；不在白名单内返回 `None`。
-///
-/// 入参应是 [`normalize`] 的输出（或白名单常量本身）——它不剥离别名后缀。
-///
-/// 推理字段路径、上下文窗口、effort 档位枚举都按**族**分流，调用方一律查这里，
-/// 不要再逐个模型 `eq_ignore_ascii_case`：那种写法在加模型时必然漏改，而漏改的
-/// 后果是静默走错字段路径（上游 400，或推理档位被整条丢弃）。
-pub fn protocol_for_model(model_id: &str) -> Option<Protocol> {
-    if ANTHROPIC_MODELS
+/// 已归一化的白名单 modelId 属于哪个上游模型族。
+pub fn family_for_model(model_id: &str) -> Option<ModelFamily> {
+    if CLAUDE_MODELS
         .iter()
         .any(|m| m.eq_ignore_ascii_case(model_id))
     {
-        return Some(Protocol::Anthropic);
+        return Some(ModelFamily::Claude);
     }
-    if OPENAI_RESPONSES_MODELS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(model_id))
-    {
-        return Some(Protocol::OpenAiResponses);
+    if GPT_MODELS.iter().any(|m| m.eq_ignore_ascii_case(model_id)) {
+        return Some(ModelFamily::Gpt);
     }
     None
 }
 
 /// 归一化客户端传入的模型名到上游 modelId。
 ///
-/// 只接受白名单模型本身及其常见别名后缀（`-thinking`、`-latest`、8 位日期戳），
-/// 其余一律返回 `None`。不做家族/版本号的模糊推断——模糊匹配会把
-/// `claude-opus-4-5`、`claude-sonnet-4.6` 之类误判成 5 代，或把未受支持的模型
-/// 透传给上游。
+/// 只接受白名单模型本身及常见别名后缀（`-thinking`、`-latest`、8 位日期戳）。
+/// 不做家族或版本号的模糊推断。
 pub fn normalize(model: &str) -> Option<&'static str> {
     let m = strip_aliases(model);
     match m.as_str() {
@@ -105,21 +100,15 @@ pub fn normalize(model: &str) -> Option<&'static str> {
     }
 }
 
-/// 在指定协议下解析模型，同时校验模型与协议是否匹配。
-pub fn resolve(model: &str, protocol: Protocol) -> Result<&'static str, RejectedModel> {
+/// 在指定 API 入口下解析模型，同时执行入口策略校验。
+pub fn resolve(model: &str, endpoint: ApiEndpoint) -> Result<&'static str, RejectedModel> {
     match normalize(model) {
-        // 归一化后的模型必须落在该协议的允许组内。
-        Some(resolved) if protocol.allowed_models().contains(&resolved) => Ok(resolved),
-        // 模型本身受支持，但走错了协议端点。
-        Some(resolved) => Err(RejectedModel::WrongProtocol {
-            model: resolved,
-            protocol,
-        }),
+        Some(resolved) if endpoint.allowed_models().contains(&resolved) => Ok(resolved),
+        Some(resolved) => Err(RejectedModel::WrongEndpoint { model: resolved }),
         None => Err(RejectedModel::Unsupported),
     }
 }
 
-/// 剥离客户端常加的别名后缀，得到裸模型名（小写）。
 fn strip_aliases(model: &str) -> String {
     let mut m = model.trim().to_ascii_lowercase();
     loop {
@@ -129,7 +118,6 @@ fn strip_aliases(model: &str) -> String {
                 m = stripped.to_string();
             }
         }
-        // 尾部 8 位日期戳，如 `-20260101`
         if let Some((base, tail)) = m.rsplit_once('-')
             && tail.len() == 8
             && tail.chars().all(|c| c.is_ascii_digit())
@@ -143,38 +131,36 @@ fn strip_aliases(model: &str) -> String {
     m
 }
 
-/// 模型被拒的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectedModel {
-    /// 不在白名单内。
     Unsupported,
-    /// 模型受支持，但不该从这个协议端点请求。
-    WrongProtocol {
+    /// 模型在白名单里，但这个入口不收它。
+    ///
+    /// 不带 endpoint 字段：只有 `/v1/responses` 会产生它。`/v1/messages` 的允许集
+    /// 就是 `ALL_MODELS`（见 [`ApiEndpoint::allowed_models`]），任何能被
+    /// [`normalize`] 认出的模型都在里面，那一侧永远走不到这个分支。
+    /// `messages_accepts_every_allowlisted_model` 锁住这个前提 —— 若哪天
+    /// Messages 也开始拒模型，下面那句「use `/v1/messages`」就会变成谎话。
+    WrongEndpoint {
         model: &'static str,
-        protocol: Protocol,
     },
 }
 
 impl RejectedModel {
-    /// 面向客户端的错误消息。
     pub fn message(&self, requested: &str) -> String {
         match self {
             Self::Unsupported => format!(
-                "model `{requested}` is not supported. This deployment serves only \
-                 [{}] on /v1/messages and [{}] on /v1/responses.",
-                ANTHROPIC_MODELS.join(", "),
-                OPENAI_RESPONSES_MODELS.join(", ")
+                "model `{requested}` is not supported. This deployment serves only [{}].",
+                ALL_MODELS.join(", ")
             ),
-            Self::WrongProtocol { model, protocol } => {
-                let (right, wrong) = match protocol {
-                    Protocol::Anthropic => ("/v1/responses", "/v1/messages"),
-                    Protocol::OpenAiResponses => ("/v1/messages", "/v1/responses"),
-                };
-                format!(
-                    "model `{model}` must be requested through `{right}`, not `{wrong}`. \
-                     Cross-protocol requests are intentionally unsupported."
-                )
-            }
+            Self::WrongEndpoint { model } => format!(
+                "model `{model}` is not supported on `{}`; use `{}`. \
+                 `{}` accepts only [{}].",
+                ApiEndpoint::Responses.path(),
+                ApiEndpoint::Messages.path(),
+                ApiEndpoint::Responses.path(),
+                GPT_MODELS.join(", ")
+            ),
         }
     }
 }
@@ -184,55 +170,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_accepts_the_allowlisted_models_and_their_aliases() {
-        for m in [
-            "claude-opus-5",
-            "Claude-Opus-5",
-            "claude-opus-5-thinking",
-            "claude-opus-5-latest",
-            "claude-opus-5-20260101",
-            "claude-opus-5-20260101-thinking",
+    fn normalize_accepts_allowlisted_models_and_aliases() {
+        for (requested, expected) in [
+            ("claude-opus-5", MODEL_OPUS_5),
+            ("Claude-Opus-5-thinking", MODEL_OPUS_5),
+            ("claude-opus-5-20260101-latest", MODEL_OPUS_5),
+            ("claude-sonnet-5", MODEL_SONNET_5),
+            ("claude-sonnet-5-20260101-thinking", MODEL_SONNET_5),
+            ("gpt-5.6-sol", MODEL_GPT_56_SOL),
+            ("gpt-5-6-sol-latest", MODEL_GPT_56_SOL),
+            ("GPT-5.6-Terra", MODEL_GPT_56_TERRA),
+            ("gpt-5-6-terra", MODEL_GPT_56_TERRA),
+            ("gpt-5.6-luna-thinking", MODEL_GPT_56_LUNA),
         ] {
-            assert_eq!(normalize(m), Some(MODEL_OPUS_5), "{m}");
-        }
-        for m in [
-            "claude-sonnet-5",
-            "Claude-Sonnet-5",
-            "claude-sonnet-5-thinking",
-            "claude-sonnet-5-latest",
-            "claude-sonnet-5-20260101",
-            "claude-sonnet-5-20260101-thinking",
-        ] {
-            assert_eq!(normalize(m), Some(MODEL_SONNET_5), "{m}");
-        }
-        for m in ["gpt-5.6-sol", "gpt-5-6-sol", "GPT-5.6-Sol", "gpt-5.6-sol-latest"] {
-            assert_eq!(normalize(m), Some(MODEL_GPT_56_SOL), "{m}");
-        }
-        for m in [
-            "gpt-5.6-terra",
-            "gpt-5-6-terra",
-            "GPT-5.6-Terra",
-            "gpt-5.6-terra-latest",
-        ] {
-            assert_eq!(normalize(m), Some(MODEL_GPT_56_TERRA), "{m}");
-        }
-        for m in [
-            "gpt-5.6-luna",
-            "gpt-5-6-luna",
-            "GPT-5.6-Luna",
-            "gpt-5.6-luna-thinking",
-        ] {
-            assert_eq!(normalize(m), Some(MODEL_GPT_56_LUNA), "{m}");
+            assert_eq!(normalize(requested), Some(expected), "{requested}");
         }
     }
 
     /// 回归锁：白名单是穷举的，绝不做家族/版本号模糊推断。
     ///
-    /// 上游账号里确实有这些模型，但本部署不服务它们。相邻版本号（`claude-sonnet-4.6`
-    /// vs `claude-sonnet-5`）是模糊匹配最容易出错的地方。
+    /// 这些 id 上游账号里确实有，但本部署不服务它们。最危险的是「差一点点」的名字：
+    /// 相邻版本号（`claude-sonnet-4.6` vs `claude-sonnet-5`）、多一个字母
+    /// （`gpt-5.6-terran` vs `gpt-5.6-terra`、`gpt-5.6-lunar` vs `gpt-5.6-luna`）。
+    /// 一旦有人把匹配改松（例如「名字里带 claude-sonnet 就算 claude-sonnet-5」），
+    /// 客户端会以为自己在用 5 代，实际不是 —— 这条测试就是拦它的。
     #[test]
     fn normalize_rejects_everything_else() {
-        for m in [
+        for model in [
             // 相邻版本：模糊匹配最容易在这里出错
             "claude-opus-4-5",
             "claude-opus-4.5",
@@ -260,151 +224,107 @@ mod tests {
             "auto",
             "",
         ] {
-            assert_eq!(normalize(m), None, "{m} 必须被拒绝");
+            assert_eq!(normalize(model), None, "{model} 必须被拒绝");
         }
     }
 
     #[test]
-    fn protocol_for_model_groups_by_family() {
-        for m in [MODEL_OPUS_5, MODEL_SONNET_5] {
-            assert_eq!(protocol_for_model(m), Some(Protocol::Anthropic), "{m}");
+    fn family_for_model_uses_upstream_schema_family() {
+        for model in CLAUDE_MODELS {
+            assert_eq!(family_for_model(model), Some(ModelFamily::Claude));
         }
-        for m in [MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA] {
-            assert_eq!(protocol_for_model(m), Some(Protocol::OpenAiResponses), "{m}");
+        for model in GPT_MODELS {
+            assert_eq!(family_for_model(model), Some(ModelFamily::Gpt));
         }
-        // 白名单外的 id 没有协议族 —— 调用方必须把它当不受支持处理，
-        // 不能落进任一族的字段路径。
-        for m in ["claude-sonnet-4.6", "gpt-5.6", "glm-5", ""] {
-            assert_eq!(protocol_for_model(m), None, "{m}");
-        }
+        assert_eq!(family_for_model("gpt-5.6"), None);
     }
 
-    #[test]
-    fn allowed_models_are_disjoint_per_protocol() {
-        for m in Protocol::Anthropic.allowed_models() {
-            assert!(
-                !Protocol::OpenAiResponses.allowed_models().contains(m),
-                "{m} 不能同时属于两个协议组"
-            );
-        }
-        assert_eq!(Protocol::Anthropic.allowed_models().len(), 2);
-        assert_eq!(Protocol::OpenAiResponses.allowed_models().len(), 3);
-    }
-
-    #[test]
-    fn resolve_enforces_protocol_binding() {
-        // Anthropic 组全体在 /v1/messages 上通过
-        for (requested, expected) in [
-            ("claude-opus-5", MODEL_OPUS_5),
-            ("claude-sonnet-5", MODEL_SONNET_5),
-            ("claude-sonnet-5-thinking", MODEL_SONNET_5),
-        ] {
-            assert_eq!(resolve(requested, Protocol::Anthropic), Ok(expected));
-        }
-        // GPT 组全体在 /v1/responses 上通过
-        for (requested, expected) in [
-            ("gpt-5.6-sol", MODEL_GPT_56_SOL),
-            ("gpt-5.6-terra", MODEL_GPT_56_TERRA),
-            ("gpt-5-6-terra", MODEL_GPT_56_TERRA),
-            ("gpt-5.6-luna", MODEL_GPT_56_LUNA),
-        ] {
-            assert_eq!(resolve(requested, Protocol::OpenAiResponses), Ok(expected));
-        }
-        // 交叉请求必须被拒
-        assert_eq!(
-            resolve("gpt-5.6-sol", Protocol::Anthropic),
-            Err(RejectedModel::WrongProtocol {
-                model: MODEL_GPT_56_SOL,
-                protocol: Protocol::Anthropic
-            })
-        );
-        assert_eq!(
-            resolve("claude-sonnet-5", Protocol::OpenAiResponses),
-            Err(RejectedModel::WrongProtocol {
-                model: MODEL_SONNET_5,
-                protocol: Protocol::OpenAiResponses
-            })
-        );
-        assert_eq!(
-            resolve("claude-opus-5", Protocol::OpenAiResponses),
-            Err(RejectedModel::WrongProtocol {
-                model: MODEL_OPUS_5,
-                protocol: Protocol::OpenAiResponses
-            })
-        );
-        assert_eq!(
-            resolve("claude-opus-4.8", Protocol::Anthropic),
-            Err(RejectedModel::Unsupported)
-        );
-        // 白名单外的模型即使走对了「看起来该去的」端点也必须是 Unsupported，
-        // 不能因为名字像 Claude/GPT 就被归进某一族。
-        assert_eq!(
-            resolve("claude-sonnet-4.6", Protocol::Anthropic),
-            Err(RejectedModel::Unsupported)
-        );
-        assert_eq!(
-            resolve("gpt-5.6", Protocol::OpenAiResponses),
-            Err(RejectedModel::Unsupported)
-        );
-    }
-
-    /// 回归锁：交叉协议**必须**是错误，不能因为「模型在白名单里」就放行。
+    /// 回归锁：模型名单只有 `CLAUDE_MODELS` + `GPT_MODELS` 两份真源，
+    /// `ALL_MODELS` 与 [`normalize`] 必须与它们逐个对上。
     ///
-    /// 曾经的实现为了让 `/v1/responses` 内部复用 `post_messages` 而整类放行
-    /// `WrongProtocol`，导致外部直接用 `/v1/messages` 请求 gpt-5.6-sol 也能 200。
-    /// 内部转发现在靠 `InternalForward` Extension 区分，此处必须保持严格。
+    /// 加一个模型要同时改三处：所属族的常量、`ALL_MODELS`、`normalize` 的 match。
+    /// 漏改任何一处，其余测试都不会变红 —— `messages_accepts_every_allowlisted_model`
+    /// 遍历的就是 `ALL_MODELS` 本身，拿漏改后的名单去验漏改后的行为，永远绿。
     ///
-    /// 白名单从 2 个模型扩到 5 个后，隔离语义不变：每侧是**一组**模型，跨组仍 400。
+    /// 漏改 `ALL_MODELS` 的实际后果：该模型从 `/v1/responses` 请求正常，从
+    /// `/v1/messages` 请求返回 400，且错误消息自相矛盾（叫调用方去用刚拒了它的入口）。
     #[test]
-    fn cross_protocol_is_always_an_error() {
-        for m in [
-            "gpt-5.6-sol",
-            "gpt-5.6-sol-thinking",
-            "gpt-5.6-terra",
-            "gpt-5-6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.6-luna-latest",
-        ] {
-            assert!(
-                resolve(m, Protocol::Anthropic).is_err(),
-                "{m} 不能从 /v1/messages 请求"
+    fn model_lists_stay_in_sync() {
+        assert_eq!(
+            ALL_MODELS.len(),
+            CLAUDE_MODELS.len() + GPT_MODELS.len(),
+            "ALL_MODELS 必须恰好是两个族的并集"
+        );
+        for model in CLAUDE_MODELS.iter().chain(GPT_MODELS) {
+            assert!(ALL_MODELS.contains(model), "{model} 漏进 ALL_MODELS");
+        }
+        for model in ALL_MODELS {
+            assert!(family_for_model(model).is_some(), "{model} 查不到模型族");
+            assert_eq!(normalize(model), Some(*model), "{model} 未登记进 normalize");
+        }
+    }
+
+    #[test]
+    fn messages_accepts_every_allowlisted_model() {
+        for model in ALL_MODELS {
+            assert_eq!(resolve(model, ApiEndpoint::Messages), Ok(*model), "{model}");
+        }
+        assert_eq!(
+            resolve("gpt-5-6-terra-latest", ApiEndpoint::Messages),
+            Ok(MODEL_GPT_56_TERRA)
+        );
+        // `RejectedModel::WrongEndpoint` 不带 endpoint 字段、消息直接写
+        // 「use /v1/messages」，前提就是 Messages 收全部白名单模型。
+        assert_eq!(ApiEndpoint::Messages.allowed_models(), ALL_MODELS);
+    }
+
+    #[test]
+    fn responses_remains_gpt_only() {
+        for model in GPT_MODELS {
+            assert_eq!(
+                resolve(model, ApiEndpoint::Responses),
+                Ok(*model),
+                "{model}"
             );
         }
-        for m in [
-            "claude-opus-5",
-            "claude-opus-5-20260101",
-            "claude-sonnet-5",
-            "claude-sonnet-5-thinking",
-            "claude-sonnet-5-20260101",
-        ] {
-            assert!(
-                resolve(m, Protocol::OpenAiResponses).is_err(),
-                "{m} 不能从 /v1/responses 请求"
+        for model in CLAUDE_MODELS {
+            assert_eq!(
+                resolve(model, ApiEndpoint::Responses),
+                Err(RejectedModel::WrongEndpoint { model })
             );
         }
     }
 
     #[test]
-    fn wrong_protocol_message_names_the_right_endpoint() {
-        let msg = resolve("gpt-5.6-sol", Protocol::Anthropic)
-            .unwrap_err()
-            .message("gpt-5.6-sol");
-        assert!(msg.contains("/v1/responses"), "{msg}");
-
-        let msg = resolve("claude-sonnet-5", Protocol::OpenAiResponses)
-            .unwrap_err()
-            .message("claude-sonnet-5");
-        assert!(msg.contains("/v1/messages"), "{msg}");
+    fn unsupported_models_fail_on_both_endpoints() {
+        for endpoint in [ApiEndpoint::Messages, ApiEndpoint::Responses] {
+            assert_eq!(
+                resolve("claude-sonnet-4.6", endpoint),
+                Err(RejectedModel::Unsupported)
+            );
+            assert_eq!(
+                resolve("gpt-5.6", endpoint),
+                Err(RejectedModel::Unsupported)
+            );
+        }
     }
 
-    /// 不受支持的模型的错误消息必须列全两侧的模型组，否则客户端只能靠猜。
     #[test]
-    fn unsupported_message_lists_every_allowed_model() {
-        let msg = resolve("glm-5", Protocol::Anthropic)
+    fn errors_describe_the_current_endpoint_policy() {
+        let wrong = resolve("claude-opus-5", ApiEndpoint::Responses)
+            .unwrap_err()
+            .message("claude-opus-5");
+        assert!(wrong.contains("/v1/responses"), "{wrong}");
+        assert!(wrong.contains("/v1/messages"), "{wrong}");
+
+        let unsupported = resolve("glm-5", ApiEndpoint::Messages)
             .unwrap_err()
             .message("glm-5");
-        for m in ANTHROPIC_MODELS.iter().chain(OPENAI_RESPONSES_MODELS) {
-            assert!(msg.contains(m), "错误消息缺少 {m}: {msg}");
+        for model in ALL_MODELS {
+            assert!(
+                unsupported.contains(model),
+                "missing {model}: {unsupported}"
+            );
         }
     }
 }

@@ -14,6 +14,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::ModelDiscoveryError;
+use crate::model::allowlist::ApiEndpoint;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -119,6 +120,7 @@ pub(crate) struct RequestTracer {
     ts: String,
     key_id: u64,
     key_source: TraceKeySource,
+    api_endpoint: String,
     model: String,
     is_stream: bool,
     started_at: Instant,
@@ -144,6 +146,7 @@ impl TraceUsage {
 
 pub(super) struct RequestTraceOptions {
     pub key_ctx: KeyContext,
+    pub api_endpoint: ApiEndpoint,
     pub model: String,
     pub is_stream: bool,
 }
@@ -156,6 +159,7 @@ impl RequestTracer {
             ts: Utc::now().to_rfc3339(),
             key_id: options.key_ctx.key_id,
             key_source: options.key_ctx.key_source,
+            api_endpoint: options.api_endpoint.as_str().to_string(),
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
@@ -203,6 +207,7 @@ impl RequestTracer {
             ts: self.ts.clone(),
             key_id: self.key_id,
             key_source: self.key_source,
+            api_endpoint: self.api_endpoint.clone(),
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -487,9 +492,9 @@ fn aggregate_available_models_inner(
 
 /// 汇总可用模型清单。
 ///
-/// 只保留白名单内的模型：本部署严格只服务 Claude 组（`claude-opus-5`、
-/// `claude-sonnet-5`，走 /v1/messages）与 GPT 组（`gpt-5.6-sol`、`gpt-5.6-terra`、
-/// `gpt-5.6-luna`，走 /v1/responses），其余一律在请求阶段 400。若这里仍列出白名单外
+/// 只保留白名单内的模型：Claude 组（`claude-opus-5`、`claude-sonnet-5`）与 GPT 组
+///（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）。全部模型可走 `/v1/messages`，
+/// GPT 组也可走 `/v1/responses`；其余一律在请求阶段 400。若这里仍列出白名单外
 /// 的模型，客户端会看到一个「能选但一用就报错」
 /// 的假选项 —— 配置与实际行为不一致，是最容易自己踩的坑。
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
@@ -557,62 +562,52 @@ pub async fn get_models(
     .into_response()
 }
 
-/// POST /v1/messages
+/// 共享执行上下文。外部 `/v1/messages` 请求没有该 Extension，使用 Messages 默认值；
+/// `/v1/responses` 翻译后直接调用本函数并显式保留原始入口和外部 stream 标记。
 ///
-/// 创建消息（对话）
-/// 内部转发标记。
-///
-/// `/v1/responses` 把 OpenAI 请求翻译成 [`MessagesRequest`] 后复用
-/// [`post_messages`]，通过该 Extension 声明「已在上一层按自己的协议校验过模型」，
-/// 使 Anthropic 协议校验跳过。外部 HTTP 请求永远不会带上它 —— axum 只会注入
-/// 路由层显式 `.layer()` 或调用方手动传入的 Extension。
+/// 客户端无法伪造它：axum 的 Extension 只来自路由层显式 `.layer()` 或调用方手动
+/// 传入，HTTP 头与请求体都进不了 request extensions。这一点现在比以前更吃重 ——
+/// `endpoint` 直接决定放行哪些模型（见下面的 `allowlist::resolve` 调用）。
+/// 退一步说，即便能伪造也只会收窄白名单（Responses 的允许集是 Messages 的子集），
+/// 不构成放宽。
 #[derive(Clone, Copy)]
-pub(super) struct InternalForward;
+pub(super) struct ForwardContext {
+    pub endpoint: ApiEndpoint,
+    pub external_stream: bool,
+}
 
+/// POST /v1/messages，以及 `/v1/responses` 翻译后的共享执行链路。
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
-    internal_forward: Option<Extension<InternalForward>>,
+    forward_context: Option<Extension<ForwardContext>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let context = forward_context.map(|v| v.0).unwrap_or(ForwardContext {
+        endpoint: ApiEndpoint::Messages,
+        external_stream: payload.stream,
+    });
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
-    // `via` 必须区分真实 HTTP 入站与 `/v1/responses` 的内部转发。内部转发压根没有
-    // 收到过 `POST /v1/messages`（它由 `post_responses` 直接函数调用进来），若一律
-    // 打印「Received POST /v1/messages」，运维看日志会得出「客户端在用 Anthropic
-    // 协议请求 GPT 模型」的反向错误结论 —— 那条路径对外是 400，不可能出现。
-    let via = if internal_forward.is_some() {
-        "internal:/v1/responses"
-    } else {
-        "http:/v1/messages"
-    };
     tracing::info!(
-        via = %via,
+        api_endpoint = %context.endpoint.as_str(),
+        api_path = %context.endpoint.path(),
         model = %payload.model,
         max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
+        stream = %context.external_stream,
+        pipeline_stream = %payload.stream,
         message_count = %payload.messages.len(),
         image_count = %img_stats.count,
         image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
-        "entering the /v1/messages pipeline"
+        "entering shared model execution pipeline"
     );
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
-    // 模型白名单 + 协议绑定校验：Anthropic 协议只服务 Claude 组
-    // （`claude-opus-5`、`claude-sonnet-5`）。
-    //
-    // `/v1/responses` 会把 GPT 请求翻译成 MessagesRequest 后复用本函数，那条路径
-    // 已在 `post_responses` 入口按 OpenAiResponses 协议校验过，并带上
-    // [`InternalForward`] 标记，故跳过此处校验；外部直连一律按 Anthropic 协议判定
-    // —— 用 `/v1/messages` 请求任一 GPT 组模型必须被拒。
-    if internal_forward.is_none()
-        && let Err(rejected) = crate::model::allowlist::resolve(
-            &payload.model,
-            crate::model::allowlist::Protocol::Anthropic,
-        )
-    {
+    // Messages 接受全部白名单模型；Responses 只接受 GPT。上游字段路径由 converter
+    // 按模型族决定，不由入口决定。
+    if let Err(rejected) = crate::model::allowlist::resolve(&payload.model, context.endpoint) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -671,8 +666,9 @@ pub async fn post_messages(
         &state,
         RequestTraceOptions {
             key_ctx: key_ctx.clone(),
+            api_endpoint: context.endpoint,
             model: payload.model.clone(),
-            is_stream: payload_stream,
+            is_stream: context.external_stream,
         },
     ));
 
@@ -1332,7 +1328,11 @@ fn build_non_stream_content(
     native_redacted_thinking: Vec<String>,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
-    let has_native_thinking = !native_thinking.is_empty();
+    // 纯空白的思考等于没有思考：客户端会把它渲染成一条内容为空的「思考」条目。
+    // 这条路径也是 `/v1/responses` 的来源（Responses 内部强制非流式），所以两个
+    // 入口都靠这一处挡住。判据与 stream.rs 的 reasoningContentEvent 处理一致。
+    // 注意只用 trim 做**判断**，真要下发时 thinking 文本仍原样输出，不做裁剪。
+    let has_native_thinking = !native_thinking.trim().is_empty();
 
     if thinking_enabled {
         if has_native_thinking {
@@ -1453,6 +1453,7 @@ mod tests {
                     group: None,
                     key_source: TraceKeySource::ClientKey,
                 },
+                api_endpoint: ApiEndpoint::Messages,
                 model: model.to_string(),
                 is_stream: false,
             },
@@ -1617,6 +1618,28 @@ mod tests {
         );
     }
 
+    /// 回归锁：思考内容只有空白时不产出 thinking 块。
+    ///
+    /// 上游会送出只含换行的 reasoning 内容。以前它会变成一个 thinking 块，
+    /// 客户端把它渲染成一条内容为空的「思考」。这条路径也是 `/v1/responses`
+    /// 的来源（Responses 内部强制非流式），所以两个入口都靠它挡住。
+    #[test]
+    fn non_stream_whitespace_only_thinking_produces_no_thinking_block() {
+        for whitespace in ["\n\n", " ", "\t\n  \n"] {
+            let content = build_non_stream_content(
+                true,
+                "final answer".to_string(),
+                whitespace.to_string(),
+                Some("real-signature".to_string()),
+                Vec::new(),
+            );
+
+            assert_eq!(content.len(), 1, "{whitespace:?} 不应产出 thinking 块");
+            assert_eq!(content[0]["type"], "text");
+            assert_eq!(content[0]["text"], "final answer");
+        }
+    }
+
     #[test]
     fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
         let content = build_non_stream_content(
@@ -1769,7 +1792,7 @@ mod tests {
                 model_name: Some("GPT 5.6 Terra".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(272_000),
+                    max_input_tokens: Some(372_000),
                     max_output_tokens: Some(128_000),
                 }),
             },

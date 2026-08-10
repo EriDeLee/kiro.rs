@@ -1,13 +1,14 @@
 //! OpenAI Responses 兼容端点
 //!
-//! 把 OpenAI `POST /v1/responses` 请求翻译成内部的 Anthropic
-//! [`MessagesRequest`]，复用 [`super::handlers::post_messages`] 的完整链路，
+//! 把 OpenAI `POST /v1/responses` 请求翻译成内部的 Messages
+//! [`MessagesRequest`]，复用 [`super::handlers::post_messages`] 的完整执行链路，
 //! 再把 Anthropic 响应翻译回 Responses 格式。
 //!
 //! 为什么需要这个端点：`@ai-sdk/openai` 的 `languageModel()` 默认走 Responses API，
 //! 只支持 `wire_api = "responses"`——即向 `<base_url>/responses` POST，
-//! 它是本部署唯一的 OpenAI 端点。对该 SDK
-//! 无效，必须提供 Responses 端点。
+//! 它是本部署唯一的 OpenAI 线格式端点，因此不能由 `/v1/messages` 取代。
+//! GPT 模型也可以直接从 `/v1/messages` 进入；两个入口在共享执行链路中保留独立
+//! `api_endpoint`，供 CLI 日志与 Admin 请求日志区分。
 //!
 //! 工具桥接（完整 codex 能力的关键）：codex 的工具按声明类型分两类，
 //! 应答的 item 种类必须与声明一致，否则 codex 直接终止本轮
@@ -44,7 +45,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::handlers::{InternalForward, post_messages};
+use super::handlers::{ForwardContext, post_messages};
 use super::middleware::{AppState, KeyContext};
 use super::responses_support::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
@@ -135,18 +136,18 @@ pub async fn post_responses(
     let model = req.model.clone();
 
     tracing::info!(
+        api_endpoint = "responses",
+        api_path = "/v1/responses",
         model = %model,
         stream = %want_stream,
         "Received POST /v1/responses request"
     );
 
-    // 0. 模型白名单 + 协议绑定校验。
-    //    本端点只服务 GPT 组（gpt-5.6-sol / -terra / -luna）；用 OpenAI 协议请求
-    //    Claude 模型会被明确拒绝，不做任何跨协议兼容（两族的推理字段路径与请求体
-    //    形状根本不同）。
+    // 0. 模型白名单 + 入口策略校验。Responses 适配器只服务 GPT 组；Claude 模型
+    //    使用 /v1/messages。上游推理字段路径另由 converter 按模型族决定。
     if let Err(rejected) = crate::model::allowlist::resolve(
         &model,
-        crate::model::allowlist::Protocol::OpenAiResponses,
+        crate::model::allowlist::ApiEndpoint::Responses,
     ) {
         return responses_error(
             StatusCode::BAD_REQUEST,
@@ -155,7 +156,7 @@ pub async fn post_responses(
         );
     }
 
-    // 1. Responses -> Anthropic 请求翻译（同时得到工具声明类型表）
+    // 1. Responses -> Messages 请求翻译（同时得到工具声明类型表）
     let (anthropic_req, tool_kinds) = match responses_to_anthropic(req) {
         Ok(r) => r,
         Err(msg) => {
@@ -163,11 +164,14 @@ pub async fn post_responses(
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
+    // 2. 复用共享执行链路（内部强制非流式）
     let inner = post_messages(
         State(state),
         Extension(key_ctx),
-        Some(Extension(InternalForward)),
+        Some(Extension(ForwardContext {
+            endpoint: crate::model::allowlist::ApiEndpoint::Responses,
+            external_stream: want_stream,
+        })),
         Json(anthropic_req),
     )
     .await;

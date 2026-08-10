@@ -1,6 +1,6 @@
 //! 请求链路追踪（Trace）持久化
 //!
-//! 记录每次 `/v1/messages` 请求的完整重试链路，用于排查"中断"类问题：
+//! 记录每次模型 API 请求的完整重试链路，用于排查"中断"类问题：
 //! - 一个外部请求 = 1 条 [`TraceRecord`] 汇总 + N 条 [`TraceAttempt`] 子记录
 //! - 每跳记录命中凭据、HTTP 状态码、失败分类、上游错误体片段、耗时
 //!
@@ -89,9 +89,15 @@ pub struct TraceRecord {
     pub key_id: u64,
     /// 入口 Key 类型，区分管理员API密钥与创建的客户端 Key。
     pub key_source: TraceKeySource,
+    /// 客户端实际请求的 API 入口：messages / responses；旧记录为 unknown。
+    pub api_endpoint: String,
     /// 模型名
     pub model: String,
-    /// 是否流式
+    /// 客户端**要求的**是否流式，不代表内部执行方式。
+    ///
+    /// `api_endpoint = "responses"` 的记录这里可能是 true，但那条路径内部强制
+    /// 非流式执行（Responses 适配器先拿完整响应再翻译回 SSE）。想知道内部是否
+    /// 真的流式，看 `api_endpoint` 而不是这个字段。
     pub is_stream: bool,
     /// 最终状态：success / error / interrupted
     pub final_status: String,
@@ -176,6 +182,8 @@ pub struct TraceQuery {
     pub failed_attempt_credential_id: Option<u64>,
     /// 模型名
     pub model: Option<String>,
+    /// 客户端 API 入口（messages / responses / unknown）
+    pub api_endpoint: Option<String>,
     /// 仅返回非 success
     pub only_failed: bool,
     /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
@@ -242,7 +250,7 @@ impl TraceStore {
     }
 
     /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
-    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source 需在此 ALTER。
+    /// 老版本的 traces.db 只有基础列，新增列需在此 ALTER。
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
@@ -255,12 +263,13 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 5] = [
+        let columns: [(&str, &str); 6] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("api_endpoint", "TEXT NOT NULL DEFAULT 'unknown'"),
         ];
         for (name, def) in columns {
             if !existing.contains(name) {
@@ -328,18 +337,19 @@ impl TraceStore {
             .unwrap_or_else(|_| Utc::now().timestamp());
         let res = (|| -> rusqlite::Result<()> {
             tx.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
-                 is_stream, final_status, final_credential_id, error_type, error_message, \
-                 total_attempts, duration_ms, interrupted_after_bytes, \
-                 input_tokens, output_tokens, \
-                 credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, api_endpoint, model, \
+                  is_stream, final_status, final_credential_id, error_type, error_message, \
+                  total_attempts, duration_ms, interrupted_after_bytes, \
+                  input_tokens, output_tokens, \
+                  credits, first_token_ms) \
+                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
                     ts_epoch,
                     rec.key_id as i64,
                     rec.key_source.as_str(),
+                    rec.api_endpoint,
                     rec.model,
                     rec.is_stream as i64,
                     rec.final_status,
@@ -438,6 +448,10 @@ impl TraceStore {
             clauses.push("model = ?".to_string());
             params.push(Box::new(m.clone()));
         }
+        if let Some(endpoint) = &q.api_endpoint {
+            clauses.push("api_endpoint = ?".to_string());
+            params.push(Box::new(endpoint.clone()));
+        }
         if let Some(ids) = &q.credential_ids {
             if ids.is_empty() {
                 // 空白名单 = 该分组下无凭据 → 强制零匹配
@@ -481,9 +495,9 @@ impl TraceStore {
             q.limit
         };
         let sql = format!(
-            "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
-             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, credits, first_token_ms \
+            "SELECT trace_id, ts, key_id, key_source, api_endpoint, model, is_stream, final_status, final_credential_id, \
+              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
+              input_tokens, output_tokens, credits, first_token_ms \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -495,19 +509,20 @@ impl TraceStore {
                 ts: row.get(1)?,
                 key_id: row.get::<_, i64>(2)? as u64,
                 key_source: TraceKeySource::from_db(row.get::<_, String>(3)?.as_str(), 3)?,
-                model: row.get(4)?,
-                is_stream: row.get::<_, i64>(5)? != 0,
-                final_status: row.get(6)?,
-                final_credential_id: row.get::<_, i64>(7)? as u64,
-                error_type: row.get(8)?,
-                error_message: row.get(9)?,
-                total_attempts: row.get::<_, i64>(10)? as u32,
-                duration_ms: row.get::<_, i64>(11)? as u64,
-                interrupted_after_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
-                input_tokens: row.get::<_, i64>(13)? as u64,
-                output_tokens: row.get::<_, i64>(14)? as u64,
-                credits: row.get::<_, f64>(15)?,
-                first_token_ms: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
+                api_endpoint: row.get(4)?,
+                model: row.get(5)?,
+                is_stream: row.get::<_, i64>(6)? != 0,
+                final_status: row.get(7)?,
+                final_credential_id: row.get::<_, i64>(8)? as u64,
+                error_type: row.get(9)?,
+                error_message: row.get(10)?,
+                total_attempts: row.get::<_, i64>(11)? as u32,
+                duration_ms: row.get::<_, i64>(12)? as u64,
+                interrupted_after_bytes: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(14)? as u64,
+                output_tokens: row.get::<_, i64>(15)? as u64,
+                credits: row.get::<_, f64>(16)?,
+                first_token_ms: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;
@@ -670,6 +685,7 @@ CREATE TABLE IF NOT EXISTS traces (
     ts_epoch          INTEGER NOT NULL,
     key_id            INTEGER NOT NULL,
     key_source        TEXT,
+    api_endpoint      TEXT NOT NULL DEFAULT 'unknown',
     model             TEXT NOT NULL,
     is_stream         INTEGER NOT NULL,
     final_status      TEXT NOT NULL,
@@ -719,6 +735,7 @@ mod tests {
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
             key_source: TraceKeySource::ClientKey,
+            api_endpoint: "messages".to_string(),
             model: input.model.to_string(),
             is_stream: true,
             final_status: input.status.to_string(),
@@ -795,6 +812,7 @@ mod tests {
         assert_eq!(out[0].attempts.len(), 2);
         assert_eq!(out[0].attempts[0].outcome, outcome::ACCOUNT_THROTTLED);
         assert_eq!(out[0].key_source, TraceKeySource::ClientKey);
+        assert_eq!(out[0].api_endpoint, "messages");
         // token 分项往返
         assert_eq!(out[0].input_tokens, 1093);
         assert_eq!(out[0].output_tokens, 779);
@@ -913,6 +931,60 @@ mod tests {
         });
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].trace_id, "cut");
+
+        let mut responses = sample(TraceSample {
+            trace_id: "responses",
+            status: "success",
+            credential_id: 8,
+            model: "gpt-5.6-sol",
+        });
+        responses.api_endpoint = "responses".to_string();
+        store.insert(&responses);
+        let by_endpoint = store.query(&TraceQuery {
+            api_endpoint: Some("responses".to_string()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(by_endpoint.len(), 1);
+        assert_eq!(by_endpoint[0].trace_id, "responses");
+    }
+
+    #[test]
+    fn migration_marks_existing_rows_as_unknown_endpoint() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL,
+                key_source TEXT,
+                model TEXT NOT NULL,
+                is_stream INTEGER NOT NULL,
+                final_status TEXT NOT NULL,
+                final_credential_id INTEGER NOT NULL,
+                error_type TEXT,
+                error_message TEXT,
+                total_attempts INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                interrupted_after_bytes INTEGER
+            );
+            INSERT INTO traces VALUES (
+                'old', '2020', 1, 1, 'clientKey', 'gpt-5.6-sol', 0,
+                'success', 1, NULL, NULL, 1, 1, NULL
+            );",
+        )
+        .unwrap();
+
+        TraceStore::migrate(&conn).unwrap();
+        let endpoint: String = conn
+            .query_row(
+                "SELECT api_endpoint FROM traces WHERE trace_id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoint, "unknown");
     }
 
     #[test]

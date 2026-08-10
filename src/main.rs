@@ -338,9 +338,9 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("监听地址: {}", addr);
-    tracing::info!("可用 API（一协议一组模型，严格绑定；跨协议请求返回 400）:");
+    tracing::info!("可用 API（Messages 接受全部白名单模型；Responses 仅接受 GPT）:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages              [claude-opus-5, claude-sonnet-5]");
+    tracing::info!("  POST /v1/messages              [全部 5 个白名单模型]");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  POST /v1/responses             [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]");
     tracing::info!("Admin: /api/admin/* + UI /admin");

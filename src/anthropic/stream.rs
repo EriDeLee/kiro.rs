@@ -2113,9 +2113,26 @@ impl StreamContext {
             && !text.is_empty()
         {
             self.output_tokens += estimate_tokens(text);
-            events.extend(self.ensure_thinking_block());
-            if let Some(idx) = self.thinking_block_index {
-                events.push(self.create_thinking_delta_event(idx, text));
+            // 纯空白分片不足以**新开**一个 thinking 块。
+            //
+            // 上游会在正文之后再补一个只含换行/空格的 reasoning 分片。此时前一个
+            // thinking 块早已被正文关闭（见 process_assistant_response），于是这里
+            // 又开一个新块，里面只有空白 —— 客户端把它渲染成回复末尾一条空的
+            // 「思考」（实测显示为 `Thought: 5ms`，正文区为空）。
+            //
+            // 块还开着时照常追加：那是思考文本内部的段落间隔，属于正常内容。
+            // 同一判据已用在 process_content_with_thinking（thinking 标签前置文本）
+            // 与 ensure_thinking_block（缓冲区 flush）。
+            if !self.is_thinking_block_open() && text.trim().is_empty() {
+                tracing::debug!(
+                    len = text.len(),
+                    "纯空白 reasoningContentEvent 分片：不为它新开 thinking 块"
+                );
+            } else {
+                events.extend(self.ensure_thinking_block());
+                if let Some(idx) = self.thinking_block_index {
+                    events.push(self.create_thinking_delta_event(idx, text));
+                }
             }
         }
 
@@ -4552,6 +4569,54 @@ mod tests {
         );
         assert_eq!(collect_thinking_content(&all_events), "native reasoning");
         assert_eq!(collect_text_content(&all_events), "final answer");
+    }
+
+    /// 回归锁：正文之后再来一个纯空白的 reasoning 分片，不能新开第二个 thinking 块。
+    ///
+    /// 上游确实会在正文之后补这种分片（通常是只含 `\n\n` 的一片）。此时第一个
+    /// thinking 块早已被正文关闭，于是空白分片又开一个新块，里面只有空白 ——
+    /// 客户端把它渲染成回复末尾一条空的「思考」（实测显示 `Thought: 5ms`，
+    /// 正文区为空）。
+    ///
+    /// 判据必须是 **thinking 块的数量**，不能用思考文本：块里只有空白，
+    /// 比对文本时两边 trim 完都是空，看不出区别。
+    #[test]
+    fn whitespace_only_reasoning_after_text_opens_no_second_thinking_block() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("real thinking".to_string()),
+                signature: None,
+                redacted_content: None,
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("visible answer"));
+        // 上游在正文之后补的空白分片：真签名照常收下，但不该为它开块。
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("\n\n".to_string()),
+                signature: Some("real-signature".to_string()),
+                redacted_content: None,
+            },
+        )));
+        all_events.extend(ctx.generate_final_events());
+
+        let thinking_starts = all_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .count();
+        assert_eq!(thinking_starts, 1, "末尾的空白分片不能再开一个 thinking 块");
+        assert_eq!(collect_thinking_content(&all_events), "real thinking");
     }
 
     #[test]

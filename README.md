@@ -2,19 +2,20 @@
 
 **该项目基于 [ZyphrZero/kiro.rs](https://github.com/ZyphrZero/kiro.rs) 进行的二次开发**
 
-一个用 Rust 编写的严格双端点代理，把 Anthropic Messages API 与 OpenAI Responses API 请求转换为 Kiro / Amazon Q 后端请求，并提供 Web Admin 面板管理凭据、用量与请求日志。
+一个用 Rust 编写的双协议代理，把 Anthropic Messages API 与 OpenAI Responses API 请求转换为 Kiro / Amazon Q 后端请求，并提供 Web Admin 面板管理凭据、用量与请求日志。
 
 本分支的 schema 严格对齐 **[Vercel AI SDK](https://ai-sdk.dev)**（`@ai-sdk/anthropic` / `@ai-sdk/openai`）的实际线格式 —— 该 SDK 是当前 agent 客户端的事实标准，其线格式与官方 REST 规范存在差异之处一律以 SDK 抓包为准。
 
-本分支**只服务 5 个模型，协议与模型组严格绑定**（一协议一组模型），跨协议请求一律拒绝。
+本分支只服务 5 个白名单模型。`/v1/messages` 是通用入口，接受全部 5 个模型；`/v1/responses` 是 OpenAI 线格式适配器，只接受 GPT 族。客户端入口与上游模型族彼此独立。
 
-| 端点 | 允许的模型 | 推理档位字段 |
+| 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5` | `output_config.effort` |
+| `POST /v1/messages` | 全部 5 个白名单模型 | `output_config.effort` |
 | `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
-同族内推理字段路径一致，跨族则根本不同（GPT 族只认 `reasoning`，下发 `output_config` /
-`thinking` 会被上游 400）。白名单是穷举的：上游账号里的 `claude-sonnet-4.6`、
+上游推理字段仍按模型族严格分流：Messages 入口收到 GPT 的 `output_config.effort` 后会转换为
+Kiro 的 `reasoning.effort`；不会把 `output_config` / `thinking` 原样下发给 GPT，否则上游会 400。
+白名单是穷举的：上游账号里的 `claude-sonnet-4.6`、
 `claude-opus-4.8`、`glm-5`、`auto` 等一律 400，不做家族/版本号模糊推断。
 
 工程约定见 [AGENTS.md](AGENTS.md)
@@ -30,7 +31,7 @@
 | **历史推理真实回传**<br><sub>请求侧 `assistantResponseMessage.reasoningContent`</sub> | ✅ | ❌ 拼 `<thinking>` 进 content<sup>1</sup> | ❌ | ❌ 直接丢弃 |
 | **真 signature 透传** | ✅ | ✅ | ❌ | ❌ 一律占位符 |
 | **gpt-5.6 `reasoning.effort`** | ✅ | ❌ 塞进 `output_config`<sup>2</sup> | ❌ | ✅ |
-| **模型白名单 + 协议隔离** | ✅ 一协议一组模型，跨协议 400 | ❌ 未知模型透传 | ❌ | ❌ |
+| **模型白名单 + 入口策略** | ✅ Messages 全模型；Responses 仅 GPT | ❌ 未知模型透传 | ❌ | ❌ |
 | **prompt cache 计量** | 已移除<sup>3</sup> | 本地伪造 | 本地伪造 | 本地伪造 |
 | **静默降级** | 全部移除<sup>4</sup> | 存在 | 存在 | 存在 |
 | **不改写客户端提示词** | ✅ 零注入<sup>5</sup> | ❌ 5 类注入 | ❌ 3 类 | ❌ 2 类 |
@@ -145,19 +146,21 @@ cargo build --release
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/messages` | Anthropic Messages，仅 `claude-opus-5` / `claude-sonnet-5` |
+| `POST` | `/v1/messages` | Anthropic Messages，接受全部 5 个白名单模型 |
 | `POST` | `/v1/messages/count_tokens` | Token 估算，覆盖 text / tool_use / tool_result / image / thinking |
 | `POST` | `/v1/responses` | OpenAI Responses，仅 `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` |
 | `GET` | `/v1/models` | 模型列表，仅列白名单内的 5 个 |
 | — | `/api/admin/*` | Admin API（57 条路由 / 70 个方法端点，需 `adminApiKey`） |
 | — | `/admin` | Admin Web UI |
 
+CLI 请求日志包含 `api_endpoint=messages|responses` 与 `api_path`。Admin 的“请求日志”页面也会显示并筛选接口；升级前的历史记录显示为“未知”，不会根据模型名猜测入口。
+
 ---
 
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（548 个）
+cargo test --release                      # 后端测试（555 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

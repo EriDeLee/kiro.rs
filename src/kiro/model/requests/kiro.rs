@@ -43,7 +43,7 @@ pub struct KiroRequest {
     ///     "output_config": { "effort": "max" }
     /// }
     /// ```
-    /// 档位枚举按协议族而异，见 `converter::model_effort_tiers`：
+    /// 档位枚举按模型族而异，见 `converter::model_effort_tiers`：
     /// Claude 族（claude-opus-5 / claude-sonnet-5）接受 low/medium/high/xhigh/max，
     /// GPT 族（gpt-5.6-sol / -terra / -luna）额外接受 none。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,7 +91,7 @@ pub struct KiroReasoningConfig {
 
 /// The effort control field recognized by the AWS Q backend
 ///
-/// 档位枚举按协议族而异：Claude 族为 low/medium/high/xhigh/max，
+/// 档位枚举按模型族而异：Claude 族为 low/medium/high/xhigh/max，
 /// GPT 族额外接受 none。不受支持的档位会在 converter 层直接报错，
 /// 不静默回落。
 ///

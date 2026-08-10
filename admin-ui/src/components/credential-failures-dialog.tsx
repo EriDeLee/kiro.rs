@@ -120,6 +120,13 @@ function FailureRow({
           {formatTime(rec.ts)}
         </span>
         <Badge variant="secondary">{keySourceLabel(rec)}</Badge>
+        <Badge variant="outline">
+          {rec.apiEndpoint === "messages"
+            ? "Messages"
+            : rec.apiEndpoint === "responses"
+              ? "Responses"
+              : "接口未知"}
+        </Badge>
         <Badge variant={style.variant}>{style.label}</Badge>
         {attempt.httpStatus != null && (
           <span className="font-mono text-muted-foreground">

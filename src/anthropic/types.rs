@@ -129,17 +129,18 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
-    /// `/v1/responses` 转译时携带的推理档位（内部通路，**不是** Anthropic 线格式）。
+    /// `/v1/responses` 转译时携带的推理档位（内部通路，**不是** Messages 线格式）。
     ///
     /// OpenAI Responses 的 `reasoning.effort` 会落在这里，因为那条路径的
     /// `thinking` 与 `output_config` 恒为 `None`（GPT 族的上游 schema 是
     /// `additionalProperties:false` 且只接受 `reasoning`，发另两个会 400）。
     ///
-    /// Anthropic 协议侧的档位一律走 `output_config.effort` —— 这是官方规范，也是
+    /// `/v1/messages` 的档位一律走 `output_config.effort` —— 这是官方规范，也是
     /// `@ai-sdk/anthropic` 的实际线格式（2026-07 抓包核验：2.0.91~4.0.23 共 11 个
     /// 版本均把 `providerOptions.anthropic.effort` 降级到 `output_config.effort`，
     /// 不存在顶层 `effort` 的线格式）。
-    #[serde(default, skip_serializing)]
+    // `skip` 同时禁止 HTTP 反序列化与普通序列化；只允许 Rust 内部显式赋值。
+    #[serde(skip)]
     pub effort: Option<String>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
@@ -360,5 +361,13 @@ mod tests {
     fn messages_request_preserves_explicit_max_tokens() {
         let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
         assert_eq!(request.max_tokens, 4096);
+    }
+
+    #[test]
+    fn messages_request_does_not_deserialize_internal_effort() {
+        let mut value = request_json(Some(4096));
+        value["effort"] = serde_json::json!("max");
+        let request: MessagesRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(request.effort, None);
     }
 }
