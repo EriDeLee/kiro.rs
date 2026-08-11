@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::types::{ContentBlock, ImageSource, MessagesRequest};
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    ReasoningContent,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroImage, Message, ReasoningContent, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
@@ -18,7 +19,6 @@ use crate::kiro::model::requests::kiro::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
-use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
 
@@ -70,9 +70,17 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
                 .into_iter()
                 .map(|(k, v)| (k, normalize_property_schema(v)))
                 .collect();
-            obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(normalized),
+            );
         }
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -89,7 +97,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -121,7 +134,12 @@ fn strip_top_level_combinators(obj: &mut serde_json::Map<String, serde_json::Val
             if m.get("type").and_then(|v| v.as_str()) != Some("object") {
                 continue;
             }
-            for key in &["properties", "required", "additionalProperties", "description"] {
+            for key in &[
+                "properties",
+                "required",
+                "additionalProperties",
+                "description",
+            ] {
                 if let Some(val) = m.get(*key) {
                     obj.entry(key.to_string()).or_insert_with(|| val.clone());
                 }
@@ -145,10 +163,18 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
-    if obj.get("exclusiveMinimum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMinimum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMinimum");
     }
-    if obj.get("exclusiveMaximum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMaximum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMaximum");
     }
 
@@ -167,7 +193,10 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
             .into_iter()
             .map(|(k, v)| (k, normalize_property_schema(v)))
             .collect();
-        obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(normalized),
+        );
     }
 
     // 递归处理 items（数组元素 schema）
@@ -191,8 +220,6 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
         None
     }
 }
-
-
 
 /// 把客户端模型名映射到上游 Kiro modelId。
 ///
@@ -252,9 +279,7 @@ fn collect_message_text(content: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => arr
             .iter()
-            .filter(|item| {
-                item.get("type").and_then(|v| v.as_str()).unwrap_or("text") == "text"
-            })
+            .filter(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("text") == "text")
             .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
             .collect::<Vec<_>>()
             .join("\n"),
@@ -303,10 +328,7 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 /// 官方规范，也是 `@ai-sdk/anthropic` 的实际线格式）
 /// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 默认 `high`（与上游 default 一致）。
 /// 随后按该模型实测枚举裁剪。
-fn select_native_reasoning_effort(
-    req: &MessagesRequest,
-    model_id: &str,
-) -> Result<String, String> {
+fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Result<String, String> {
     let raw = req
         .effort
         .as_deref()
@@ -372,8 +394,8 @@ impl EffortTier {
 /// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：
 ///   none / low / medium / high / xhigh / max
 fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
-    use EffortTier::*;
     use crate::model::allowlist::{ModelFamily, family_for_model};
+    use EffortTier::*;
     match family_for_model(model_id) {
         Some(ModelFamily::Gpt) => &[None, Low, Medium, High, XHigh, Max],
         // Claude 族与白名单外的兜底都用不含 none 的五档：白名单外的模型走不到这里
@@ -401,13 +423,21 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Result<Option
             "effort `{}` is not supported by model `{}`; supported tiers: {}",
             tier.as_str(),
             model_id,
-            tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            tiers
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         Option::None => Err(format!(
             "unrecognized effort value `{}`; supported tiers for `{}`: {}",
             trimmed,
             model_id,
-            tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            tiers
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -505,10 +535,7 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
-    /// 本次请求声明的所有工具名（原始 client 名）。用于 `<invoke>` 文本容错的灾难兜底：
-    /// 只有合成出的工具名在此集合里，才允许把字面 `<invoke>` 捞回成结构化 tool_use；
-    /// 否则当普通文本吐出，避免把「正文展示的工具调用」误执行成真命令。
-    pub known_tool_names: std::collections::HashSet<String>,
+
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -694,18 +721,6 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
-    // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
-    let mut known_tool_names: std::collections::HashSet<String> = req
-        .tools
-        .as_ref()
-        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
-        .unwrap_or_default();
-    // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
-    // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
-    for short in tool_name_map.keys() {
-        known_tool_names.insert(short.clone());
-    }
-
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
@@ -743,7 +758,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
+    //
+    // 客户端发什么就发什么：正文为空（agent 循环里工具结果轮次的 user 消息只有
+    // `tool_result` 块、没有 text 块）也原样发空串，**不补任何占位符**。
+    //
+    // 曾经补过一个空格，理由是「历史 assistant 那侧补了、这侧漏了」。那个理由不成立：
+    // assistant 侧注释所称的「Kiro API 要求 content 非空」从未被实测支持，反而本仓库的
+    // 变异实测记录着 `assistantResponseMessage.content` 为空串时上游返回 200。按未经
+    // 实测的假设给上游塞内容，就是在替客户端做它没要求的决定（§2.5）。
     let content = text_content;
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -765,10 +787,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
@@ -783,7 +802,6 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
-        known_tool_names,
         additional_model_request_fields,
     })
 }
@@ -848,8 +866,11 @@ fn process_message_content_dedup(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -910,7 +931,10 @@ fn extract_kiro_image(
     }
     let cfg = ResizeConfig::from_env();
     let processed = maybe_shrink_image(cfg, &format, &source.data);
-    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    images.push(KiroImage::from_base64(
+        processed.format,
+        processed.data_base64,
+    ));
     None
 }
 
@@ -1136,16 +1160,13 @@ fn convert_tools(
         return Vec::new();
     };
 
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
 
     for t in tools {
         let mapped_name = map_tool_name(&t.name, tool_name_map);
-        // 按小写名去重（Kiro 工具名大小写不敏感），首个出现者胜出。
-        if !seen.insert(mapped_name.to_lowercase()) {
-            tracing::debug!("跳过重复的工具名: {}", mapped_name);
-            continue;
-        }
+        // 客户端声明了什么工具就发什么。这里曾经按小写名去重、静默丢弃后出现的同名工具
+        // （只留一条 debug 日志），理由是「Kiro 工具名大小写不敏感」。那等于替客户端删掉
+        // 它明确声明过的工具：若上游真的不接受，应当让上游报错，而不是我们悄悄少发一个。
 
         // kiro API 不接受空描述，填充占位符
         let description = if t.description.trim().is_empty() {
@@ -1176,7 +1197,12 @@ fn convert_tools(
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1352,28 +1378,12 @@ fn convert_assistant_message(
                         // 推理写进可见输出。Smithy union 每条消息只能带一个 reasoning
                         // 块，故多个 thinking 块的文本累加、签名取最后一个非空值。
                         "thinking" => {
-                            // 只回传带**真签名**的思考。
+                            // 客户端回传的思考原样带上。
                             //
-                            // 上游解密 signature 重建思维链，签名对不上会返回
-                            // `THINKING_SIGNATURE_INVALID`（本代理据此直接报错、不剥离
-                            // 重试）。而当上游本轮没下发真签名时，出站侧会填一个占位串
-                            // 以满足客户端「thinking 块必须带非空 signature」的本地校验
-                            // —— 那个占位串会被客户端原样回传到这里，若继续转发给上游
-                            // 就是**必然失败**的一次请求。
-                            //
-                            // 因此这里识别并丢弃占位签名的块：本轮用户照常看得到思考，
-                            // 下一轮不会因为一个假签名把整个会话打死。
-                            let is_placeholder = block
-                                .signature
-                                .as_deref()
-                                .is_some_and(|s| s == super::stream::THINKING_SIGNATURE_PLACEHOLDER);
-                            if is_placeholder {
-                                tracing::debug!(
-                                    "历史 thinking 块携带占位签名（上游本轮未下发真签名），\
-                                     已跳过回传以避免上游验签失败"
-                                );
-                                continue;
-                            }
+                            // 这里曾经识别并丢弃「携带自造占位签名」的块：出站侧在上游没给
+                            // 签名时会填一个占位串，客户端原样回传后若继续转发给上游，就是
+                            // 一次必然失败的请求（`THINKING_SIGNATURE_INVALID`）。占位签名
+                            // 已不再产生，这段配对补丁随之删除。
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
                             }
@@ -1410,16 +1420,12 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    let has_reasoning = redacted_thinking.is_some() || !thinking_content.is_empty();
     // content 只放可见正文；思考走 `reasoningContent` 结构化字段。
-    // Kiro API 要求 content 非空，仅有 tool_use / 仅有思考时用空格占位。
-    let final_content = if text_content.is_empty() && (!tool_uses.is_empty() || has_reasoning) {
-        " ".to_string()
-    } else {
-        text_content
-    };
-
-    let mut assistant = AssistantMessage::new(final_content);
+    //
+    // 正文为空就发空串，不补占位符。这里曾经在「仅有 tool_use / 仅有思考」时填一个空格，
+    // 注释称「Kiro API 要求 content 非空」—— 该说法从未被实测支持，而本仓库的变异实测
+    // 恰恰记录着 `assistantResponseMessage.content` 为空串时上游返回 200。
+    let mut assistant = AssistantMessage::new(text_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
@@ -1468,13 +1474,12 @@ fn merge_assistant_messages(
         }
     }
 
-    let content = if content_parts.is_empty()
-        && (!all_tool_uses.is_empty() || merged_reasoning.is_some())
-    {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
+    let content =
+        if content_parts.is_empty() && (!all_tool_uses.is_empty() || merged_reasoning.is_some()) {
+            " ".to_string()
+        } else {
+            content_parts.join("\n\n")
+        };
 
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
@@ -1491,16 +1496,6 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn test_map_model_rejects_invalid_ids() {
@@ -1537,6 +1532,82 @@ mod tests {
         }
     }
 
+    /// 构造 agent 循环里最常见的一轮：assistant 发起工具调用，user 只回 `tool_result`
+    /// （没有任何 text 块）。这正是 `userInputMessage.content` 会变成空串的形态。
+    fn tool_result_turn_request(model: &str, trailing_user_text: Option<&str>) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut last_blocks = vec![serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "ok",
+        })];
+        if let Some(text) = trailing_user_text {
+            last_blocks.push(serde_json::json!({ "type": "text", "text": text }));
+        }
+
+        let mut req = minimal_request_with_effort(model, "high");
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("读一下 Cargo.toml"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read",
+                    "input": { "path": "Cargo.toml" },
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(last_blocks),
+            },
+        ];
+        req
+    }
+
+    /// 回归锁：工具结果轮次的空正文原样发给上游，**不许注入占位符**。
+    ///
+    /// 曾经在这里补过一个空格，理由是「历史 assistant 那侧补了、这侧漏了」。那个理由
+    /// 不成立：assistant 侧注释所称的「Kiro API 要求 content 非空」从未被实测支持，
+    /// 而本仓库的变异实测记录着该字段为空串时上游返回 200。按未经实测的假设给上游塞
+    /// 内容，等于替客户端做它没要求的决定。
+    #[test]
+    fn tool_result_only_turn_sends_client_content_verbatim() {
+        let req = tool_result_turn_request("claude-opus-5", None);
+        let result = convert_request(&req).expect("应转换成功");
+        let user_input = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(
+            user_input.content, "",
+            "客户端没给文本，就原样发空串，不许补占位符"
+        );
+        assert_eq!(
+            user_input.user_input_message_context.tool_results.len(),
+            1,
+            "tool_result 必须仍然带上"
+        );
+    }
+
+    /// 回归锁：客户端给了文本就原样带上。
+    #[test]
+    fn tool_result_turn_keeps_user_text_when_present() {
+        let req = tool_result_turn_request("claude-opus-5", Some("继续"));
+        let result = convert_request(&req).expect("应转换成功");
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "继续",
+            "有真实文本时必须原样保留，不能被空格占位覆盖"
+        );
+    }
+
     fn minimal_adaptive_thinking_request_with_effort(model: &str, effort: &str) -> MessagesRequest {
         use super::super::types::Thinking;
 
@@ -1562,19 +1633,9 @@ mod tests {
         req
     }
 
-
-
-
-
-
-
-
-
-
     #[test]
     fn test_output_config_normalizes_effort_case_and_spacing() {
-        let req =
-            minimal_adaptive_thinking_request_with_effort("claude-opus-5", "  MAX  ");
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "  MAX  ");
         let result = convert_request(&req).unwrap();
 
         let fields = result
@@ -1658,7 +1719,10 @@ mod tests {
                 .additional_model_request_fields
                 .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
             assert_eq!(
-                fields.output_config.expect("Claude 族应有 output_config").effort,
+                fields
+                    .output_config
+                    .expect("Claude 族应有 output_config")
+                    .effort,
                 "max",
                 "{model}"
             );
@@ -1721,7 +1785,10 @@ mod tests {
         // Claude 族 1M in
         assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-sonnet-5-thinking"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-sonnet-5-thinking"),
+            1_000_000
+        );
         // GPT 族三个模型实测均为 372k in。
         assert_eq!(get_context_window_size("gpt-5.6-sol"), 372_000);
         assert_eq!(get_context_window_size("gpt-5.6-sol-latest"), 372_000);
@@ -1746,10 +1813,6 @@ mod tests {
         assert_eq!(effort_from_budget_tokens(100_000), "xhigh");
     }
 
-
-
-
-
     #[test]
     fn disabled_thinking_emits_nothing_even_for_supported_model() {
         let req = minimal_thinking_request("claude-opus-5", "disabled");
@@ -1759,7 +1822,6 @@ mod tests {
             "thinking disabled 不应下发任何字段"
         );
     }
-
 
     // ---- normalize_json_schema: 顶层 type / 组合关键字（PR#6）----
 
@@ -1832,10 +1894,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-opus-5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -1861,13 +1920,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1937,8 +2001,13 @@ mod tests {
             .iter()
             .map(|t| t.tool_specification.name.as_str())
             .collect();
-        // 「Write」与「write」小写同名，去重后只剩首个；其余原样保留。
-        assert_eq!(names, vec!["Write", "Read", "WebSearch", "my_custom_tool"]);
+        // 一个都不少：`Write` 与 `write` 只有大小写之差，也都原样发给上游。
+        // 曾经按小写名去重、静默丢弃后出现的那个（只留一条 debug 日志），等于替客户端
+        // 删掉它明确声明过的工具。若上游真的不接受同名，应当由上游报错。
+        assert_eq!(
+            names,
+            vec!["Write", "write", "Read", "WebSearch", "my_custom_tool"]
+        );
         assert!(
             map.is_empty(),
             "短工具名不产生任何映射（tool_name_map 只记录长名缩短）"
@@ -1968,14 +2037,20 @@ mod tests {
     fn fs_append_is_not_filtered_out() {
         let mut map = HashMap::new();
         let out = convert_tools(
-            &Some(vec![passthrough_tool("fs_append"), passthrough_tool("Write")]),
+            &Some(vec![
+                passthrough_tool("fs_append"),
+                passthrough_tool("Write"),
+            ]),
             &mut map,
         );
         let names: Vec<&str> = out
             .iter()
             .map(|t| t.tool_specification.name.as_str())
             .collect();
-        assert!(names.contains(&"fs_append"), "fs_append 应原样透传，实际: {names:?}");
+        assert!(
+            names.contains(&"fs_append"),
+            "fs_append 应原样透传，实际: {names:?}"
+        );
     }
 
     /// 空描述被填成工具名（上游不接受空描述）—— 与工具名映射无关的独立行为。
@@ -2073,7 +2148,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::BTreeMap::new();
@@ -2083,12 +2159,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-opus-5".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -2117,8 +2191,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -2126,7 +2204,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2390,10 +2469,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-opus-5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2422,10 +2498,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-opus-5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2494,10 +2567,7 @@ mod tests {
 
         let history = vec![
             // 第一轮：用户请求
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-opus-5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
             // 第一轮：assistant 使用工具
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg1,
@@ -2539,10 +2609,7 @@ mod tests {
         user_msg_with_result = user_msg_with_result.with_context(ctx);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-opus-5",
-            )),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2565,8 +2632,10 @@ mod tests {
     fn test_convert_assistant_message_tool_use_only() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
-        // Kiro API 要求 content 字段不能为空
+        // 仅包含 tool_use 的 assistant 消息（无 text 块）：content 原样发空串。
+        //
+        // 这里曾经断言必须补一个 " " 占位，理由是「Kiro API 要求 content 非空」——
+        // 该说法从未被实测支持，而本仓库的变异实测恰恰记录着该字段为空串时上游返回 200。
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -2576,14 +2645,9 @@ mod tests {
 
         let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
-        // 验证 content 不为空（使用占位符）
-        assert!(
-            !result.assistant_response_message.content.is_empty(),
-            "content 不应为空"
-        );
         assert_eq!(
-            result.assistant_response_message.content, " ",
-            "仅 tool_use 时应使用 ' ' 占位符"
+            result.assistant_response_message.content, "",
+            "客户端没给正文，就原样发空串，不许补占位符"
         );
 
         // 验证 tool_uses 被正确保留
@@ -2728,7 +2792,10 @@ mod tests {
             .user_input_message
             .content;
         // 转换后末尾必须是 user 消息，且同时含原始提问与 prefill 指令。
-        assert!(current.contains("do the thing"), "原始 user 内容应保留: {current}");
+        assert!(
+            current.contains("do the thing"),
+            "原始 user 内容应保留: {current}"
+        );
         assert!(
             current.contains("MAXIMUM STEPS REACHED"),
             "prefill 指令应并入 user 消息: {current}"
@@ -2803,11 +2870,13 @@ mod tests {
 
     /// 回归锁：携带占位签名的历史 thinking 块不回传上游。
     ///
-    /// 出站侧在上游未下发真签名时会填占位串（满足客户端「signature 必须非空」的
-    /// 本地校验），客户端下一轮会原样回传。若继续转发，上游验签必然失败 →
-    /// `THINKING_SIGNATURE_INVALID` → 会话被打死。真签名则必须原样回传。
+    /// 回归锁：客户端回传的历史思考签名逐字节原样转发给上游。
+    ///
+    /// 上游解密该签名来重建思维链，改一个字节就会 `THINKING_SIGNATURE_INVALID`。
+    /// 出站侧已不再为「上游没给签名」的情况自造占位串，所以这里也不再有识别并剔除
+    /// 占位签名的配对逻辑 —— 客户端给什么就转发什么。
     #[test]
-    fn placeholder_signature_thinking_is_not_replayed_upstream() {
+    fn history_thinking_signature_is_replayed_verbatim() {
         use super::super::types::Message as AnthropicMessage;
 
         let with_sig = |sig: &str| {
@@ -2832,23 +2901,17 @@ mod tests {
             convert_request(&req).expect("应转换成功")
         };
 
-        // 占位签名 → 整块跳过，历史里没有 reasoningContent
-        let placeholder = with_sig(crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER);
-        let rendered = serde_json::to_string(&placeholder.conversation_state.history).unwrap();
-        assert!(
-            !rendered.contains("reasoningContent"),
-            "占位签名的思考不应回传: {rendered}"
-        );
-        assert!(rendered.contains("a1"), "可见正文仍应保留");
-
-        // 真签名 → 必须回传，且签名逐字节保真
+        // 客户端回传的签名一律原样转发，且签名逐字节保真
         let real = with_sig("CAISyRAKcAgQEAEYAipAREALSIG");
         let rendered = serde_json::to_string(&real.conversation_state.history).unwrap();
         assert!(
             rendered.contains("CAISyRAKcAgQEAEYAipAREALSIG"),
             "真签名必须原样回传: {rendered}"
         );
-        assert!(rendered.contains("internal reasoning"), "思考文本应随签名回传");
+        assert!(
+            rendered.contains("internal reasoning"),
+            "思考文本应随签名回传"
+        );
     }
 
     #[test]
@@ -2883,7 +2946,10 @@ mod tests {
             !content.contains("<thinking>"),
             "content 不应再包含 thinking XML 标签"
         );
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
         let rc = result
             .assistant_response_message
             .reasoning_content
@@ -2896,7 +2962,10 @@ mod tests {
             rt.text
         );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -2947,7 +3016,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -3010,7 +3083,11 @@ mod tests {
         let msg = &result.conversation_state.current_message.user_input_message;
 
         // image is lifted to the top-level images
-        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
+        assert_eq!(
+            msg.images.len(),
+            1,
+            "image in tool_result should be lifted to top-level images"
+        );
         assert_eq!(msg.images[0].format, "png");
         assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
 
@@ -3063,7 +3140,10 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
+        assert!(
+            msg.images.is_empty(),
+            "text-only tool_result should produce no top-level image"
+        );
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(

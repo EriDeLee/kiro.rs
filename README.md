@@ -160,7 +160,7 @@ CLI 请求日志包含 `api_endpoint=messages|responses` 与 `api_path`。Admin 
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（555 个）
+cargo test --release                      # 后端测试（493 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

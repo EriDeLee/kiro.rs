@@ -457,10 +457,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
     }
 }
 
-fn aggregate_available_models_inner(
-    upstream_models: Vec<UpstreamModel>,
-
-) -> Vec<Model> {
+fn aggregate_available_models_inner(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     let mut merged_upstream: BTreeMap<String, UpstreamModel> = BTreeMap::new();
     for incoming in upstream_models {
         match merged_upstream.get_mut(&incoming.model_id) {
@@ -771,7 +768,6 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
 
     if payload.stream {
         // 流式响应
@@ -782,7 +778,6 @@ pub async fn post_messages(
             total_input_tokens,
             thinking_enabled,
             tool_name_map,
-            known_tool_names,
             hook,
             tracer,
             key_ctx.group.clone(),
@@ -798,7 +793,6 @@ pub async fn post_messages(
             total_input_tokens,
             extract_thinking,
             tool_name_map,
-            known_tool_names,
             hook,
             tracer,
             key_ctx.group.clone(),
@@ -815,7 +809,6 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
@@ -843,13 +836,8 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
-        model,
-        input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -968,7 +956,10 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if let Some(message) = ctx
+                                .upstream_failure_message()
+                                .or_else(|| ctx.tool_json_error_message())
+                            {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -1019,13 +1010,7 @@ fn record_stream_usage(
     status: &str,
 ) {
     let input = ctx.resolved_usage();
-    hook.record(
-        credential_id,
-        input,
-        ctx.output_tokens,
-        ctx.credits,
-        status,
-    );
+    hook.record(credential_id, input, ctx.output_tokens, ctx.credits, status);
 }
 
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
@@ -1052,9 +1037,6 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
-    _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
@@ -1130,6 +1112,9 @@ async fn handle_non_stream_request(
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    // 上游下发的错误 / 异常事件。只记第一条（后续多为同一故障的连带事件），
+    // 收尾时返回 502 而不是 200 —— 宁可失败，也不把上游的失败伪装成完整答案。
+    let mut upstream_failure: Option<String> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1204,9 +1189,31 @@ async fn handle_non_stream_request(
                             );
                             metering = Some(event_metering);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        // 上游明确报错，必须让客户端知道。
+                        //
+                        // 这个 match 曾经没有 `Event::Error` 分支，它会落进下面的
+                        // `_ => {}`：代理照旧返回 200 + 已累计的正文 + `end_turn`，
+                        // 客户端把上游的失败当成了模型的完整答案。
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
+                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                            if upstream_failure.is_none() {
+                                upstream_failure = Some(format!("{error_code}: {error_message}"));
+                            }
+                        }
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
+                            tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                            // `ContentLengthExceededException` 是上游对「输出被长度截断」
+                            // 的正常告知，用 stop_reason 表达即可，不是失败。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            } else if upstream_failure.is_none() {
+                                upstream_failure = Some(format!("{exception_type}: {message}"));
                             }
                         }
                         _ => {}
@@ -1226,6 +1233,27 @@ async fn handle_non_stream_request(
     {
         tracing::error!("{}", e);
         tool_json_error = Some(e);
+    }
+
+    // 上游报了错 / 异常：非流式路径尚未发送任何字节，直接回 502，把上游的失败如实
+    // 暴露出去，而不是返回 200 + 半截正文 + `end_turn`（那等于把失败伪装成完整答案）。
+    if let Some(message) = upstream_failure {
+        hook.record(credential_id, input_tokens, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::UNKNOWN),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                format!("upstream {message}"),
+            )),
+        )
+            .into_response();
     }
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
@@ -1252,8 +1280,15 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
-    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
-    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
+    // 字面 <tool_use 标签只告警、不删除（与流式同口径）。删除会连带吞掉标签之后的
+    // 正文（未闭合时直接丢到末尾），客户端拿到一条被截断的回复且毫无提示 —— 那比让
+    // 它看到一段多余的 XML 更糟。助手正常提到这个标签名（例如解释协议）就会触发。
+    if crate::kiro::model::events::contains_tool_use_xml_leak(&text_content) {
+        tracing::warn!(
+            text_len = text_content.len(),
+            "上游正文里出现字面 <tool_use 标签，已原样透传（不再删除）"
+        );
+    }
 
     // 构建响应内容
     let mut content = build_non_stream_content(
@@ -1328,20 +1363,26 @@ fn build_non_stream_content(
     native_redacted_thinking: Vec<String>,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
-    // 纯空白的思考等于没有思考：客户端会把它渲染成一条内容为空的「思考」条目。
-    // 这条路径也是 `/v1/responses` 的来源（Responses 内部强制非流式），所以两个
-    // 入口都靠这一处挡住。判据与 stream.rs 的 reasoningContentEvent 处理一致。
-    // 注意只用 trim 做**判断**，真要下发时 thinking 文本仍原样输出，不做裁剪。
-    let has_native_thinking = !native_thinking.trim().is_empty();
+    // 上游给了思考内容就原样下发，不看内容是什么。
+    //
+    // 这里曾经把「纯空白的思考」当作没有思考丢掉（客户端会把它渲染成一条内容为空的
+    // 「思考」条目）。那仍然是代理替上游决定用户能看到什么。这条路径也是
+    // `/v1/responses` 的来源（Responses 内部强制非流式），两个入口共用此处判断。
+    let has_native_thinking = !native_thinking.is_empty();
 
     if thinking_enabled {
         if has_native_thinking {
-            content.push(json!({
+            let mut block = json!({
                 "type": "thinking",
                 "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
-            }));
+            });
+            // 只有上游真给了签名才带 signature 字段。这里曾经在缺签名时填一个自造的占位
+            // 串（好让客户端 SDK 不要因为缺 signature 而丢弃整块），那是发上游从未发过的
+            // 字段，且必须在下一轮入站时再剔除，否则回传即触发上游验签失败。
+            if let Some(signature) = native_thinking_signature {
+                block["signature"] = json!(signature);
+            }
+            content.push(block);
         } else if !text_content.is_empty() {
             // 只认原生 `reasoningContentEvent`（带真 signature）。上游若把思考写进
             // 正文的 `<thinking>` 标签，那是 legacy 形态：此处不再解析提取，正文
@@ -1432,8 +1473,6 @@ pub async fn count_tokens(
         input_tokens: total_tokens.max(1) as i32,
     })
 }
-
-
 
 /// 创建缓冲 SSE 事件流
 ///
@@ -1612,19 +1651,18 @@ mod tests {
         assert_eq!(content.len(), 1, "不应再拆出 thinking 块");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(
-            content[0]["text"],
-            "<thinking>legacy thinking</thinking>\n\nfinal answer",
+            content[0]["text"], "<thinking>legacy thinking</thinking>\n\nfinal answer",
             "正文应原样保留，不做 XML 提取"
         );
     }
 
-    /// 回归锁：思考内容只有空白时不产出 thinking 块。
+    /// 回归锁：上游给的思考内容原样下发，只含空白也照发。
     ///
-    /// 上游会送出只含换行的 reasoning 内容。以前它会变成一个 thinking 块，
-    /// 客户端把它渲染成一条内容为空的「思考」。这条路径也是 `/v1/responses`
-    /// 的来源（Responses 内部强制非流式），所以两个入口都靠它挡住。
+    /// 这里曾经把「只含换行的 reasoning 内容」当作没有思考丢掉（客户端会把它渲染成一条
+    /// 内容为空的「思考」）。那仍然是代理替上游决定用户能看到什么。这条路径也是
+    /// `/v1/responses` 的来源（Responses 内部强制非流式），两个入口共用此处判断。
     #[test]
-    fn non_stream_whitespace_only_thinking_produces_no_thinking_block() {
+    fn non_stream_whitespace_only_thinking_is_still_emitted() {
         for whitespace in ["\n\n", " ", "\t\n  \n"] {
             let content = build_non_stream_content(
                 true,
@@ -1634,9 +1672,18 @@ mod tests {
                 Vec::new(),
             );
 
-            assert_eq!(content.len(), 1, "{whitespace:?} 不应产出 thinking 块");
-            assert_eq!(content[0]["type"], "text");
-            assert_eq!(content[0]["text"], "final answer");
+            assert_eq!(
+                content.len(),
+                2,
+                "{whitespace:?} 应产出 thinking + text 两块"
+            );
+            assert_eq!(content[0]["type"], "thinking");
+            assert_eq!(
+                content[0]["thinking"], whitespace,
+                "思考内容必须逐字保真，不许 trim"
+            );
+            assert_eq!(content[1]["type"], "text");
+            assert_eq!(content[1]["text"], "final answer");
         }
     }
 

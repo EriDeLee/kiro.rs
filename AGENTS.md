@@ -87,7 +87,7 @@ open-code 第二套）。那个机制的前提假设 —— 客户端内置工�
 | 孤儿 `tool_use`/`tool_result` 清理 | 跳过并 warn | 修复上游会 400 的历史不一致，属修复而非降级 |
 | `image_resize` 环境变量解析失败 | 用默认值 | 配置写错就崩服务更糟 |
 | assistant prefill（末尾 assistant 消息） | 转成末尾 user 指令 + warn | Anthropic 协议的合法形态，客户端用它约束下一轮输出；Kiro 上游无预填槽位，报错会打死会话，转换不丢信息 |
-| 占位签名的历史 thinking 块 | 入站剔除 | 见 §4.2 |
+
 | `save_stats_debounced` 的 30 秒去抖 | 窗口内只标脏不落盘 | 高频写盘不可取；但**必须**有 graceful shutdown 调 `flush_stats()` 兜住，否则重启就丢——`Drop` 在生产中不执行（信号退出 + 多处 `process::exit` + `Arc` 被 app state 持有） |
 
 ### 2.4 代码不许说谎
@@ -244,7 +244,27 @@ graceful shutdown 失效。
 
 ---
 
-### 3.10 端到端实测基线（改动后按此回归）
+### 3.10 全仓审计：把整个仓库交给模型自查
+
+grep 找违规点找不全 —— 它只能命中你已经想到的模式。有效做法是写一个一次性脚本，
+把全部有意义代码（去空行去注释，排除 `target/`、`node_modules/`、锁文件、图片、
+Markdown）打成**一条**请求发给本机代理上的 `claude-opus-5`（`output_config.effort`
+设 `max`、`stream: true`），一次性要出两类清单：违反原样透传的地方，以及死代码。
+
+脚本与产物按 `.gitignore` 的 `/*audit*` 规则**不入库**（产物是兆字节级的全仓代码
+副本）。要点：每个文件以 `===== FILE: 路径 =====` 分隔；系统提示里必须写明「只报
+实际看到的，不要凭常见模式推测」并要求逐条给出文件路径、符号名、代码依据；要求它
+把「确定」与「疑似」分开列。
+
+2026-08-11 首次运行：139 个文件 / 1.70 MB / 47123 行 → 输入 745127 token、输出 23027
+token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与 28 条 B 类（死代码）。
+抽查 15 条全部属实，无捏造；它对「确定 / 疑似」的分级也可靠（把有明确 400 提示的
+白名单拦截、协议必填但值由代理决定的字段都正确归入疑似）。
+
+**模型的每一条都必须逐条核对到代码再采信。** 首轮抽查中唯一一次"疑似误报"，
+最后查明是核对者自己的 grep 正则写错，而非模型虚构。
+
+### 3.11 端到端实测基线（改动后按此回归）
 
 单测覆盖内部自洽，跨进程行为只能靠真实凭据实测。本仓库的完整矩阵（2026-07 跑通
 59 项）：
@@ -255,7 +275,7 @@ graceful shutdown 失效。
 | 2 | 已移除端点 absent | `/cc/v1/*`、`/v1/chat/completions` 全 404 |
 | 3 | 推理档位全矩阵 | Claude 组五档全 200、`none`/非法值 400；GPT 组六档全 200、非法 400 |
 | 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>`（Claude 组两个模型都要验） |
-| 5 | signature 端到端 | 真签名回传后模型能基于历史推理续算；占位签名被剔除不打死会话 |
+| 5 | signature 端到端 | 真签名回传后模型能基于历史推理续算；上游未给签名时出站不带该字段、也不自造 |
 | 6 | 工具 schema 透传 | 工具名与 input_schema 原样下发；仅超长名缩短 + 入站还原 |
 | 7 | 静默降级已移除 | prefill 转换 200 + warn；坏 JSON / 空 messages 400 |
 | 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0；CLI 与 Trace 对 GPT 请求均能区分 `messages` / `responses` 入口 |
@@ -267,7 +287,7 @@ graceful shutdown 失效。
 测试客户端行为时不必安装该客户端 —— 从其源码读出真实的工具 id / 参数形状后手工
 构造请求即可。
 
-### 3.11 Rebase 上游后必须做双向验证
+### 3.12 Rebase 上游后必须做双向验证
 
 只验一个方向会漏。两个方向都要查：
 
@@ -277,9 +297,9 @@ graceful shutdown 失效。
    **测试数变化**（本轮 518 → 542，说明上游 24 个新测试全部纳入并通过）
 3. **已删符号是否复活** —— 上游改动可能把删掉的字段/函数带回来
 
-三项都过之后再跑一遍端到端实测（§3.10），因为上游改动可能落在我方改过的同一文件里。
+三项都过之后再跑一遍端到端实测（§3.11），因为上游改动可能落在我方改过的同一文件里。
 
-### 3.12 写断言前先读实现，不要让证据服从预期
+### 3.13 写断言前先读实现，不要让证据服从预期
 
 本轮连续犯了四次同类错误，共同点是**先形成预期，再让证据服从预期**：
 
@@ -394,7 +414,11 @@ graceful shutdown 失效。
 
 **跨族接续可行**（2026-08-10 实测）：`claude-opus-5` 的会话历史（含 thinking 块与 opus-5 的真签名）原样带上、把 `model` 换成 `gpt-5.6-*` 从 `/v1/messages` 请求，**成功接续**。即 `converter` 不按模型族过滤历史 `reasoningContent` 是安全的，GPT 族不会因为签名来自 Claude 而拒绝。此前担心的「切模型打死会话」不成立。
 
-**`claude-opus-5` 100% 走原生 `reasoningContentEvent`**：4 组场景（长推理 max / 带工具调用 / 非流式 / 无 display）共 406 个事件，`<thinking>` XML 标签模式 **0 次触发**。故 XML 提取路径已从非流式删除。
+**`claude-opus-5` 100% 走原生 `reasoningContentEvent`**：4 组场景（长推理 max / 带工具调用 / 非流式 / 无 display）共 406 个事件，`<thinking>` XML 标签模式 **0 次触发**。
+
+**`<thinking>` / `<tool_use>` 字面量：上游从不用这套约定，读正文猜语义一律禁止**（2026-08-10 实测）。这两个标签是本代理家族早年自创的，上游协议里没有它们。实测证据：让 `gpt-5.6-sol` 原样输出「答案是 `<thinking>`内部推理`</thinking>` 完毕」，上游把整段作为**正文**下发，签名 payload 的非加密 slot 写着 `{"anchor":"答案是","length":32,"phase":"final_answer"}` —— 上游明确标注这是最终答案。代理却把它劈成 text + thinking 两块，且闭合标签被上游分片切断（`理</` + `thi` + `nking>`）后检测失败，回复尾巴整段变成一条折叠的「思考」。同理，字面 `<tool_use` 的删除会连带吞掉标签之后的正文（未闭合时丢弃到流末尾），助手正常提到该标签名时半条回复消失。**结论：面向客户端的文本一律原样透传，只在命中时 `warn!` 留痕。** 同类逻辑已全部清除，包括最后一处、后果最重的 `<invoke>` 文本捞回（它会把正文改写成结构化 `tool_use`，客户端会真的去改文件、跑命令）：上游把工具调用吐成字面文字，就照字面文字交给客户端。
+
+**`gpt-5.6-sol` 的公开 reasoning 文本是 `...` 占位，且是否产生带采样性**（2026-08-11 本地构造 Kiro 请求实测 45 次）：原始事件固定为正文 `assistantResponseEvent` 在前、`reasoningContentEvent{text:"..."}` 在后，最后才是单独的真签名；代理按事件头直接分流（`base.rs` → `process_reasoning_content`），没有生成或重标这三个点。单变量结果：普通原样复述 `0/3`、解释 `<thinking>` `0/3`、普通尖括号比较 `0/3`、Markdown 包裹 `0/3`；原样复述 `<foo>...</foo>` `2/3`、JSON 的 `"thinking"` 字段 `1/3`、要求生成普通 XML `1/3`；未闭合/完整 `<thinking>` 与 `[thinking]...[/thinking]` 都是 `3/3`。所以触发条件不是「输出里有 `<`」或「正文含 thinking 字样」，而是模型对**结构化标记任务**发生内部推理；`thinking` 包裹语义会显著提高概率，但不是唯一条件，也不是完全确定的文本开关。effort 对同一阳性提示的结果：不下发 reasoning 字段时 `...` 作为普通正文尾巴 `3/3`，显式 `none` 时完全消失 `3/3`，`low/high/max` 时全部成为尾部 reasoning + signature（各 `3/3`）。结论：`...` 是 GPT/Kiro 根据 reasoning 配置路由的上游内容，不能在代理里按内容删除；否则既违反原样透传，也会制造 `text` 与 signature 历史不一致。与 Claude 族完全不同（Claude 实测为 404 个真实 text 分片 + 2 个纯 signature）。
 
 **Builder ID 账号**：不支持 `ListAvailableProfiles`（固定 403 `AWS Builder ID is not supported for this operation.`），必须用占位 profileArn 并跳过探测；MCP（WebSearch）路径要用 `streaming_profile_arn()` 而非 `effective_profile_arn()`，否则 400 `profileArn is required`。
 
@@ -416,8 +440,10 @@ graceful shutdown 失效。
 
 | 方向 | 行为 | 原因 |
 |---|---|---|
-| 出站 | 有真签名则原样发；无真签名填占位串 | 满足客户端"signature 非空"的本地校验，用户每轮都看得到思考 |
-| 入站 | 真签名回传上游；**占位串识别后剔除** | 占位串回传必然 `THINKING_SIGNATURE_INVALID`，会打死会话 |
+| 出站 | 有真签名则逐字节原样发；**无真签名就不带该字段** | 不给客户端发上游从未发过的数据。代价是 SDK 会丢弃这段思考显示 |
+| 入站 | 客户端回传什么就逐字节转发什么 | 上游解密签名重建思维链，改一个字节即 `THINKING_SIGNATURE_INVALID` |
+
+早期实现曾在无真签名时填一个占位串以满足 SDK 的「signature 非空」校验，并在入站识别后剔除 —— 出站编一个、入站再拆掉，一对互相打补丁的改写。两半已一并删除。
 
 **响应 usage 移除 cache 字段是安全的**：SDK schema 两字段均 `.nullish()` + `?? 0` 兜底。实测下游完整换算链（SDK usage adapter → 客户端用量统计 → 上下文溢出判定 → 成本计算）无 NaN、压缩阈值正常。
 
@@ -442,6 +468,7 @@ graceful shutdown 失效。
 | `metadataEvent` 完全静默无害 | 一直在下发，只是从未被看见；加 warn 后立刻暴露 |
 | 上游 `reasoningContent` "仅响应侧支持，请求 history 传入会 400" | Smithy 模型中该 shape 只有序列化器无反序列化器（input-only），实测回传成功 |
 | GPT 族 `maxInputTokens` 是 272,000（2026-07-29 首测所记） | 2026-08-10 复测为 **372,000**；旧值已作废。教训：`tokenLimits` 是上游随时可调的运行时数据，不是固化协议常量，跟窗口有关的换算出现偏差时先复测 `ListAvailableModels` |
+| "claude-opus-5 实测 0 次触发 XML 模式，所以留着 `<thinking>` 提取路径无害" | 结论本身没错，但**结论范围被悄悄放大**了：那次实测只测了 Claude。2026-08-10 实测 `gpt-5.6-sol` 会把含字面 `<thinking>` 的正文整段作为最终答案下发，该路径立刻误伤正文。教训：一个模型的实测结论不能推广到别的模型族；「实测 0 次触发」只说明**当时那个模型**不触发，不说明代码无害 |
 
 ---
 

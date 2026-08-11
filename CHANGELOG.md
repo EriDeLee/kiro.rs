@@ -12,9 +12,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
 - 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
 
+### Removed
+
+- **流式路径不再解释正文内容。** 删掉 `<thinking>` 字面量提取（`process_content_with_thinking` 及配套的标签查找、缓冲区状态共约 700 行）；thinking 块此后只由上游原生 `reasoningContentEvent` 产生。非流式路径早已删除该逻辑，这次把流式对齐。
+- 删掉跨 chunk 的 `ToolUseXmlLeakFilter`。面向客户端的三条文本路径（流式、非流式、websearch 循环）改为原样透传 + 告警，不再删除任何正文；`strip_tool_use_xml_leaks` 只保留给 Admin 的凭据连通性测试（那里只是把回复显示在管理页面，删噪声不丢数据）。
+- 删掉两条永远走不到的坏 JSON 处理分支。`parse_invoke_block` 原先把入参先 `serde_json::to_string` 再交由调用方 `from_str` 解析回来 —— 解析 serde 自己刚序列化的 `Map<String, String>` 不可能失败，于是两处调用方各背了一条不可达的错误路径，其中流式那条还会连带销毁未消费的正文。现在该函数直接返回 `serde_json::Value`，`extract_invoke_content_blocks` 随之不再需要 `Result`（它已无任何错误来源），8 个调用点一并更新。
+- **不再丢弃「疑似退化复读」的正文。** 上游模型长上下文退化时会把同一个引导词（call / count / card）一行行刷上万次。原先一旦同一个词连续重复超过 32 次就「跳闸」，丢掉这一行及**本轮后续所有正文**，且跳闸是粘性的 —— 客户端拿到一条被截断的回复却毫不知情。流式与块级（非流式 / web_search loop）两条路径都改为只 `warn` 一次、正文一字不丢。代价是退化时用户会看到完整的复读洪水、输出额度照实消耗，那正是上游真实发出的内容。
+- **不再为「上游只发 reasoning、没发正文」的回合伪造终止原因和空正文。** 原先会把 `stop_reason` 改成 `max_tokens` 并补发一个内容为空格的 text 块。两者都是猜测：上游从未说过本轮是因为耗尽输出预算才没有正文（真被截断时它下发 `ContentLengthExceededException`，另有处理）。伪造的后果是客户端收到假的「被截断」信号，可能据此做多余的续写或重试。现在响应里就只有上游给的 thinking 块，`stop_reason` 走默认的 `end_turn`。
+- **删掉把正文改写成工具调用的 `<invoke>` 文本捞回。** 上游模型退化时会把工具调用吐成字面 `<invoke name="...">...</invoke>` 文本，原先会在「行首 + 非代码围栏 + 工具名已声明」三道判定下把那段正文改写成结构化 `tool_use` 交给客户端执行。它是「读正文内容猜语义」的最后一处，误判后果最重（客户端会真的改文件、跑命令）；而且为了等 `</invoke>` 闭合必须把正文暂存住，本身就构成正文延迟与丢失的通路。整套机制删除：嗅探缓冲区、块级入口 `extract_invoke_content_blocks`、代码围栏状态跟踪、引导词剥离 `strip_trailing_stray_tokens`，以及 20 个只服务于它的辅助函数。上游吐成字面文字，就照字面文字交给客户端。
+- **不再为「上游没给签名」的思考块自造签名。** 原先填一个占位串 `kiro-rs-thinking-signature`，好让客户端 SDK 不要因为「thinking 块缺 signature」而整块丢弃；出站编一个、入站再识别并剔除，是一对互相打补丁的改写（不剔除则回传必然触发上游 `THINKING_SIGNATURE_INVALID`）。现在上游没给就不发该字段，入站那段配对逻辑一并删除。代价是这种情况下客户端可能不显示该段思考 —— 那是客户端的选择，不是代理编造数据的理由。
+- **不再丢弃「只含空白」的思考分片。** 上游会在正文之后补一个只含换行的 reasoning 分片，原先按「空白等于没有思考」不为它开块，以免客户端渲染出一条内容为空的「思考」。那仍然是代理替上游决定用户能看到什么。流式与非流式两条路径都改为原样开块、逐字发出，不做 trim。
+- **不再按小写名去重客户端声明的工具。** 原先 `Write` 与 `write` 只保留首个（仅一条 debug 日志），等于替客户端删掉它明确声明过的工具。现在全部原样下发；若上游确实不接受同名，应由上游报错。
+- **不再给上游的消息补空格占位。** 客户端正文为空（agent 循环的工具结果轮次、或仅含 `tool_use` 的历史 assistant 消息）就原样发空串。原注释称「Kiro API 要求 content 非空」，该说法从未被实测支持，而本仓库的变异实测恰恰记录着该字段为空串时上游返回 200。
+- 随之无人调用的内部函数一并删除：`collapse_stray_token_floods`、`SseStateManager::has_non_thinking_blocks`、`ConversionResult::known_tool_names` 及其贯穿 converter / handlers / stream / websearch 的全链路。
+
 ### Fixed
 
+- **上游报错不再被静默吞掉当成正常结束。** 客户端原先会收到一条「正常结束」的半截回复，把上游的失败当成模型的完整答案，而 Trace 也记成 success，靠状态码查不出来。
+  - 流式：`Event::Error` 原先只写一行日志就丢掉，流照旧以 `message_delta{stop_reason:end_turn}` + `message_stop` 收尾。现在补发 Anthropic `error` 事件（带上游原始错误码与消息）、`stop_reason` 置为 `error`、上层把请求记为 error；报错前已发出的正文照旧保留，不因后续失败而回收。
+  - 非流式：该 `match` 原先**没有** `Event::Error` 分支，它落进 `_ => {}`。现在返回 502 并带上上游原话，而不是 200 + 半截正文 + `end_turn`。
+  - `Event::Exception`：原先只处理 `ContentLengthExceededException`，其余异常仅留日志。现在只有它仍按「输出被长度截断」用 `stop_reason` 表达（那确实不是失败），其余一律当失败上报。
+  - 按反向判据验证：把 `Event::Error` 改回旧写法，新增的回归锁确实失败（`必须补发一个 error 事件`），装回后通过。
+- **正文尾巴不再被误变成一条折叠的「思考」，正文也不再凭空消失。** 两处都是「读文本内容猜语义」造成的：
+  - 正文里出现字面 `<thinking>` 时被当成思考块开始，后面的正文全被吞进去。实测 `gpt-5.6-sol` 把「答案是 `<thinking>`…」整段作为最终答案下发（签名 payload 的非加密 slot 里写着 `phase=final_answer`），代理照样劈成 text + thinking 两块；闭合标签又被上游分片切断（`理</` + `thi` + `nking>`），检测失败，连 `</thinking>` 和它后面的正文一起进了思考块，text 块再没打开。
+  - 正文里出现字面 `<tool_use` 时，该标签及其后内容被直接删除（未闭合时丢弃到流末尾），客户端拿到一条被截断的回复且毫无提示。助手正常提到这个标签名（例如解释协议时）就会触发。
 - 回复末尾不再出现一条内容为空的「思考」。上游会在正文之后补一个只含换行的 reasoning 分片，此前它会被当作真内容新开一个 thinking 块（客户端渲染为 `Thought: 5ms` 且正文区为空）。流式与非流式两条路径都已挡住 —— 后者也是 `/v1/responses` 的来源。thinking 块已开着时的空白照常追加，那是思考文本内部的段落间隔。
+- 不过滤上游 `gpt-5.6-sol` 的 `reasoningContentEvent{text:"..."}`。45 次本地构造请求确认：这是模型在结构化标记任务中产生的推理摘要占位，事件位于正文之后、真签名之前；同一阳性提示在 `effort=none` 时消失，在 `low/high/max` 时稳定作为 reasoning 下发。它会被客户端显示为回复末尾的 `Thought: ...`，但属于上游明确标记的推理内容，不是代理伪造。
+- **正文还扣在 `<invoke>` 嗅探缓冲区时，不再被判定成「本轮没有正文」。** 嗅探器为了等 `</invoke>` 闭合会把行首未闭合的块暂存起来，此时尚无 text 块；`generate_final_events` 原先**先判定、后 flush**，于是把 `stop_reason` 误改成 `max_tokens`，还往正文流里插了一个空格。现在先排空缓冲区再判定。反向验证：撤掉修复后 `stop_reason` 确实变成 `max_tokens`。
 
 ## [0.7.5] - 2026-08-05
 

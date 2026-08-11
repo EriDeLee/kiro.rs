@@ -10,6 +10,8 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+# 审计脚本及产物
+/*audit*
 # 中转层缓存计量落盘（运行时产物，不入库）
 /cache_metering.json
 /prompt_cache.json

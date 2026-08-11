@@ -9,7 +9,34 @@ use crate::kiro::parser::frame::Frame;
 
 use super::base::EventPayload;
 
+/// 正文里是否出现字面 `<tool_use ...>` 开标签（判定规则与
+/// [`strip_tool_use_xml_leaks`] 一致：标签名后必须是空白或直接 `>`）。
+///
+/// 只用于**告警**，不改内容。面向客户端的文本一律原样透传：删除会连带吞掉标签
+/// 之后的正文（未闭合时直接丢到末尾），客户端拿到一条被截断的回复且毫无提示 ——
+/// 那比让它看到一段多余的 XML 更糟。实测记录：助手正文里正常提到 `<tool_use`
+/// 这个标签名（例如解释协议时）就会触发删除，半条回复消失。
+pub(crate) fn contains_tool_use_xml_leak(content: &str) -> bool {
+    let mut rest = content;
+    while let Some(start) = rest.find("<tool_use") {
+        let after_start = &rest[start..];
+        let is_real_tag = after_start.get("<tool_use".len()..).is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with(char::is_whitespace) || suffix.starts_with('>')
+        });
+        if is_real_tag {
+            return true;
+        }
+        rest = &after_start["<tool_use".len()..];
+    }
+    false
+}
+
 /// 剥离混入 assistant 文本的字面 `<tool_use ...>...</tool_use>` XML 泄漏。
+///
+/// **只剩 Admin 的凭据连通性测试在用。** 面向客户端的三条文本路径
+/// （流式、非流式、websearch 循环）已改为原样透传 + [`contains_tool_use_xml_leak`]
+/// 告警，不再删除任何正文。Admin 那处只是把回复显示在管理页面上，删掉噪声
+/// 不会让任何人丢数据。
 ///
 /// Kiro（上游）有时把工具调用意图以字面 XML 吐进文本里——真正的调用走结构化
 /// `toolUseEvent`，这段 XML 是重复噪声，需删除以免原样透传给客户端。
@@ -115,8 +142,7 @@ mod tests {
     #[test]
     fn test_strip_tool_use_xml_leaks() {
         // 剥离标签块本身，保留其两侧文本（周围换行原样保留）。
-        let content =
-            "before\n<tool_use id=\"toolu_1\" name=\"Read\">\n{\"path\":\"/a\"}\n</tool_use>\nafter";
+        let content = "before\n<tool_use id=\"toolu_1\" name=\"Read\">\n{\"path\":\"/a\"}\n</tool_use>\nafter";
         assert_eq!(strip_tool_use_xml_leaks(content), "before\n\nafter");
     }
 
