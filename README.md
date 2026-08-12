@@ -10,7 +10,7 @@
 
 | 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | 全部 5 个白名单模型 | `output_config.effort` |
+| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `output_config.effort` |
 | `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
 上游推理字段仍按模型族严格分流：Messages 入口收到 GPT 的 `output_config.effort` 后会转换为
