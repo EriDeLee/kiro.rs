@@ -53,7 +53,12 @@ function GithubIcon({ className }: { className?: string }) {
 }
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { storage, type CredentialView } from "@/lib/storage";
+import {
+  storage,
+  type CredentialView,
+  type CredentialSortDir as SortDir,
+  type CredentialSortField as SortField,
+} from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -167,15 +172,8 @@ const TIER_LABELS: Record<Tier, string> = {
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
-// 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用
-type SortField =
-  | "manual"
-  | "priority"
-  | "successCount"
-  | "totalFailureCount"
-  | "lastUsedAt"
-  | "id";
-type SortDir = "asc" | "desc";
+// 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用。
+// SortField / SortDir 的取值域定义在 storage.ts —— 持久化读回时要按同一份白名单校验。
 const SORT_OPTIONS: { value: Exclude<SortField, "manual">; label: string }[] = [
   { value: "priority", label: "优先级" },
   { value: "successCount", label: "成功次数" },
@@ -334,26 +332,35 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
-  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
-  const [sortField, setSortField] = useState<SortField>("manual");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽。
+  // 与展示形态 / 每页数量一样持久化到 localStorage，刷新后不回到“手动顺序”。
+  const [sortField, setSortField] = useState<SortField>(() =>
+    storage.getCredentialSortField(),
+  );
+  const [sortDir, setSortDir] = useState<SortDir>(() =>
+    storage.getCredentialSortDir(),
+  );
   // 按状态隐藏（多选）：集合内的状态对应的凭据不显示；空集合 = 不隐藏任何状态
   const [hiddenStatuses, setHiddenStatuses] = useState<Set<StatusKey>>(
     new Set(),
   );
-  // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
+  // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向。
+  // 先算出下一组值再一次写盘 —— 用 setState 的函数式更新拿不到新值，落盘会滞后一次点击。
   const applySort = (field: SortField) => {
-    if (field === "manual") {
-      setSortField("manual");
-      return;
-    }
-    if (sortField === field) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-      return;
-    }
+    const nextDir: SortDir =
+      field === "manual"
+        ? sortDir // 手动顺序不看方向，保留当前值
+        : sortField === field
+          ? sortDir === "asc"
+            ? "desc"
+            : "asc"
+          : // 成功次数/最后使用默认降序（大/新在前），其余默认升序
+            field === "successCount" || field === "lastUsedAt"
+            ? "desc"
+            : "asc";
     setSortField(field);
-    // 成功次数/最后使用默认降序（大/新在前），其余默认升序
-    setSortDir(field === "successCount" || field === "lastUsedAt" ? "desc" : "asc");
+    setSortDir(nextDir);
+    storage.setCredentialSort(field, nextDir);
   };
   const toggleStatus = (s: StatusKey) => {
     setHiddenStatuses((prev) => {

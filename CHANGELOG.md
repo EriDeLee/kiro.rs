@@ -41,6 +41,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 回复末尾不再出现一条内容为空的「思考」。上游会在正文之后补一个只含换行的 reasoning 分片，此前它会被当作真内容新开一个 thinking 块（客户端渲染为 `Thought: 5ms` 且正文区为空）。流式与非流式两条路径都已挡住 —— 后者也是 `/v1/responses` 的来源。thinking 块已开着时的空白照常追加，那是思考文本内部的段落间隔。
 - 不过滤上游 `gpt-5.6-sol` 的 `reasoningContentEvent{text:"..."}`。45 次本地构造请求确认：这是模型在结构化标记任务中产生的推理摘要占位，事件位于正文之后、真签名之前；同一阳性提示在 `effort=none` 时消失，在 `low/high/max` 时稳定作为 reasoning 下发。它会被客户端显示为回复末尾的 `Thought: ...`，但属于上游明确标记的推理内容，不是代理伪造。
 - **正文还扣在 `<invoke>` 嗅探缓冲区时，不再被判定成「本轮没有正文」。** 嗅探器为了等 `</invoke>` 闭合会把行首未闭合的块暂存起来，此时尚无 text 块；`generate_final_events` 原先**先判定、后 flush**，于是把 `stop_reason` 误改成 `max_tokens`，还往正文流里插了一个空格。现在先排空缓冲区再判定。反向验证：撤掉修复后 `stop_reason` 确实变成 `max_tokens`。
+- **Admin 面板的排序字段与升降序现在会持久化。** 展示形态（`credentialView`）与每页数量（`credentialPageSize`）一直存在 localStorage，排序却只活在组件 state 里，刷新或重新登录就悄悄回到「手动顺序」—— 用户以为自己选的排序还在，看到的其实是服务端顺序。现在写 `credentialSortField` / `credentialSortDir` 两个键，读回时按白名单校验、认不出的值回落 `manual`（否则一个比较器不认识的字段会让排序静默失效）；`SortField` / `SortDir` 的取值域随之移到 `storage.ts`，与那份白名单同源，避免两处各写一遍走岔。`applySort` 改为先算出下一组字段/方向再一次落盘 —— 用函数式 `setState` 取不到新值，落盘会滞后一次点击。
 
 ## [0.7.5] - 2026-08-05
 
