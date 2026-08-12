@@ -4,7 +4,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -98,11 +98,9 @@ function readTabFromHash(): Tab {
 }
 
 interface AppHeaderProps {
-  darkMode: boolean;
   tab: Tab;
   onLogout: () => void;
   onSwitchTab: (next: Tab) => void;
-  onToggleDarkMode: () => void;
 }
 
 function App() {
@@ -114,11 +112,9 @@ function App() {
 
   return (
     <LoggedInApp
-      darkMode={app.darkMode}
       tab={app.tab}
       onLogout={app.handleLogout}
       onSwitchTab={app.switchTab}
-      onToggleDarkMode={app.toggleDarkMode}
     />
   );
 }
@@ -126,13 +122,6 @@ function App() {
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
-
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
   }, []);
@@ -153,19 +142,12 @@ function useAppShell() {
     storage.removeApiKey();
     setIsLoggedIn(false);
   };
-  const toggleDarkMode = () => {
-    setDarkMode((v) => !v);
-    document.documentElement.classList.toggle("dark");
-  };
-
   return {
-    darkMode,
     handleLogin,
     handleLogout,
     isLoggedIn,
     switchTab,
     tab,
-    toggleDarkMode,
   };
 }
 
@@ -179,20 +161,16 @@ function LoggedOutApp({ onLogin }: { onLogin: () => void }) {
 }
 
 function LoggedInApp({
-  darkMode,
   onLogout,
   onSwitchTab,
-  onToggleDarkMode,
   tab,
 }: AppHeaderProps) {
   return (
     <ConfirmProvider>
       <AppHeader
-        darkMode={darkMode}
         tab={tab}
         onLogout={onLogout}
         onSwitchTab={onSwitchTab}
-        onToggleDarkMode={onToggleDarkMode}
       />
       <AppMain tab={tab} onLogout={onLogout} />
       <Toaster position="top-center" />
@@ -201,21 +179,15 @@ function LoggedInApp({
 }
 
 function AppHeader({
-  darkMode,
   onLogout,
   onSwitchTab,
-  onToggleDarkMode,
   tab,
 }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-50 w-full glass">
       <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
-        <HeaderActions
-          darkMode={darkMode}
-          onLogout={onLogout}
-          onToggleDarkMode={onToggleDarkMode}
-        />
+        <HeaderActions onLogout={onLogout} />
       </div>
       <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
     </header>
@@ -267,13 +239,9 @@ function DesktopTabs({
 }
 
 function HeaderActions({
-  darkMode,
   onLogout,
-  onToggleDarkMode,
 }: {
-  darkMode: boolean;
   onLogout: () => void;
-  onToggleDarkMode: () => void;
 }) {
   return (
     <div className="flex shrink-0 items-center gap-1">
@@ -285,9 +253,6 @@ function HeaderActions({
       </div>
       <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
       <GithubButton />
-      <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
-        {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-      </Button>
       <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
         <LogOut className="h-4 w-4" />
       </Button>

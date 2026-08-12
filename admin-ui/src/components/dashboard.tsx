@@ -2,8 +2,6 @@ import { useState, useEffect, useRef } from "react";
 import {
   RefreshCw,
   LogOut,
-  Moon,
-  Sun,
   Server,
   Plus,
   Upload,
@@ -306,13 +304,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     storage.setCredentialPageSize(n);
     setCurrentPage(1);
   };
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
-
   const queryClient = useQueryClient();
   const { data, isLoading, error, refetch } = useCredentials();
   const { mutate: deleteCredential } = useDeleteCredential();
@@ -646,11 +637,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return next.size === prev.size ? prev : next;
     });
   }, [data?.credentials]);
-
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle("dark");
-  };
 
   const handleRefresh = () => {
     refetch();
@@ -1340,18 +1326,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 >
                   <GithubIcon className="h-4 w-4" />
                 </a>
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={toggleDarkMode}
-                title="切换主题"
-              >
-                {darkMode ? (
-                  <Sun className="h-4 w-4" />
-                ) : (
-                  <Moon className="h-4 w-4" />
-                )}
               </Button>
               <Button
                 variant="ghost"
