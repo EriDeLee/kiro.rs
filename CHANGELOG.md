@@ -25,6 +25,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **不再按小写名去重客户端声明的工具。** 原先 `Write` 与 `write` 只保留首个（仅一条 debug 日志），等于替客户端删掉它明确声明过的工具。现在全部原样下发；若上游确实不接受同名，应由上游报错。
 - **不再给上游的消息补空格占位。** 客户端正文为空（agent 循环的工具结果轮次、或仅含 `tool_use` 的历史 assistant 消息）就原样发空串。原注释称「Kiro API 要求 content 非空」，该说法从未被实测支持，而本仓库的变异实测恰恰记录着该字段为空串时上游返回 200。
 - 随之无人调用的内部函数一并删除：`collapse_stray_token_floods`、`SseStateManager::has_non_thinking_blocks`、`ConversionResult::known_tool_names` 及其贯穿 converter / handlers / stream / websearch 的全链路。
+- **不再把上游的思考文本混进正文。** 客户端未启用 thinking 时，`process_reasoning_content`（流式）与 `build_non_stream_content`（非流式，也是 `/v1/responses` 的来源）原先把 `reasoningContentEvent` 的文本当作 text 块下发。思考与正文是上游的两个通道，客户端收到的却是一个标着「回答」的块，它无从分辨。2026-08-12 单变量实测 `claude-opus-5`：不带 thinking 字段时上游**照样**回一段 summarized 思考（带 `thinking.type=adaptive` 且不带 `display` 时反而完全不回），于是正文开头永远粘着一段思考。实际后果是 OpenCode 的 compaction 请求（不带 thinking、正文为空）把 3737 字的模型独白当成压缩摘要存了下来，压缩后会话记忆即被污染。现在客户端没要就不发，丢弃只在收尾汇总一条 `warn`（逐个分片各打一条会把日志刷爆 —— 上游一轮能发 400 多个 reasoning 分片）。
+- **不再给一个工具都没声明的请求补占位工具定义。** 原先无条件为历史 `tool_use` 里出现过的工具名补 `create_placeholder_tool`，依据是注释里那句「Kiro API 要求历史引用的工具必须在 tools 中有定义」—— 该陈述已被实测推翻（历史带 `bash`、本轮零 tools，上游 200）。而占位工具的 schema 是 `properties: {}`：`claude-opus-5` 因此认为 `bash` 可用、却没有任何结构化字段能装命令，直接把 `<invoke name="bash"><parameter name="command">…` 当正文打出来并自编一行命令输出，整篇压缩摘要作废。GPT 族不模仿这套 XML 方言，所以同一条链路上 GPT 的压缩一直正常。这正是 §2.5 禁止的「注入客户端未声明的工具」，与当年那个 `noop` 假工具同一性质。保留「客户端声明了工具、但历史里用过另一个没再带上」这一分支：该情况未单独实测过上游是否真要求定义，维持既有行为是保守选择。
 
 ### Fixed
 

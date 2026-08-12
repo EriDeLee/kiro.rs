@@ -1413,10 +1413,14 @@ fn build_non_stream_content(
             "text": text_content
         }));
     } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
-        }));
+        // 正文为空 + 客户端没要思考：曾经把思考文本当作正文块下发。那是伪造上游从未
+        // 发过的块（思考与正文是两个通道），客户端无从分辨；实测后果是 OpenCode 的
+        // 压缩摘要被写成了模型的内心独白。客户端没要就不发 —— 此时 content 为空数组，
+        // 不补空正文、不伪造截断（与流式侧同一条回归锁）。
+        tracing::warn!(
+            len = native_thinking.len(),
+            "客户端未启用 thinking 且正文为空，丢弃上游 reasoning 文本（不再当正文下发）"
+        );
     }
     content
 }
@@ -1688,7 +1692,10 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+    /// 回归锁：非流式下客户端没启用 thinking 且正文为空时，content 就是空数组 ——
+    /// 不许把思考文本当正文下发（旧行为如此，OpenCode 的压缩摘要因此变成模型独白），
+    /// 也不许补一个空正文块。
+    fn non_stream_native_thinking_is_dropped_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
             String::new(),
@@ -1697,9 +1704,10 @@ mod tests {
             vec!["ignored-redacted".to_string()],
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+        assert!(
+            content.is_empty(),
+            "思考文本不许当正文下发，实际: {content:?}"
+        );
     }
 
     #[test]

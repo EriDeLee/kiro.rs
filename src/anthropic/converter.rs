@@ -618,8 +618,16 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     tool_names
 }
 
-/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
-/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
+/// 为历史中使用但不在 tools 列表中的工具创建占位符定义。
+///
+/// 这里原先写着「Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有
+/// 定义」。2026-08-12 实测推翻了这条陈述的普适性：历史里带 `bash` 的 tool_use /
+/// tool_result、本轮**一个 tools 都不声明**，上游返回 200 并正常作答。所以零工具场景
+/// 不再补占位符（补出来的空壳 schema 会让 claude-opus-5 把工具调用当正文打出来）。
+///
+/// 仍保留「客户端声明了工具、但历史里用过另一个没再带上」这一分支：那种情况**未**单独
+/// 实测过上游是否真要求定义，维持既有行为是保守选择；此时模型本来就有工具可用，占位符
+/// 不会凭空造出一个新能力。
 fn create_placeholder_tool(name: &str) -> Tool {
     Tool {
         tool_specification: ToolSpecification {
@@ -742,9 +750,31 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
-    for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
+    // 客户端一个工具都没声明时**不补占位符** —— 补了就是替客户端声明它没要的工具（§2.5，
+    // 与当年那个 `noop` 假工具同一性质）。
+    //
+    // 2026-08-12 实测后果：OpenCode 的 compaction 请求不带 tools，但历史里满是
+    // bash / read / edit 的 tool_use，于是这里给每个名字都补一个 `properties: {}` 的
+    // 空壳工具。claude-opus-5 因此认为 bash 可用，却没有任何结构化字段能装命令，直接把
+    // `<invoke name="bash"><parameter name="command">…` 当正文打出来，还编了一行命令
+    // 输出，整篇压缩摘要作废。GPT 族不模仿这套 XML 方言，所以同一条链路上 GPT 的压缩
+    // 一直正常 —— 这就是它只在 Claude 上暴露的原因。
+    //
+    // 只在客户端**确实声明了工具**时才补：那种场景下补的是同一轮工具集里缺失的名字
+    // （历史用过、本轮客户端没再带上），模型本来就有工具可用，占位符不会凭空造出
+    // 一个新能力。
+    if tools.is_empty() {
+        if !history_tool_names.is_empty() {
+            tracing::warn!(
+                names = history_tool_names.len(),
+                "客户端未声明任何工具：历史 tool_use 不补占位符定义"
+            );
+        }
+    } else {
+        for tool_name in history_tool_names {
+            if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+                tools.push(create_placeholder_tool(&tool_name));
+            }
         }
     }
 
@@ -1592,6 +1622,75 @@ mod tests {
         );
     }
 
+    /// 回归锁：客户端一个工具都没声明时，历史里的 tool_use **不许**被补成占位工具定义。
+    ///
+    /// 旧行为按「Kiro 要求历史引用的工具必须有定义」给每个历史工具名补一个
+    /// `properties: {}` 的空壳工具。2026-08-12 实测代价：OpenCode 的 compaction 请求不带
+    /// tools，但历史里满是 bash / read / edit，补出来的空壳让 claude-opus-5 认为 bash 可用
+    /// 又没有字段能装命令，于是把 `<invoke name="bash"><parameter name="command">…` 当正文
+    /// 打出来（并自编一行命令输出），整篇压缩摘要作废。GPT 族不模仿这套 XML 方言，所以
+    /// 同一条链路上只有 Claude 暴露。
+    #[test]
+    fn no_client_tools_means_no_placeholder_tools() {
+        let req = tool_result_turn_request("claude-opus-5", None);
+        assert!(req.tools.is_none(), "前提：客户端没声明任何工具");
+
+        let result = convert_request(&req).expect("应转换成功");
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert!(
+            tools.is_empty(),
+            "客户端没声明工具，不许替它造工具: {:?}",
+            tools
+                .iter()
+                .map(|t| &t.tool_specification.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 回归锁：客户端**确实**声明了工具时，历史里用过、本轮没再带上的工具名仍补占位定义
+    /// （上游要求历史引用的工具在 tools 里有定义；此时模型本来就有工具可用，占位符不会
+    /// 凭空造出一个新能力）。
+    #[test]
+    fn declared_tools_still_get_history_placeholders() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let mut req = tool_result_turn_request("claude-opus-5", None);
+        req.tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "bash".to_string(),
+            description: "run a command".to_string(),
+            input_schema: Default::default(),
+            cache_control: None,
+            max_uses: None,
+        }]);
+
+        let result = convert_request(&req).expect("应转换成功");
+        let names: Vec<_> = result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .iter()
+            .map(|t| t.tool_specification.name.clone())
+            .collect();
+
+        assert!(
+            names.contains(&"bash".to_string()),
+            "客户端声明的工具必须在: {names:?}"
+        );
+        assert!(
+            names.contains(&"read".to_string()),
+            "历史里用过的 read 仍需补占位定义: {names:?}"
+        );
+    }
+
     /// 回归锁：客户端给了文本就原样带上。
     #[test]
     fn tool_result_turn_keeps_user_text_when_present() {
@@ -2271,11 +2370,18 @@ mod tests {
         assert!(found, "应该在历史中找到 tool_use");
     }
 
+    /// 回归锁：客户端本轮声明了工具、但历史里用过另一个没再带上的工具时，给缺失的那个
+    /// 补占位定义（上游要求历史引用的工具在 tools 里有定义）。
+    ///
+    /// 这个测试原本断言的是「客户端 `tools: None` 时也补占位符」。那条行为已被删除 ——
+    /// 它让不带 tools 的 compaction 请求凭空获得 bash / read 能力，claude-opus-5 于是把
+    /// 工具调用当正文打了出来。零工具那一侧现在由
+    /// `no_client_tools_means_no_placeholder_tools` 反向锁住。
     #[test]
     fn test_history_tools_added_to_tools_list() {
-        use super::super::types::Message as AnthropicMessage;
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        // 创建一个请求，历史中有工具使用，但 tools 列表为空
+        // 客户端本轮声明了 write，历史里却用过 read（本轮没再带上）
         let req = MessagesRequest {
             model: "claude-opus-5".to_string(),
             max_tokens: 1024,
@@ -2300,7 +2406,14 @@ mod tests {
             ],
             stream: false,
             system: None,
-            tools: None, // 没有提供工具定义
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "write".to_string(),
+                description: "write a file".to_string(),
+                input_schema: Default::default(),
+                cache_control: None,
+                max_uses: None,
+            }]),
             tool_choice: None,
             thinking: None,
             output_config: None,

@@ -469,6 +469,8 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 | 上游 `reasoningContent` "仅响应侧支持，请求 history 传入会 400" | Smithy 模型中该 shape 只有序列化器无反序列化器（input-only），实测回传成功 |
 | GPT 族 `maxInputTokens` 是 272,000（2026-07-29 首测所记） | 2026-08-10 复测为 **372,000**；旧值已作废。教训：`tokenLimits` 是上游随时可调的运行时数据，不是固化协议常量，跟窗口有关的换算出现偏差时先复测 `ListAvailableModels` |
 | "claude-opus-5 实测 0 次触发 XML 模式，所以留着 `<thinking>` 提取路径无害" | 结论本身没错，但**结论范围被悄悄放大**了：那次实测只测了 Claude。2026-08-10 实测 `gpt-5.6-sol` 会把含字面 `<thinking>` 的正文整段作为最终答案下发，该路径立刻误伤正文。教训：一个模型的实测结论不能推广到别的模型族；「实测 0 次触发」只说明**当时那个模型**不触发，不说明代码无害 |
+| "Kiro API 要求：历史消息中引用的工具必须在 `currentMessage.tools` 中有定义"（`create_placeholder_tool` 上方注释） | 2026-08-12 实测推翻：历史里带 `bash` 的 `tool_use` / `tool_result`、本轮**一个 tools 都不声明**，上游返回 200 并正常作答。该注释是无实测支撑的断言，却支撑着一处 §2.5 违规（给客户端没声明的工具补 `properties: {}` 空壳定义）。代价：`claude-opus-5` 认为 `bash` 可用却没有字段能装参数，把 `<invoke name="bash"><parameter name="command">…` 当正文打出来并自编一行命令输出 |
+| "客户端没启用 thinking，上游就不会下发思考文本"（`!thinking_enabled` 分支把 reasoning 当正文发的隐含前提） | 恰好相反。2026-08-12 单变量实测 `claude-opus-5`（同一问题只改 thinking 字段）：**不带** thinking 字段 → 上游回一段 summarized 思考；`thinking.type=adaptive` + `display=summarized` → 思考在独立 thinking 块（signature 848 字节）；`thinking.type=adaptive` **不带** `display` → 上游完全不回思考。即「不要思考」的请求反而拿到思考，代理再把它混进正文 |
 
 ---
 

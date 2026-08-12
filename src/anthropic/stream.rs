@@ -539,6 +539,11 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 客户端未启用 thinking 时被丢弃的 reasoning 文本累计字节数。
+    ///
+    /// 只在收尾时汇总告警一条。曾经每个 reasoning 分片各打一条 warn —— 上游一轮能发
+    /// 400 多个分片，日志瞬间被刷爆，真正的协议异常会被埋掉（§2.6）。
+    dropped_reasoning_bytes: usize,
     /// 上游下发的错误 / 异常事件（`(类型或错误码, 消息)`）。与 `tool_json_error` 同口径：
     /// 收尾时补发 Anthropic `error` 事件，上层据此把本次请求记为 error。
     ///
@@ -595,6 +600,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            dropped_reasoning_bytes: 0,
             upstream_failure: None,
         }
     }
@@ -963,12 +969,23 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
+        // 客户端没要思考（请求里没有 thinking 字段，或显式 disabled）时，上游仍会
+        // 下发 `reasoningContentEvent`：2026-08-12 实测 claude-opus-5 在**不带**
+        // thinking 字段时回一段 summarized 思考（反而带 `thinking.type=adaptive`
+        // 且不带 display 时完全不回）。
+        //
+        // 这里曾经把这段思考写进正文 delta。那是伪造上游从未发过的块 —— 思考与正文
+        // 是两个通道，客户端拿到的却是一个标着「回答」的块，它无从分辨。实测后果：
+        // OpenCode 的压缩（compaction 请求不带 thinking）把模型的内心独白当成摘要
+        // 存了下来（该轮正文为空，整篇摘要只剩独白，压缩后会话记忆即被污染）。
+        //
+        // 客户端没要，就不发。丢弃必须留痕（§2.3），但**不在这里**打日志：上游一轮能发
+        // 400 多个 reasoning 分片，逐片一条 warn 会把日志刷爆，真正的协议异常反而被埋掉
+        // （§2.6）。所以这里只累加字节数，由 `generate_final_events` 整轮汇总一条 warn，
+        // 且只报长度不报内容（§6）。
         if !self.thinking_enabled {
-            if let Some(text) = reasoning.text.as_deref()
-                && !text.is_empty()
-            {
-                self.output_tokens += estimate_tokens(text);
-                return self.create_text_delta_events(text);
+            if let Some(text) = reasoning.text.as_deref() {
+                self.dropped_reasoning_bytes += text.len();
             }
             return Vec::new();
         }
@@ -1170,6 +1187,14 @@ impl StreamContext {
 
         if self.is_thinking_block_open() {
             events.extend(self.close_open_thinking_block());
+        }
+
+        // 客户端没要思考却收到了 reasoning：整轮汇总一条，只报字节数不报内容（§6）。
+        if self.dropped_reasoning_bytes > 0 {
+            tracing::warn!(
+                bytes = self.dropped_reasoning_bytes,
+                "客户端未启用 thinking，本轮丢弃上游 reasoning 文本（不混入正文）"
+            );
         }
 
         // 上游只发了 reasoning、没发正文时，**原样如实转达**：响应里就只有 thinking 块，
@@ -2124,7 +2149,10 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    /// 回归锁：客户端没启用 thinking 时，上游的 reasoning 文本一律丢弃，**不许**
+    /// 混进正文。旧行为把它写成 text delta，客户端收到一个标着「回答」的块却装着
+    /// 模型的内心独白，OpenCode 的压缩摘要因此被污染（2026-08-12 实测）。
+    fn test_native_reasoning_text_is_dropped_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let mut all_events = ctx.generate_initial_events();
 
@@ -2139,7 +2167,8 @@ mod tests {
 
         assert_eq!(
             collect_text_content(&all_events),
-            "visible reasoning fallback"
+            "",
+            "reasoning 文本不许混入正文"
         );
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
