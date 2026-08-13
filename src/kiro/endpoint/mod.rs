@@ -81,6 +81,11 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_client_validation_error(body)
     }
 
+    /// 判断响应体是否明确表示图片数量超过上游限制。
+    fn is_image_count_exceeded(&self, body: &str) -> bool {
+        default_is_image_count_exceeded(body)
+    }
+
     /// 判断响应体是否表示上游网关超时。
     ///
     /// 524 通常来自 Cloudflare/边缘层，继续在同一次客户端调用里重试会把等待时间
@@ -185,6 +190,26 @@ pub fn default_is_gateway_timeout(body: &str) -> bool {
         && (lower.contains("status code")
             || lower.contains("gateway timeout")
             || lower.contains("server-side issue"))
+}
+
+/// 默认的图片数量超限判断逻辑。
+///
+/// Kiro 的实测响应使用精确 reason `IMAGE_COUNT_EXCEEDED`。仅匹配顶层或
+/// `error.reason` 中的这个结构化值，避免因错误文案碰巧提到图片数量而误删图片。
+pub fn default_is_image_count_exceeded(body: &str) -> bool {
+    const REASON: &str = "IMAGE_COUNT_EXCEEDED";
+    if !body.contains(REASON) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let top = value.get("reason").and_then(|value| value.as_str());
+    let nested = value.pointer("/error/reason").and_then(|value| value.as_str());
+    [top, nested]
+        .into_iter()
+        .flatten()
+        .any(|reason| reason == REASON)
 }
 
 /// 触发"客户端请求格式错误 → 立即终止、不重试"的精确 reason 取值集合
@@ -332,6 +357,28 @@ mod tests {
         assert!(default_is_gateway_timeout("524 Gateway Timeout"));
         assert!(!default_is_gateway_timeout(
             r#"{"message":"some unrelated field mentions 524 tokens"}"#
+        ));
+    }
+
+    #[test]
+    fn test_default_is_image_count_exceeded() {
+        assert!(default_is_image_count_exceeded(
+            r#"{"message":"too many inline media segments: 101 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#
+        ));
+        assert!(default_is_image_count_exceeded(
+            r#"{"error":{"reason":"IMAGE_COUNT_EXCEEDED"}}"#
+        ));
+        assert!(!default_is_image_count_exceeded(
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
+        ));
+        assert!(!default_is_image_count_exceeded(
+            r#"{"message":"too many images","reason":"OTHER"}"#
+        ));
+        assert!(!default_is_image_count_exceeded(
+            r#"{"message":"trace mentions IMAGE_COUNT_EXCEEDED","reason":"OTHER"}"#
+        ));
+        assert!(!default_is_image_count_exceeded(
+            "upstream error: IMAGE_COUNT_EXCEEDED"
         ));
     }
 

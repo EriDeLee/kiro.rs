@@ -72,6 +72,39 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// 返回历史消息和当前消息中的图片总数。
+    pub fn image_count(&self) -> usize {
+        let history_count = self
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(message) => Some(message.user_input_message.images.len()),
+                Message::Assistant(_) => None,
+            })
+            .sum::<usize>();
+        history_count + self.current_message.user_input_message.images.len()
+    }
+
+    /// 按会话时间顺序丢弃最早的一张图片。
+    pub fn remove_oldest_image(&mut self) -> bool {
+        for message in &mut self.history {
+            if let Message::User(message) = message
+                && !message.user_input_message.images.is_empty()
+            {
+                message.user_input_message.images.remove(0);
+                return true;
+            }
+        }
+
+        let current_images = &mut self.current_message.user_input_message.images;
+        if current_images.is_empty() {
+            false
+        } else {
+            current_images.remove(0);
+            true
+        }
+    }
 }
 
 /// 当前消息容器
@@ -447,5 +480,46 @@ mod tests {
         assert!(json.contains("\"conversationId\":\"conv-123\""));
         assert!(json.contains("\"agentTaskType\":\"vibe\""));
         assert!(json.contains("\"content\":\"Hello\""));
+    }
+
+    #[test]
+    fn remove_oldest_image_follows_conversation_order() {
+        let image = |name: &str| KiroImage::from_base64("png", name);
+        let history = vec![
+            Message::Assistant(HistoryAssistantMessage::new("first")),
+            Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new("old", "model")
+                    .with_images(vec![image("old-1"), image("old-2")]),
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: UserMessage::new("newer", "model")
+                    .with_images(vec![image("newer-1")]),
+            }),
+        ];
+        let mut state = ConversationState::new("conv")
+            .with_history(history)
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("current", "model")
+                    .with_images(vec![image("current-1")]),
+            ));
+
+        assert_eq!(state.image_count(), 4);
+        for expected_first in ["old-2", "newer-1", "current-1"] {
+            assert!(state.remove_oldest_image());
+            let first = state
+                .history
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(message) => message.user_input_message.images.first(),
+                    Message::Assistant(_) => None,
+                })
+                .chain(state.current_message.user_input_message.images.first())
+                .next()
+                .unwrap();
+            assert_eq!(first.source.bytes, expected_first);
+        }
+        assert!(state.remove_oldest_image());
+        assert!(!state.remove_oldest_image());
+        assert_eq!(state.image_count(), 0);
     }
 }

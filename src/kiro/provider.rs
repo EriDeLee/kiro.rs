@@ -17,6 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -495,17 +496,30 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
+        // 图片数量上限由上游模型决定，只在上游明确拒绝后才逐张删除最旧图片。
+        // 图片重试有请求内图片数这一自然上限，不占用网络/限流的重试预算。
+        let mut retryable_request = serde_json::from_str::<KiroRequest>(request_body).ok();
+        let image_retry_budget = retryable_request
+            .as_ref()
+            .map_or(0, |request| request.conversation_state.image_count());
+        let mut image_retries = 0usize;
+        let mut effective_request_body = request_body.to_string();
+
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        for network_attempt in 0..max_retries.saturating_add(image_retry_budget) {
+            let attempt = network_attempt - image_retries;
+            if attempt >= max_retries {
+                break;
+            }
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
+                        sink, network_attempt, 0, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
                     if is_rate_limit_error(&e) {
@@ -529,7 +543,7 @@ impl KiroProvider {
                 Ok(e) => e,
                 Err(e) => {
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
+                        sink, network_attempt, ctx.id, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
                     last_error = Some(e);
@@ -548,7 +562,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(&effective_request_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!(
@@ -623,7 +637,7 @@ impl KiroProvider {
                         e
                     );
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, None,
+                        sink, network_attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
@@ -643,7 +657,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
                 );
                 self.token_manager
@@ -657,6 +671,31 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
+            if endpoint.is_image_count_exceeded(&body)
+                && let Some(request) = retryable_request.as_mut()
+                && request.conversation_state.remove_oldest_image()
+            {
+                effective_request_body = serde_json::to_string(request)
+                    .map_err(|e| anyhow::anyhow!("重建图片超限重试请求失败: {}", e))?;
+                image_retries += 1;
+                let remaining = request.conversation_state.image_count();
+                tracing::warn!(
+                    "上游报告图片数超限，已丢弃最早图片并重试（剩余 {} 张）",
+                    remaining
+                );
+                Self::emit_attempt(
+                    sink,
+                    network_attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
+                );
+                continue;
+            }
+
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
@@ -667,7 +706,7 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
                 );
 
@@ -697,7 +736,7 @@ impl KiroProvider {
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(400),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
@@ -719,7 +758,7 @@ impl KiroProvider {
                         body
                     );
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, Some(403),
+                        sink, network_attempt, ctx.id, endpoint_name, Some(403),
                         outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
                     );
 
@@ -753,7 +792,7 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::AUTH_FAILED, Some(&body), attempt_start,
                 );
 
@@ -820,7 +859,7 @@ impl KiroProvider {
                         group,
                     );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(429),
                     outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
                 );
                 // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
@@ -852,7 +891,7 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
@@ -869,7 +908,7 @@ impl KiroProvider {
                 );
                 Self::emit_attempt(
                     sink,
-                    attempt,
+                    network_attempt,
                     ctx.id,
                     endpoint_name,
                     Some(status.as_u16()),
@@ -891,7 +930,7 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::TRANSIENT, Some(&body), attempt_start,
                 );
                 last_error = if let Some(rate_limit) = rate_limit_error {
@@ -922,7 +961,7 @@ impl KiroProvider {
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
@@ -937,7 +976,7 @@ impl KiroProvider {
                 body
             );
             Self::emit_attempt(
-                sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                sink, network_attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                 outcome::UNKNOWN, Some(&body), attempt_start,
             );
             last_error = Some(anyhow::anyhow!(
@@ -1143,5 +1182,177 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+#[cfg(test)]
+mod image_retry_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use serde_json::{Value, json};
+
+    use crate::kiro::model::requests::{
+        conversation::{
+            ConversationState, CurrentMessage, HistoryUserMessage, KiroImage, Message,
+            UserInputMessage, UserMessage,
+        },
+        kiro::KiroRequest,
+    };
+
+    struct MockEndpoint {
+        url: String,
+    }
+
+    impl KiroEndpoint for MockEndpoint {
+        fn name(&self) -> &'static str {
+            "image-retry-test"
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn decorate_api(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn decorate_mcp(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    async fn image_limit_once(
+        State(requests): State<Arc<Mutex<Vec<Value>>>>,
+        body: Bytes,
+    ) -> Response {
+        let request = serde_json::from_slice(&body).expect("测试请求应为 JSON");
+        let mut requests = requests.lock();
+        requests.push(request);
+        if requests.len() == 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "message": "too many inline media segments: 2 exceeds limit 1",
+                    "reason": "IMAGE_COUNT_EXCEEDED"
+                })),
+            )
+                .into_response();
+        }
+        StatusCode::OK.into_response()
+    }
+
+    #[tokio::test]
+    async fn upstream_image_limit_drops_oldest_image_and_retries() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("kiro_rs=warn")
+            .with_test_writer()
+            .try_init();
+
+        let encoded = "aW1hZ2U=".to_string();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/generateAssistantResponse", post(image_limit_once))
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = crate::model::config::Config::default();
+        config.default_endpoint = "image-retry-test".to_string();
+        let credential = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("test-key".to_string()),
+            machine_id: Some("00000000-0000-4000-8000-000000000000".to_string()),
+            endpoint: Some("image-retry-test".to_string()),
+            ..KiroCredentials::default()
+        };
+        let token_manager = Arc::new(
+            MultiTokenManager::new(config, vec![credential], None, None, true).unwrap(),
+        );
+        let endpoint: Arc<dyn KiroEndpoint> = Arc::new(MockEndpoint {
+            url: format!("http://{address}/generateAssistantResponse"),
+        });
+        let provider = KiroProvider::with_proxy(
+            token_manager,
+            None,
+            HashMap::from([("image-retry-test".to_string(), endpoint)]),
+            "image-retry-test".to_string(),
+        );
+
+        let history = vec![Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new("old", "claude-opus-5")
+                .with_images(vec![KiroImage::from_base64("jpeg", encoded.clone())]),
+        })];
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("image-retry-test")
+                .with_history(history)
+                .with_current_message(CurrentMessage::new(
+                    UserInputMessage::new("current", "claude-opus-5")
+                        .with_images(vec![KiroImage::from_base64("png", encoded)]),
+                )),
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+
+        let result = provider.call_api(&body, None, None).await.unwrap();
+        assert_eq!(result.response.status(), StatusCode::OK);
+        server.abort();
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2, "应在图片超限后仅重试一次");
+        assert_eq!(
+            requests[0]["conversationState"]["history"][0]["userInputMessage"]["images"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            requests[0]["conversationState"]["currentMessage"]["userInputMessage"]["images"]
+                [0]["format"],
+            "png"
+        );
+        assert!(
+            requests[1]["conversationState"]["history"][0]["userInputMessage"]
+                .get("images")
+                .is_none(),
+            "第二次请求应丢弃历史中的最早图片"
+        );
+        assert_eq!(
+            requests[1]["conversationState"]["currentMessage"]["userInputMessage"]["images"]
+                [0]["format"],
+            "png",
+            "当前消息中的较新图片应保留"
+        );
     }
 }
