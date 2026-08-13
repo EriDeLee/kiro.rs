@@ -19,6 +19,7 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
+import { SecretInput } from '@/components/ui/secret-input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
@@ -115,7 +116,8 @@ export function EditCredentialDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
+        {/* autoComplete="off"：理由同 add-credential-dialog */}
+        <form onSubmit={handleSubmit} autoComplete="off">
           <div className="space-y-4 py-4">
             {/* 邮箱 */}
             <div className="space-y-2">
@@ -224,9 +226,9 @@ export function EditCredentialDialog({
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
                 />
-                <Input
+                <SecretInput
                   id="proxyPassword"
-                  type="password"
+                  secretLabel="代理密码"
                   placeholder="代理密码（留空不修改）"
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}

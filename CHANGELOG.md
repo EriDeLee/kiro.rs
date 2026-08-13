@@ -55,6 +55,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   - 与 429 的唯一区别：**绝不把当前请求范围冷却成空池。** 429 风控只针对个别账号，而 `INVALID_MODEL_ID` 可能对所有凭据同时成立（请求了一个当前谁都取不到的模型）；无条件冷却会让一次这样的请求把整池按凭据冷却，连**其它模型**的请求也一起打死。故作用域内已无其它候选时跳过冷却，只让本次请求失败。
   - 判据只认结构化 `reason`，不做文案匹配：那句 `Invalid model ID. Please select a different model to continue.` 是完全可能出现在模型正文里的普通英文（用户就可能在问这条报错是什么意思），文案匹配会把一次正常回答变成冷却一个健康凭据。其余四种已观测的 400（`IMAGE_COUNT_EXCEEDED`、`THINKING_SIGNATURE_INVALID`、`REQUEST_BODY_INVALID`、`CONTENT_LENGTH_EXCEEDS_THRESHOLD`）根因都在请求本身，保持立即失败，回归锁逐条挡住误判。
   - 顺带修掉一句说谎的注释：原先称首次请求那趟 400「随即被缓存修正」，而全仓没有任何地方在 400 后刷新模型缓存（`refresh_model_cache_for` 只有 `cached_or_refresh_models_for` 与两个 Admin 接口三个调用点）。
+- **填凭据时密码管理器不再乱填、也不再追问「要不要保存密码」。** Refresh Token、Kiro API Key、Client Secret、代理密码原先都是 `type="password"`，而两个凭据弹窗又都是真 `<form onSubmit>`，于是浏览器与各家扩展把它当登录表单：把别的站点保存过的账密灌进来，每次提交再追问一次保存。这些字段装的是**上游凭据**，不是本站登录凭据，被当成后者纯属误伤。
+  - 新增 `SecretInput`：`type` 恒为 `text`，遮罩改由 CSS `-webkit-text-security` 完成，并带一个眼睛按钮可点开核对（长 token 遮住后无法确认粘贴对不对）。不用 `type="password"` 是关键 —— Chrome 判定「这是不是登录表单」主要看有没有密码框，不看 `autocomplete`，只要还是密码框保存提示就关不掉。
+  - `Input` 组件默认加上各家密码管理器的退出属性（1Password / LastPass / Bitwarden / Proton Pass / Dashlane，均为自定义 `data-*`）与 `autoComplete="off"`，新增 `allowPasswordManager` 供显式开启。默认关闭而非默认开启，是为了让以后新增的机密字段自动继承正确行为：漏写属性的后果变成「少一个便利」，而不是「又一个字段被乱填」。全站唯一显式开启的是登录页的管理密钥 —— 那里用户通常确实希望被记住。
+  - 遮罩**不是**安全边界：`-webkit-text-security` 在 Firefox 132 之前不支持，那些浏览器上会明文显示。真正的保护仍在后端 —— 凭据列表接口从不回传这些值，只给哈希与掩码。
 - **Admin 面板的排序字段与升降序现在会持久化。** 展示形态（`credentialView`）与每页数量（`credentialPageSize`）一直存在 localStorage，排序却只活在组件 state 里，刷新或重新登录就悄悄回到「手动顺序」—— 用户以为自己选的排序还在，看到的其实是服务端顺序。现在写 `credentialSortField` / `credentialSortDir` 两个键，读回时按白名单校验、认不出的值回落 `manual`（否则一个比较器不认识的字段会让排序静默失效）；`SortField` / `SortDir` 的取值域随之移到 `storage.ts`，与那份白名单同源，避免两处各写一遍走岔。`applySort` 改为先算出下一组字段/方向再一次落盘 —— 用函数式 `setState` 取不到新值，落盘会滞后一次点击。
 
 ## [0.7.5] - 2026-08-05

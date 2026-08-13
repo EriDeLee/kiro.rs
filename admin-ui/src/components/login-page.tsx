@@ -59,8 +59,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <form onSubmit={handleSubmit} className="space-y-3">
             <div className="relative">
               <Lock className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              {/*
+                全站唯一该让密码管理器接管的字段：这里填的是本站登录凭据，
+                用户通常希望被记住。`Input` 默认关闭密码管理器，故此处显式开启。
+              */}
               <Input
                 type="password"
+                allowPasswordManager
+                autoComplete="current-password"
                 placeholder="登录API密钥"
                 value={apiKey}
                 onChange={(e) => {

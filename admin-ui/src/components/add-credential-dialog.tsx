@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { SecretInput } from '@/components/ui/secret-input'
 import {
   Select,
   SelectTrigger,
@@ -141,7 +142,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           <DialogTitle>添加凭据</DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+        {/*
+          autoComplete="off"：本表单填的是上游凭据，不是本站登录凭据。
+          单靠它挡不住密码管理器（各字段的退出属性在 Input 里默认加上，
+          机密字段另用 SecretInput 避开 type="password"），但表单级声明是前提。
+        */}
+        <form onSubmit={handleSubmit} autoComplete="off" className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* 认证方式 */}
             <div className="space-y-2">
@@ -171,9 +177,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <label htmlFor="kiroApiKey" className="text-sm font-medium">
                   Kiro API Key <span className="text-red-500">*</span>
                 </label>
-                <Input
+                <SecretInput
                   id="kiroApiKey"
-                  type="password"
+                  secretLabel="Kiro API Key"
                   placeholder="格式: ksk_xxxxxxxx"
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
@@ -188,9 +194,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>
                 </label>
-                <Input
+                <SecretInput
                   id="refreshToken"
-                  type="password"
+                  secretLabel="Refresh Token"
                   placeholder="请输入 Refresh Token"
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
@@ -246,9 +252,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <label htmlFor="clientSecret" className="text-sm font-medium">
                     Client Secret <span className="text-red-500">*</span>
                   </label>
-                  <Input
+                  <SecretInput
                     id="clientSecret"
-                    type="password"
+                    secretLabel="Client Secret"
                     placeholder="请输入 Client Secret"
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
@@ -398,9 +404,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
                 />
-                <Input
+                <SecretInput
                   id="proxyPassword"
-                  type="password"
+                  secretLabel="代理密码"
                   placeholder="代理密码"
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
