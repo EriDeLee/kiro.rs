@@ -19,6 +19,17 @@ pub enum AdminServiceError {
     /// 上游服务调用失败（网络、API 错误等）
     UpstreamError(String),
 
+    /// 上游失败原因已被识别，可安全展示给管理员。
+    ///
+    /// 与 [`Self::UpstreamError`] 的区别：那个的原始报文可能含 AWS 账号 ID /
+    /// request-id，一律不外发（见本文件的 `upstream_error_response_does_not_expose_raw_body`）。
+    /// 这里的 `public` 只允许取固定字面量，原始报文仍然只进日志 —— 面板因此能
+    /// 显示「账号被封禁」这种可操作的原因，而不是一句无信息量的通用失败。
+    UpstreamRejected {
+        public: &'static str,
+        detail: String,
+    },
+
     /// 上游明确返回限流，可选携带合法 Retry-After。
     RateLimited { retry_after: Option<String> },
 
@@ -36,6 +47,7 @@ impl fmt::Display for AdminServiceError {
                 write!(f, "凭据不存在: {}", id)
             }
             AdminServiceError::UpstreamError(_) => write!(f, "上游服务请求失败"),
+            AdminServiceError::UpstreamRejected { public, .. } => write!(f, "{}", public),
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
@@ -50,7 +62,9 @@ impl AdminServiceError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
-            AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
+            AdminServiceError::UpstreamError(_) | AdminServiceError::UpstreamRejected { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
@@ -61,7 +75,10 @@ impl AdminServiceError {
     pub fn into_response(self) -> AdminErrorResponse {
         match &self {
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
-            AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
+            AdminServiceError::UpstreamError(_)
+            | AdminServiceError::UpstreamRejected { .. } => {
+                AdminErrorResponse::api_error(self.to_string())
+            }
             AdminServiceError::RateLimited { .. } => {
                 AdminErrorResponse::rate_limit(self.to_string())
             }
@@ -75,8 +92,15 @@ impl AdminServiceError {
     }
 
     pub fn into_http_response(self) -> Response {
-        if let AdminServiceError::UpstreamError(message) = &self {
-            tracing::warn!(error = %message, "Admin 上游服务请求失败");
+        match &self {
+            AdminServiceError::UpstreamError(message) => {
+                tracing::warn!(error = %message, "Admin 上游服务请求失败");
+            }
+            // 原始报文只进日志；外发的只有 `public` 那句固定文案
+            AdminServiceError::UpstreamRejected { public, detail } => {
+                tracing::warn!(reason = %public, error = %detail, "Admin 上游明确拒绝");
+            }
+            _ => {}
         }
         let retry_after = match &self {
             AdminServiceError::RateLimited { retry_after } => retry_after.clone(),
@@ -110,6 +134,30 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "rate_limit_error");
         assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    /// `UpstreamRejected` 只外发固定文案，原始报文仍不出现在响应体里。
+    ///
+    /// 这是「让面板显示真实原因」与「不泄露 AWS 账号 ID / request-id」的分界：
+    /// 展示的是被识别出的原因，不是上游报文本身。
+    #[tokio::test]
+    async fn upstream_rejected_exposes_only_the_public_reason() {
+        let detail = "权限不足，无法获取可用模型: 403 Forbidden \
+             {\"message\":\"Your User ID (736048611274) is temporarily suspended\"}";
+        let response = AdminServiceError::UpstreamRejected {
+            public: "账号被封禁",
+            detail: detail.to_string(),
+        }
+        .into_http_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("账号被封禁"), "应给出可操作的具体原因");
+        assert!(!body.contains("736048611274"), "不得泄露上游账号 ID");
+        assert!(!body.contains("Forbidden"), "不得回显上游原始报文");
     }
 
     #[tokio::test]

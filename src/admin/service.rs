@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
+use crate::kiro::endpoint;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
@@ -1905,7 +1906,55 @@ impl AdminService {
             );
         }
 
-        // 3. 上游服务错误特征：HTTP 响应错误或网络错误
+        // 4. 上游已明确说明原因：优先复用数据面那三个判据，避免同一语义两套字符串。
+        //    错误串形如 "{前缀}: {status} {body}"（token_manager 的 bail!），
+        //    body 原样在内，所以这些判据可直接作用于它。
+        //    文案保持极简：面板要的是「下一步做什么」，不是 AWS 的整段报文。
+        if endpoint::default_is_account_suspended(&msg) {
+            return AdminServiceError::UpstreamRejected {
+                public: "账号被封禁",
+                detail: msg,
+            };
+        }
+        if endpoint::default_is_monthly_request_limit(&msg) {
+            return AdminServiceError::UpstreamRejected {
+                public: "额度已用尽",
+                detail: msg,
+            };
+        }
+        if endpoint::default_is_bearer_token_invalid(&msg) {
+            return AdminServiceError::UpstreamRejected {
+                public: "Token 已失效",
+                detail: msg,
+            };
+        }
+
+        // 5. body 没带可识别标记时，退到 token_manager 自己按 HTTP 状态给出的前缀。
+        //
+        //    这一层是必要的而非锦上添花：REST 端点对**被封账号**只回一句通用的
+        //    `User is not authorized to make this call.`，既无 `TEMPORARILY_SUSPENDED`
+        //    也无封禁文案（2026-08-13 实测），上面三条判据必然全部落空。只有流式端点
+        //    才吐详细原因。所以这里能诚实说出的就是「上游拒绝了」，**不能**推断成
+        //    「账号被封禁」—— 403 也可能是权限/区域问题，猜错比不说更糟。
+        //    账号是否真被封由数据面写进 disabledReason，卡片徽标另有显示。
+        //
+        //    两侧都是固定字面量，不带上游报文，故不存在泄露账号 ID / request-id。
+        const UPSTREAM_PREFIX_MESSAGES: &[(&str, &str)] = &[
+            ("认证失败", "Token 已失效"),
+            ("权限不足", "上游拒绝访问"),
+            ("服务器错误", "上游服务异常"),
+        ];
+        if let Some((_, public)) = UPSTREAM_PREFIX_MESSAGES
+            .iter()
+            .find(|(prefix, _)| msg.starts_with(prefix))
+        {
+            return AdminServiceError::UpstreamRejected {
+                public,
+                detail: msg,
+            };
+        }
+
+        // 6. 其余上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error = msg.contains("获取使用额度失败") ||
             msg.contains("获取可用模型失败") ||
             msg.contains("设置用户偏好失败") ||
@@ -1930,7 +1979,7 @@ impl AdminService {
         if is_upstream_error {
             AdminServiceError::UpstreamError(msg)
         } else {
-            // 4. 默认归类为内部错误（本地验证失败、配置错误等）
+            // 7. 默认归类为内部错误（本地验证失败、配置错误等）
             // 包括：缺少 refreshToken、refreshToken 已被截断、无法生成 machineId 等
             AdminServiceError::InternalError(msg)
         }

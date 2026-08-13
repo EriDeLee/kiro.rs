@@ -120,14 +120,16 @@ pub struct Config {
     #[serde(default = "default_account_rpm_limit")]
     pub account_rpm_limit: u32,
 
-    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    /// 是否识别 403 账号封禁响应并立即禁用凭据（默认 true）。
     ///
-    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
-    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
-    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    /// 开启后：某凭据收到 403 且响应体命中封禁判据时，立即标记为 `Suspended`
+    /// 并禁用。这类凭据**不参与自愈**，需人工联系客服核实后手动重置，从根上
+    /// 打断持续 403 死循环（issue #51）。
     ///
-    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
-    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    /// 判据本身见 [`crate::kiro::endpoint::default_is_account_suspended`]：优先认
+    /// 结构化 `reason == TEMPORARILY_SUSPENDED`，`reason` 缺失时才退回文案匹配。
+    /// 两层都要求高特异性，不影响普通 403（权限/WAF/区域抖动），后者仍按既有
+    /// `report_failure` 累计路径处理。关闭后：完全回退旧行为。
     #[serde(default = "default_suspended_detection_enabled")]
     pub suspended_detection_enabled: bool,
 

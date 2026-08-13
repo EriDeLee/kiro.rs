@@ -242,6 +242,18 @@ graceful shutdown 失效。
 本机尤其重要 —— 生产实例（`/opt/kiro-rs-ktool/kiro-rs`）与测试实例
 （`ktool-target2/release/kiro-rs`）同名，靠名字区分会误杀生产。
 
+**停止本服务必须走 graceful shutdown，禁止强杀。** Linux 用 `SIGTERM`，Windows 不要用
+`Stop-Process -Force`（等价于 `TerminateProcess`，不执行任何信号处理器）。理由已写在
+§2.3：`save_stats_debounced` 有 30 秒去抖窗口，窗口内只标脏不落盘，靠 shutdown 时的
+`flush_stats()` 兜底，而 `Drop` 在生产中不执行。强杀 = 丢最多 30 秒用量计数。
+2026-08-13 实测：强杀 PID 后 `kiro_stats.json` 停在杀之前的最后一次去抖落盘时刻，
+之后的计数无声消失；`traces.db` 靠 SQLite WAL 自恢复，未损坏。
+
+**Windows 上重新链接 exe 需要先停进程**（`error: failed to remove file ...\kiro-rs.exe`）。
+这不是"顺手停一下"的理由 —— 用 `cargo check --release --all-targets` 就能完整验证编译，
+`cargo test` 更是连编带跑，两者都不碰那个被占用的 exe。**只有在明确获得停服授权后
+才链接。**
+
 ---
 
 ### 3.10 全仓审计：把整个仓库交给模型自查
@@ -309,6 +321,8 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 | `"    }\n"` 能定位函数结尾 | 匹配到内层 `match` 的闭合括号 | 删函数留下 4 行残骸，`unexpected closing delimiter` |
 | 优先级高的凭据就该被选中 | priority 模式下 `current_id` 是**粘性**的 | 写出错误断言，测试失败 |
 | 同族模型 effort 枚举一致 | 恰好成立 | 但当时只是推断，未实测就写进了代码分支 |
+| 日志相邻行属于同一凭据（"已切换到凭据 #8" 之后那条 403 就是 #8 的） | 两个并发请求的重试日志交错，且 `API 请求失败（尝试 N/4）` 那行**不带凭据 id** | 断言 #8/#9 也吐过封禁文案，据此说"封禁判据修好就能覆盖它们"。trace DB 一查：#8/#9 全部 15~17 次失败**只**吐 `bearer token invalid`，从没吐过封禁文案 |
+| `ListAvailableModels` 对被封账号会带封禁文案 | 只回通用的 `User is not authorized to make this call.`，无 `TEMPORARILY_SUSPENDED` 也无封禁文案 | 照此写的 Admin 错误分类三条判据全部落空，面板照旧显示通用失败。**而推翻它的证据（那条日志原文）我几步前刚亲手引用过** |
 
 前两条是 §3.9 / §3.5 已记录的坑，写下之后自己又踩。规律：**改动前先读实现确认语义，
 断言失败时先怀疑自己的假设而不是代码**。第三条尤其典型 —— 测试挂了，挂的是我新加的
@@ -316,6 +330,17 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 同理，把「推断」写进代码分支前要标注它未经实测，或者干脆先实测。第四条虽然结果正确，
 但当时若不成立，按族分流就是错的。
+
+后两条（2026-08-13）暴露了一个比"没查"更糟的形态：**证据已经在上下文里，却没被用来
+约束下一步的代码**。第六条尤其难看 —— 推翻假设的那行日志是我自己引用来做诊断的，
+几步之后写分类逻辑时又按相反的假设去写。所以规矩要再收一格：
+
+- **凭据 / 会话 / 请求级的归属，只认日志行里显式带的 id。** 靠相邻行推断归属在并发
+  重试下必然出错。要判"某凭据到底收到过什么"，查 trace DB 的 `trace_attempts`
+  （`credential_id` + `error_snippet`），那是按 attempt 落库的，不会串台。
+- **动手写判据前，先把该判据要匹配的真实字节取出来贴到眼前**，而不是凭对上游行为的
+  印象。本轮正确的做法是先 `?failedAttemptCredentialId=<id>&onlyFailed=true` 去重出
+  全部 body，再写代码 —— 那一步做了之后，"两种 body 要分到两种处置"一眼就看出来了。
 
 ---
 
@@ -422,6 +447,59 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 **Builder ID 账号**：不支持 `ListAvailableProfiles`（固定 403 `AWS Builder ID is not supported for this operation.`），必须用占位 profileArn 并跳过探测；MCP（WebSearch）路径要用 `streaming_profile_arn()` 而非 `effective_profile_arn()`，否则 400 `profileArn is required`。
 
+**被封账号（`TEMPORARILY_SUSPENDED`）在三个端点上的表现完全不同**（2026-08-13 实测，
+17 个凭据、trace DB 去重）。排查"某功能坏了"之前先看这张表，否则会把账号问题当成功能 BUG：
+
+| 端点 | 被封账号的返回 | 能否据此判定封禁 |
+|---|---|---|
+| `/generateAssistantResponse`（流式） | 403 + `"reason":"TEMPORARILY_SUSPENDED"` + 完整文案 | **能**，只有这里说真话 |
+| `ListAvailableModels`（REST GET） | 403 `{"message":"User is not authorized to make this call.","reason":null}` | **不能**，与权限/区域问题无法区分 |
+| `getUsageLimits`（REST GET） | **200**，订阅等级与余额照常返回 | 不能，且会造成"账号是好的"的错觉 |
+
+第三行是最容易误导人的：Admin 面板的等级徽标和余额都来自 `getUsageLimits`，所以一个
+被封账号在面板上看起来完全健康，只有模型列表和实际调用会失败。**因此"余额能查"永远
+不能作为凭据可用的证据。**
+
+推论：任何"这个账号为什么不能用"的判断都必须以流式端点的响应为准；REST 端点的 403
+只能诚实地报成"上游拒绝访问"，不能推断成封禁（`admin/service.rs` 的
+`classify_balance_error` 按此实现，注释里写明了原因）。
+
+**`400 INVALID_MODEL_ID` 是临时状态，不是"订阅不含该模型"。**
+
+上游对「该凭据此刻取不到这个模型」返回：
+
+```
+400 {"message":"Invalid model ID. Please select a different model to continue.",
+     "reason":"INVALID_MODEL_ID"}
+```
+
+两条来源：trace DB 取样确认它真实发生过 13 次（凭据 #4 / #5，opus-5 十二次 + sonnet-5
+一次），且当时 13 条**全部** `finalStatus=error` —— 整条客户端请求直接失败、没有换号；
+以及使用者的现场观察：**订阅确实包含该模型的账号也会收到它，数小时后同一模型又能正常
+请求**（后者是现场观察，未做单变量复现）。
+
+因此有一条硬约束：**绝不可据此把凭据对该模型标记为不支持。** 那等于把已删除的
+`supports_opus()` 硬否决换个形式加回来 —— 同样是硬否决、同样不自愈，只是触发条件从
+"订阅标题含 FREE"变成"上游抖了一下"。正确处置是**短时冷却 + 换号**，靠冷却到期自动恢复
+（`report_model_unavailable_for_request`）。
+
+`Unsupported` 这个判定只有一个合法来源：真实 `ListAvailableModels` 清单里没有该
+model_id（`cached_model_support`）。别的信号都不够格。
+
+还有两个连带约束，都在 `report_model_unavailable_for_request` 里锁着：
+
+- **不能累计 `failure_count`**（只加 `total_failure_count`，与 429 冷却一致）。累计的话
+  三次抖动就把一个健康凭据禁用了。
+- **不能把作用域冷却成空池**。429 风控只针对个别账号，而 `INVALID_MODEL_ID` 可能对所有
+  凭据同时成立（请求了一个当前谁都取不到的模型）；无条件冷却会让一次这样的请求把整池
+  按凭据冷却掉，连**其它模型**的请求也一起打死。故只剩一个候选时跳过冷却。
+
+最后：`INVALID_MODEL_ID` 是**唯一**换凭据可能成功的 400。其余已观测到的 400
+（`IMAGE_COUNT_EXCEEDED`、`THINKING_SIGNATURE_INVALID`、`REQUEST_BODY_INVALID`、
+`CONTENT_LENGTH_EXCEEDS_THRESHOLD`）根因都在请求本身，必须保持立即失败，不要顺手
+一起改成故障转移。判据只认结构化 `reason`，不认文案 —— 那句 message 是普通英文，
+用户完全可能在对话里问它是什么意思，文案匹配会把一次正常回答变成冷却一个健康凭据。
+
 ### 4.2 客户端 SDK 线格式
 
 结论来自 npm 包源码 + 真 SDK 打 mock server 抓包。取样版本 `@ai-sdk/anthropic@3.0.82`、`@ai-sdk/openai@3.0.84`（`effort` 位置额外回溯了 2.0.91~4.0.23 共 11 个版本）。
@@ -471,6 +549,17 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 | "claude-opus-5 实测 0 次触发 XML 模式，所以留着 `<thinking>` 提取路径无害" | 结论本身没错，但**结论范围被悄悄放大**了：那次实测只测了 Claude。2026-08-10 实测 `gpt-5.6-sol` 会把含字面 `<thinking>` 的正文整段作为最终答案下发，该路径立刻误伤正文。教训：一个模型的实测结论不能推广到别的模型族；「实测 0 次触发」只说明**当时那个模型**不触发，不说明代码无害 |
 | "Kiro API 要求：历史消息中引用的工具必须在 `currentMessage.tools` 中有定义"（`create_placeholder_tool` 上方注释） | 2026-08-12 实测推翻：历史里带 `bash` 的 `tool_use` / `tool_result`、本轮**一个 tools 都不声明**，上游返回 200 并正常作答。该注释是无实测支撑的断言，却支撑着一处 §2.5 违规（给客户端没声明的工具补 `properties: {}` 空壳定义）。代价：`claude-opus-5` 认为 `bash` 可用却没有字段能装参数，把 `<invoke name="bash"><parameter name="command">…` 当正文打出来并自编一行命令输出 |
 | "客户端没启用 thinking，上游就不会下发思考文本"（`!thinking_enabled` 分支把 reasoning 当正文发的隐含前提） | 恰好相反。2026-08-12 单变量实测 `claude-opus-5`（同一问题只改 thinking 字段）：**不带** thinking 字段 → 上游回一段 summarized 思考；`thinking.type=adaptive` + `display=summarized` → 思考在独立 thinking 块（signature 848 字节）；`thinking.type=adaptive` **不带** `display` → 上游完全不回思考。即「不要思考」的请求反而拿到思考，代理再把它混进正文 |
+| "封禁判据只认文案就够了：同时含 `suspended` 与 `locked your account` 两个高特异短语"（`default_is_account_suspended` 的原实现 + 注释 + 一条把该形态锁成"不是封禁"的负向断言 `assert!(!default_is_account_suspended("your account is suspended"))`） | 2026-08-13 上游把文案改成 `We detected unusual user activity and locked it as a security precaution` —— `locked your account` 不再出现，判据静默返回 false。后果链：被封凭据退化成普通 403 → 按 `TooManyFailures` 禁用 → 而自愈**只**复活 `TooManyFailures` → 每 5 分钟复活再被 403 打死，issue #51 的死循环以换文案的形式复发；6 个凭据各白打 15 次上游，且"反复重试被封账号"本身就是上游判定 unusual activity 的行为。修复：改为优先认结构化 `reason == TEMPORARILY_SUSPENDED`，文案只作 `reason` 缺失时的兜底 |
+
+最后一条给出一条通用判据，凡是要从上游错误里认出某种语义时都适用：
+**结构化字段（`reason`、错误码）是稳的，散文文案是不稳的。** 已有的 402 额度判据
+（`QUOTA_EXHAUSTED_REASONS`）从一开始就只认 `reason`，两年没坏过；同一文件里的封禁
+判据只认文案，一次文案微调就失效。新增此类判据时先找结构化字段，找不到再退回文案，
+并在注释里写明"此处无结构化字段可用"。
+
+更值得记住的是**失效方式**：判据返回 false 不会报错、不会留日志，它只是让凭据走进另一条
+本来正确的路径（累计失败 → 禁用 → 自愈）。所以这类 BUG 的症状不是"报错了"，而是
+"某个终态标签用错了"，只能靠对比 `disabledReason` 与上游实际 body 发现。
 
 ---
 

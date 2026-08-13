@@ -290,6 +290,10 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 刷新**成功**过的凭据。必须与 `force_refreshed` 分开：后者也包含刷新
+        // 失败的凭据（它承担"每凭据只试一次刷新"的职责），用它判终态会把一次
+        // OIDC 网络抖动误判成永久失效，而终态是不参与自愈的。
+        let mut refreshed_ok: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
@@ -407,6 +411,22 @@ impl KiroProvider {
                     continue;
                 }
 
+                // 已成功换过新 token 仍被拒绝：不可自动恢复的终态，理由同流式路径
+                if endpoint.is_bearer_token_invalid(&body) && refreshed_ok.contains(&ctx.id) {
+                    let has_available = self
+                        .token_manager
+                        .report_token_rejected_for_request(ctx.id, None, group);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（token 刷新后仍被拒绝）: {} {}",
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -414,6 +434,7 @@ impl KiroProvider {
                     if Self::handle_force_refresh_result(
                         self.token_manager.force_refresh_token_for(ctx.id).await,
                     )? {
+                        refreshed_ok.insert(ctx.id);
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -494,6 +515,8 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 见 MCP 路径同名变量的说明：刷新失败不等于凭据永久失效。
+        let mut refreshed_ok: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 图片数量上限由上游模型决定，只在上游明确拒绝后才逐张删除最旧图片。
@@ -733,7 +756,44 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 + INVALID_MODEL_ID：唯一一种"换个凭据就可能成功"的 400。
+            //
+            // 上游对「该凭据此刻取不到这个模型」返回 400，与请求格式错误同码不同因。
+            // 这是**临时**状态：已观察到订阅确实含该模型的账号也会收到它，数小时后恢复。
+            // 所以只做短时冷却 + 换号，绝不把凭据对该模型永久标记为不支持。
+            if status.as_u16() == 400 && endpoint.is_model_unavailable(&body) {
+                let cooldown_secs = self
+                    .token_manager
+                    .get_account_throttle_cooldown_secs()
+                    .max(1);
+                let remaining = self.token_manager.report_model_unavailable_for_request(
+                    ctx.id,
+                    std::time::Duration::from_secs(cooldown_secs),
+                    model.as_deref(),
+                    group,
+                );
+                Self::emit_attempt(
+                    sink, network_attempt, ctx.id, endpoint_name, Some(400),
+                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                );
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据当前均取不到该模型）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（该凭据当前取不到该模型）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 其余 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 Self::emit_attempt(
                     sink, network_attempt, ctx.id, endpoint_name, Some(400),
@@ -796,6 +856,34 @@ impl KiroProvider {
                     outcome::AUTH_FAILED, Some(&body), attempt_start,
                 );
 
+                // 本次请求已为该凭据强制刷新过一次，拿到新 token 后上游依然拒绝：
+                // refresh token 还能换票、但业务端不认这个身份，属不可自动恢复的终态。
+                // 若继续走 report_failure，它会以 TooManyFailures 被禁用，而自愈恰好
+                // 只复活 TooManyFailures —— 每 5 分钟复活一轮、每轮再白烧一次 OIDC
+                // 刷新（实测同一凭据连吃 17 次 403）。故直接打入终态。
+                if endpoint.is_bearer_token_invalid(&body) && refreshed_ok.contains(&ctx.id) {
+                    let has_available = self.token_manager.report_token_rejected_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    );
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（token 刷新后仍被拒绝）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -803,6 +891,7 @@ impl KiroProvider {
                     if Self::handle_force_refresh_result(
                         self.token_manager.force_refresh_token_for(ctx.id).await,
                     )? {
+                        refreshed_ok.insert(ctx.id);
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }

@@ -950,6 +950,16 @@ enum DisabledReason {
     /// 上游明确返回账号封禁/停用（403 + 封禁文案）后立即禁用。
     /// 不可自动恢复、**不参与自愈**，需人工联系客服核实后手动重置。
     Suspended,
+    /// 强制刷新 token **成功**后，上游仍以 403 "bearer token invalid" 拒绝。
+    ///
+    /// 与 [`Self::InvalidRefreshToken`] 的区别：那个是 OIDC 服务端返回
+    /// `invalid_grant`（刷新本身失败），这里刷新是成功的、拿到了新 token，
+    /// 只是业务端不认。二者不可混用，否则禁用原因会对不上实际发生的事。
+    ///
+    /// 这是不可自动恢复的终态（实测同一凭据可连续 17 次如此），**不参与自愈**，
+    /// 需重新登录该账号。若不单独识别，它会退化成 `TooManyFailures`，
+    /// 被自愈每 5 分钟复活一次，每轮再白烧 1 次 OIDC 刷新。
+    TokenRejectedAfterRefresh,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -966,6 +976,7 @@ impl DisabledReason {
             Self::Manual => "Manual",
             Self::TooManyFailures => "TooManyFailures",
             Self::Suspended => "Suspended",
+            Self::TokenRejectedAfterRefresh => "TokenRejectedAfterRefresh",
             Self::TooManyRefreshFailures => "TooManyRefreshFailures",
             Self::QuotaExceeded => "QuotaExceeded",
             Self::InvalidRefreshToken => "InvalidRefreshToken",
@@ -978,6 +989,7 @@ impl DisabledReason {
             "Manual" => Some(Self::Manual),
             "TooManyFailures" => Some(Self::TooManyFailures),
             "Suspended" => Some(Self::Suspended),
+            "TokenRejectedAfterRefresh" => Some(Self::TokenRejectedAfterRefresh),
             "TooManyRefreshFailures" => Some(Self::TooManyRefreshFailures),
             "QuotaExceeded" => Some(Self::QuotaExceeded),
             "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
@@ -1236,7 +1248,8 @@ fn credential_matches_request(
     // 此处曾有一道 `supports_opus()` 订阅门槛（`!title.contains("FREE")`），已移除：
     // 它是猜测性启发式，且是**硬否决**——上游明明报告支持某模型，也会因订阅标题被
     // 永久排除且不自愈。唯一起作用的窗口是模型缓存尚为 Unknown 的首次请求，
-    // 而那一次放行的代价只是一趟上游 400，远小于「凭据对某模型永久隐形」。
+    // 而那一次放行的代价只是一趟上游 400 `INVALID_MODEL_ID`（随即冷却换号，请求仍成功），
+    // 远小于「凭据对某模型永久隐形」。
     group_matches(&credentials.groups, group)
 }
 
@@ -2640,6 +2653,40 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> bool {
+        self.report_terminal_for_request(id, model, group, DisabledReason::Suspended)
+    }
+
+    /// 报告指定凭据强制刷新后上游仍拒绝其 token（403 bearer token invalid）。
+    ///
+    /// 处理方式与封禁一致：立即禁用、不累计、不参与自愈。见
+    /// [`DisabledReason::TokenRejectedAfterRefresh`] 说明为何不能复用
+    /// `InvalidRefreshToken`。返回是否还有可用凭据可以重试。
+    pub fn report_token_rejected_for_request(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        self.report_terminal_for_request(
+            id,
+            model,
+            group,
+            DisabledReason::TokenRejectedAfterRefresh,
+        )
+    }
+
+    /// 把凭据打入某个**不可自动恢复的终态**并切换到下一个可用凭据。
+    ///
+    /// 与 `report_failure_for_request` 的区别：不累计失败计数、直接把
+    /// `failure_count` 顶到阈值，且所标记的 reason 都不在自愈白名单里
+    /// （自愈只复活 [`DisabledReason::TooManyFailures`]，见 `try_self_heal`）。
+    fn report_terminal_for_request(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+        reason: DisabledReason,
+    ) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -2654,17 +2701,28 @@ impl MultiTokenManager {
 
             let entry = &mut entries[entry_index];
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::Suspended);
+            entry.disabled_reason = Some(reason);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.clear_self_heal_streak();
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             entry.total_failure_count += 1;
 
-            tracing::error!(
-                "凭据 #{} 被上游封禁/停用（账号 suspended），已禁用且不参与自愈，请人工联系客服核实后在管理面板手动重置",
-                id
-            );
+            match reason {
+                DisabledReason::Suspended => tracing::error!(
+                    "凭据 #{} 被上游封禁/停用（账号 suspended），已禁用且不参与自愈，请人工联系客服核实后在管理面板手动重置",
+                    id
+                ),
+                DisabledReason::TokenRejectedAfterRefresh => tracing::error!(
+                    "凭据 #{} 强制刷新成功后上游仍拒绝该 token，已禁用且不参与自愈，需重新登录该账号",
+                    id
+                ),
+                other => tracing::error!(
+                    "凭据 #{} 已按 {} 禁用且不参与自愈",
+                    id,
+                    other.as_str()
+                ),
+            }
 
             if let Some(next) = entries
                 .iter()
@@ -2686,7 +2744,12 @@ impl MultiTokenManager {
             }
         };
         if let Err(error) = self.persist_credentials() {
-            tracing::warn!("凭据 #{} 封禁状态持久化失败: {}", id, error);
+            tracing::warn!(
+                "凭据 #{} {} 状态持久化失败: {}",
+                id,
+                reason.as_str(),
+                error
+            );
         }
         self.save_stats_debounced();
         result
@@ -3185,6 +3248,69 @@ impl MultiTokenManager {
                 })
                 .count()
         }
+    }
+
+    /// 报告"该凭据当前取不到请求的模型"（400 + `INVALID_MODEL_ID`），冷却后换号。
+    ///
+    /// 复用 [`Self::report_account_throttled_for_request`] 那套 `throttled_until` 冷却，
+    /// 因此白拿：选号排除、面板 `throttledRemainingSecs` 可见、Admin 可手动清除、
+    /// 时长按 `account_throttle_cooldown_secs` 配置。与它一样**只加
+    /// `total_failure_count`、不动 `failure_count`** —— 这不是凭据坏了，
+    /// 不能让它累积到 3 次被禁用。
+    ///
+    /// 与 429 冷却的唯一区别：**绝不把当前请求范围冷却成空池。**
+    ///
+    /// 原因是两者的触发面完全不同。429 账号风控只针对个别账号；而
+    /// `INVALID_MODEL_ID` 完全可能对**所有**凭据同时成立（例如请求了一个当前谁都取不到
+    /// 的模型）。若照 429 那样无条件冷却，一次这样的请求就会把整个池子按凭据冷却掉，
+    /// 连**其它模型**的请求也一起打死 —— 那比现在"这一条请求失败、其它照常"严重得多。
+    /// 故当作用域内已无其它候选时，跳过冷却，只让本次请求失败。
+    ///
+    /// 返回作用域内剩余可用凭据数；`0` 表示调用方应直接失败而不要再换号。
+    pub fn report_model_unavailable_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+
+        // 先数「除自己以外」的候选，再决定是否冷却
+        let others = entries
+            .iter()
+            .filter(|e| {
+                e.id != id && self.entry_available_for_request(e, model, group, now)
+            })
+            .count();
+
+        if others == 0 {
+            tracing::warn!(
+                "凭据 #{} 取不到模型 {}，但作用域内已无其它候选，跳过冷却以免整池不可用",
+                id,
+                model.unwrap_or("(未指定)")
+            );
+            return 0;
+        }
+
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let until = now + cooldown;
+            // 取较晚的到期时间（多次触发时延长冷却），与 429 一致
+            entry.throttled_until = Some(match entry.throttled_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+            entry.total_failure_count += 1;
+            tracing::warn!(
+                "凭据 #{} 当前取不到模型 {}，冷却 {} 秒并换号（临时状态，到期自动恢复）",
+                id,
+                model.unwrap_or("(未指定)"),
+                cooldown.as_secs()
+            );
+        }
+
+        others
     }
 
     /// 手动解除指定凭据的临时冷却（Admin API）
@@ -5145,6 +5271,113 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
+    /// 回归锁：模型不可用只冷却、不禁用，且**绝不把作用域冷却成空池**。
+    ///
+    /// 两条都是反向判据：
+    /// 1. `failure_count` 必须保持 0 —— 若它累计，3 次 `INVALID_MODEL_ID` 就会把一个
+    ///    健康凭据禁用掉，而这个状态是临时的。
+    /// 2. 只剩一个候选时必须跳过冷却 —— 否则一次"谁都取不到的模型"请求会把整池
+    ///    按凭据冷却，连其它模型的请求也一起打死。
+    #[test]
+    fn model_unavailable_cools_down_without_disabling_or_draining_pool() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 两个候选：冷却 #1，仍剩 #2
+        let remaining = manager.report_model_unavailable_for_request(
+            1,
+            StdDuration::from_secs(300),
+            Some("claude-opus-5"),
+            None,
+        );
+        assert_eq!(remaining, 1, "应报告 #2 仍可用，让调用方换号而不是失败");
+
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(!e1.disabled, "模型不可用不得禁用凭据 —— 这是临时状态");
+            assert_eq!(
+                e1.failure_count, 0,
+                "不得累计 failure_count，否则 3 次就把健康凭据禁用了"
+            );
+            assert!(
+                e1.throttled_remaining_secs.unwrap_or(0) > 0,
+                "应处于冷却中，到期自动恢复"
+            );
+        }
+
+        // 现在只剩 #2 一个候选：必须跳过冷却，返回 0 让本次请求失败
+        let remaining = manager.report_model_unavailable_for_request(
+            2,
+            StdDuration::from_secs(300),
+            Some("claude-opus-5"),
+            None,
+        );
+        assert_eq!(remaining, 0, "无其它候选时应返回 0");
+        {
+            let snapshot = manager.snapshot();
+            let e2 = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+            assert!(
+                e2.throttled_remaining_secs.unwrap_or(0) == 0,
+                "最后一个候选不得被冷却，否则其它模型的请求也会全部失败"
+            );
+            assert!(!e2.disabled);
+        }
+    }
+
+    /// 回归锁：强制刷新成功后上游仍拒绝 token 的凭据，必须立即打入终态且不被自愈复活。
+    ///
+    /// 不加这条识别时它会退化成 `TooManyFailures`，而自愈恰好只复活
+    /// `TooManyFailures` —— 实测某凭据因此连吃 17 次 403，每轮还白烧一次 OIDC 刷新。
+    #[test]
+    fn report_token_rejected_disables_immediately_and_excluded_from_self_heal() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // #1 刷新后仍被拒：立即禁用（不累计），#2 仍可用
+        assert!(
+            manager.report_token_rejected_for_request(1, None, None),
+            "标记 #1 后 #2 仍可用"
+        );
+        assert_eq!(manager.available_count(), 1);
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(e1.disabled);
+            assert_eq!(
+                e1.disabled_reason.as_deref(),
+                Some("TokenRejectedAfterRefresh"),
+                "必须与 InvalidRefreshToken / TooManyFailures 区分开"
+            );
+        }
+
+        assert!(
+            !manager.report_token_rejected_for_request(2, None, None),
+            "标记 #2 后应全灭"
+        );
+        assert_eq!(manager.available_count(), 0);
+
+        assert!(
+            !manager.try_self_heal(None, None),
+            "TokenRejectedAfterRefresh 凭据不参与自愈"
+        );
+        assert_eq!(manager.available_count(), 0);
+    }
+
     #[test]
     fn suspended_credential_recovers_via_manual_reset() {
         let manager = MultiTokenManager::new(
@@ -6594,8 +6827,13 @@ mod tests {
     ///    Claude 族，Free 凭据对 sonnet-5 会彻底隐形；只对 opus-5 生效又只是
     ///    在重复 `cached_model_support` 已经做对的事。
     ///
-    /// 唯一让它起作用的窗口是模型缓存尚为 Unknown 的首次请求，而那一次放行的代价
-    /// 只是一趟上游 400（且随即被缓存修正），远小于凭据永久隐形。
+    /// 唯一让它起作用的窗口是模型缓存尚为 Unknown 的首次请求（刚启动、预热未跑完，
+    /// 或该凭据的 `ListAvailableModels` 取不到）。那一次放行的代价是一趟上游
+    /// 400 `INVALID_MODEL_ID`，随后该凭据进入短时冷却并换号重试 —— 请求本身仍会成功，
+    /// 远小于凭据对某模型永久隐形。
+    ///
+    /// 注意这里**只**冷却、不写"不支持"：`INVALID_MODEL_ID` 是临时状态，订阅确实含该
+    /// 模型的账号也会收到它（数小时后恢复），据此永久标记等于把本门槛换个形式加回来。
     #[test]
     fn credential_match_does_not_gate_on_subscription_tier() {
         let mut free = grouped_cred("free", &[]);

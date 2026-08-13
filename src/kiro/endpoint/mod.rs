@@ -101,6 +101,15 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_account_suspended(&self, body: &str) -> bool {
         default_is_account_suspended(body)
     }
+
+    /// 判断响应体是否表示"该凭据当前取不到请求的模型"（400 + `INVALID_MODEL_ID`）。
+    ///
+    /// 与其它 400 的区别：其它 400（请求体非法、图片超限、签名失效、正文超长）换凭据
+    /// 毫无意义，必须快速失败；这一个换个凭据往往就能成功。见
+    /// [`MODEL_UNAVAILABLE_REASON`]。
+    fn is_model_unavailable(&self, body: &str) -> bool {
+        default_is_model_unavailable(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -128,6 +137,29 @@ const QUOTA_EXHAUSTED_REASONS: &[&str] = &[
     "MONTHLY_REQUEST_COUNT",
     "OVERAGE_REQUEST_LIMIT_EXCEEDED",
 ];
+
+/// 触发"账号被封禁 → 立即禁用且不参与自愈"的 `reason` 取值
+///
+/// 结构化字段远比文案稳定：2026-08-13 实测上游把封禁文案从
+/// `We've locked your account` 改成了 `and locked it as a security precaution`，
+/// 只认文案的旧判据当场失效（详见 [`default_is_account_suspended`]）。
+const SUSPENDED_REASON: &str = "TEMPORARILY_SUSPENDED";
+
+/// 触发"该凭据当前取不到此模型 → 冷却并换号"的 `reason` 取值
+///
+/// 上游对此返回 **400**（不是 403）：
+/// `{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}`
+///
+/// 2026-08-13 从 trace DB 取样确认存在且已发生 13 次（凭据 #4 / #5，
+/// `claude-opus-5` 12 次 + `claude-sonnet-5` 1 次），全部 `finalStatus=error`
+/// —— 即当时整条客户端请求直接失败，没有换号。
+///
+/// **这个状态是临时的，不代表订阅不含该模型。** 已观察到订阅确实支持该模型的账号
+/// 也会收到它，数小时后同一模型又能正常请求。故绝不可据此把凭据对该模型永久标记为
+/// 不支持 —— 那等于把已删除的 `supports_opus()` 硬否决换个形式加回来
+/// （见 `token_manager` 的 `credential_match_does_not_gate_on_subscription_tier`）。
+/// 正确处置是"短时冷却 + 换号"，靠冷却到期自动恢复。
+const MODEL_UNAVAILABLE_REASON: &str = "INVALID_MODEL_ID";
 
 /// 默认的"请求额度耗尽"判断逻辑
 ///
@@ -171,16 +203,78 @@ pub fn default_is_account_throttled(body: &str) -> bool {
 
 /// 默认的"账号被封禁/停用"判断逻辑
 ///
-/// 上游对被封账号返回 403 + 类似：
-/// `Your User ID (...) temporarily is suspended. We've locked your account as a
-/// security precaution. To restore access, please contact our support team ...`
+/// 上游对被封账号返回 403，已实测到**两种**文案，且都带
+/// `"reason":"TEMPORARILY_SUSPENDED"` 之外的形态差异：
 ///
-/// 与普通 403（权限不足 / WAF / 区域抖动）的关键差异：同时出现 "suspended" 与
-/// "locked your account" 两个高特异短语。大小写不敏感匹配，兼容文案微调。
-/// 两个短语都命中才判定，避免把偶发 403 误判为封禁。
+/// - 2025 版（`reason` 为 `null`，只能靠文案）：
+///   `Your User ID (...) temporarily is suspended. We've locked your account as a
+///   security precaution. To restore access, please contact our support team ...`
+/// - 2026-08-13 实测版（带结构化 `reason`）：
+///   `Your User ID is temporarily suspended. We detected unusual user activity and
+///   locked it as a security precaution. To restore access, please contact our
+///   support team ...`
+///
+/// 判定顺序据此分两层：
+///
+/// 1. **结构化优先**：顶层或 `error.reason` 等于 `TEMPORARILY_SUSPENDED` 即命中。
+///    与 [`default_is_monthly_request_limit`] 同构，是上游改文案时唯一稳的锚点。
+/// 2. **文案兜底**：`reason` 缺失（2025 版）时仍需文案判定。要求 "suspended" 与
+///    "锁定"类短语同时出现，大小写不敏感；单独出现任一短语不判定，避免把偶发
+///    403（权限不足 / WAF / 区域抖动）误判为封禁。
+///
+/// 历史教训：旧实现只有第 2 层且"锁定"类短语写死为 `locked your account`。
+/// 上游把它改成 `locked it as a security precaution` 后判据静默失效 ——
+/// 被封凭据退化成普通 403，按 `TooManyFailures` 禁用，而自愈恰好只复活
+/// `TooManyFailures`，于是每 5 分钟复活一次再被 403 打死（issue #51 的死循环
+/// 以另一种形式复发）。所以第 1 层必须在，且不能再让文案成为唯一判据。
 pub fn default_is_account_suspended(body: &str) -> bool {
+    // 第 1 层：结构化 reason。先做字符串快扫，避免对绝大多数响应体做 JSON 解析
+    if body.contains(SUSPENDED_REASON) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            let top = value.get("reason").and_then(|v| v.as_str());
+            let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+            if [top, nested]
+                .into_iter()
+                .flatten()
+                .any(|reason| reason == SUSPENDED_REASON)
+            {
+                return true;
+            }
+        } else {
+            // body 非 JSON 但含该 reason 关键词（兼容简单文本响应）
+            return true;
+        }
+    }
+
+    // 第 2 层：文案兜底
     let lower = body.to_ascii_lowercase();
-    lower.contains("suspended") && lower.contains("locked your account")
+    lower.contains("suspended")
+        && (lower.contains("locked your account")
+            || lower.contains("locked it as a security precaution"))
+}
+
+/// 默认的"该凭据当前取不到此模型"判断逻辑
+///
+/// **只认结构化 `reason`，不做任何文案匹配。** 理由：`message` 那句
+/// `Invalid model ID. Please select a different model to continue.` 是完全可能出现在
+/// 模型正文里的普通英文（比如用户就在问这条报错是什么意思），靠文案匹配会把一次正常
+/// 回答误判成"模型不可用"并冷却掉一个健康凭据。而 `reason` 是结构化字段，不会被正文污染。
+///
+/// 顶层与嵌套 `error.reason` 两种形状都认（与额度、封禁两个判据同构）。
+pub fn default_is_model_unavailable(body: &str) -> bool {
+    if !body.contains(MODEL_UNAVAILABLE_REASON) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        // 非 JSON body 不判定：这里没有可信的结构化字段，宁可放过也不冷却健康凭据
+        return false;
+    };
+    let top = value.get("reason").and_then(|v| v.as_str());
+    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+    [top, nested]
+        .into_iter()
+        .flatten()
+        .any(|reason| reason == MODEL_UNAVAILABLE_REASON)
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -334,6 +428,125 @@ mod tests {
         assert!(!default_is_account_suspended("your account is suspended"));
         assert!(!default_is_account_suspended(
             "we have locked your account temporarily"
+        ));
+    }
+
+    /// 回归锁：2026-08-13 实测的真实封禁响应必须被判定为封禁。
+    ///
+    /// 这条文案里**没有** `locked your account`（上游改成了 `locked it as a
+    /// security precaution`），旧判据在它上面静默返回 false，导致被封凭据被当成
+    /// 普通 403 → `TooManyFailures` → 每 5 分钟被自愈复活再被 403 打死。
+    #[test]
+    fn account_suspended_matches_2026_08_13_upstream_wording() {
+        let body = r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution. To restore access, please contact our support team to verify your identity: https://support.aws.amazon.com/#/contacts/kiro","reason":"TEMPORARILY_SUSPENDED"}"#;
+        assert!(
+            default_is_account_suspended(body),
+            "2026-08-13 实测封禁文案必须命中，否则被封凭据会退化成 TooManyFailures 并被自愈反复复活"
+        );
+    }
+
+    /// 回归锁：只要结构化 `reason` 命中就判定封禁，不依赖任何文案。
+    ///
+    /// 上游可以随时再改一次 message；`reason` 是唯一稳的锚点。
+    /// 顶层与嵌套 `error.reason` 两种形状都要认（与额度判据同构）。
+    #[test]
+    fn account_suspended_matches_structured_reason_without_known_wording() {
+        assert!(default_is_account_suspended(
+            r#"{"message":"totally new wording nobody has seen","reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(default_is_account_suspended(
+            r#"{"error":{"reason":"TEMPORARILY_SUSPENDED"}}"#
+        ));
+    }
+
+    /// 回归锁：2026-08-13 从 trace DB 取出的**两种真实 403 响应字节**必须被分到不同处置。
+    ///
+    /// 取样自 17 个凭据里全部失败尝试的去重结果（8 个凭据、两种 body）：
+    /// - 6 个凭据（#7 #10 #11 #12 #13 #15）只吐封禁 body → 走 `Suspended`
+    /// - 2 个凭据（#8 #9）只吐 bearer-invalid body，**从未**吐过封禁文案
+    ///   → 只能走刷新后仍被拒的终态，封禁判据必须对它返回 false
+    ///
+    /// 两条 body 都不含账号 ID，可安全作为固定测试数据。
+    /// 这条锁的是"分流"而非单个判据：把两者混为一谈会让 #8/#9 被标成封禁
+    /// （原因说谎），或让 #7 类退回 `TooManyFailures`（被自愈反复复活）。
+    #[test]
+    fn real_403_payloads_route_to_distinct_verdicts() {
+        const SUSPENDED_BODY: &str = r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution. To restore access, please contact our support team to verify your identity: https://support.aws.amazon.com/#/contacts/kiro","reason":"TEMPORARILY_SUSPENDED"}"#;
+        const BEARER_INVALID_BODY: &str =
+            r#"{"message":"The bearer token included in the request is invalid.","reason":null}"#;
+
+        assert!(
+            default_is_account_suspended(SUSPENDED_BODY),
+            "#7 #10 #11 #12 #13 #15 的真实 body 必须判为封禁"
+        );
+        assert!(
+            !default_is_bearer_token_invalid(SUSPENDED_BODY),
+            "封禁 body 不应同时命中 bearer-invalid，否则会先被刷新分支截走"
+        );
+
+        assert!(
+            default_is_bearer_token_invalid(BEARER_INVALID_BODY),
+            "#8 #9 的真实 body 必须判为 token 失效"
+        );
+        assert!(
+            !default_is_account_suspended(BEARER_INVALID_BODY),
+            "#8 #9 从未吐过封禁文案，不能被标成账号封禁 —— 那是编造禁用原因"
+        );
+
+        // 两条都不是额度问题，别和 402 路径串台
+        assert!(!default_is_monthly_request_limit(SUSPENDED_BODY));
+        assert!(!default_is_monthly_request_limit(BEARER_INVALID_BODY));
+    }
+
+    /// 回归锁：`INVALID_MODEL_ID` 只按结构化 `reason` 判定，正文提到那句话不算。
+    ///
+    /// 上游那句 `Invalid model ID. Please select a different model to continue.` 是
+    /// 完全可能出现在模型正文里的普通英文（用户就可能在问这条报错是什么意思）。
+    /// 若靠文案匹配，一次正常回答会被判成"模型不可用"并冷却掉一个健康凭据。
+    #[test]
+    fn model_unavailable_matches_structured_reason_only() {
+        // 真实 body（2026-08-13 trace DB，13 次）
+        assert!(default_is_model_unavailable(
+            r#"{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#
+        ));
+        // 嵌套形状同样认
+        assert!(default_is_model_unavailable(
+            r#"{"error":{"reason":"INVALID_MODEL_ID"}}"#
+        ));
+
+        // 正文提到关键词但 reason 不是它 → 不命中
+        assert!(!default_is_model_unavailable(
+            r#"{"message":"what does INVALID_MODEL_ID mean?","reason":null}"#
+        ));
+        // 只有文案、没有结构化字段 → 不命中（宁可放过也不冷却健康凭据）
+        assert!(!default_is_model_unavailable(
+            "Invalid model ID. Please select a different model to continue."
+        ));
+        // 非 JSON 且含关键词 → 不命中
+        assert!(!default_is_model_unavailable("INVALID_MODEL_ID"));
+
+        // 别和其它 400 串台：这几种换凭据没意义，必须快速失败
+        for other in [
+            r#"{"message":"too many inline media segments: 101 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#,
+            r#"{"message":"messages.1.content.30: Invalid `signature` in `thinking` block","reason":"THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}"#,
+            r#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        ] {
+            assert!(
+                !default_is_model_unavailable(other),
+                "{other} 不应被判为模型不可用"
+            );
+        }
+    }
+
+    /// 正文顺口提到关键词不算封禁：`reason` 字段值不对，文案也只命中半边。
+    ///
+    /// 防的是把模型回答里出现 "TEMPORARILY_SUSPENDED" 字样的响应误判成封禁 ——
+    /// 误判的代价是把一个健康凭据永久踢出轮换且不参与自愈。
+    #[test]
+    fn account_suspended_ignores_keyword_in_unrelated_field() {
+        assert!(!default_is_account_suspended(
+            r#"{"message":"explain what TEMPORARILY_SUSPENDED means","reason":null}"#
         ));
     }
 

@@ -198,6 +198,8 @@ function getDisabledReasonStyle(reason?: string | null): {
       return { label: "失败过多", variant: "destructive" };
     case "Suspended":
       return { label: "账号封禁", variant: "destructive" };
+    case "TokenRejectedAfterRefresh":
+      return { label: "Token 被拒", variant: "destructive" };
     case "TooManyRefreshFailures":
       return { label: "刷新失败过多", variant: "destructive" };
     case "InvalidRefreshToken":

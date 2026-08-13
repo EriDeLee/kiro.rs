@@ -11,6 +11,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - `/v1/messages` 现在接受全部 5 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
 - CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
 - 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
+- **Admin 上游失败不再一律显示「上游服务请求失败」。** 余额与模型列表查询的失败现在按已识别的原因给出具体文案：`账号被封禁`、`额度已用尽`、`Token 已失效`、`上游拒绝访问`（403 权限不足）、`上游服务异常`（5xx）。前三条复用数据面的三个判据（同一语义不再有两套字符串），后两条取 `token_manager` 自己按状态码给出的前缀。外发的只有这几个固定字面量，上游原始报文仍然只进日志 —— 原有那条「不泄露 AWS 账号 ID / request-id」的断言未放宽，新增 `upstream_rejected_exposes_only_the_public_reason` 一并锁住。
+  - 需要注意 REST 与流式端点的差异：`ListAvailableModels` 对**被封账号**只回一句 `User is not authorized to make this call.`（无 `TEMPORARILY_SUSPENDED`、无封禁文案），只有流式端点吐详细原因。所以这里诚实地报「上游拒绝访问」，**不**推断成封禁 —— 403 也可能是权限或区域问题。账号是否真被封由数据面写进 `disabledReason`，卡片徽标另有显示，两处口径允许不同：解封后弹窗会先恢复正常返回，而徽标仍写封禁，那个差异正是「可以试着重置了」的信号。
 
 ### Removed
 
@@ -41,6 +43,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 回复末尾不再出现一条内容为空的「思考」。上游会在正文之后补一个只含换行的 reasoning 分片，此前它会被当作真内容新开一个 thinking 块（客户端渲染为 `Thought: 5ms` 且正文区为空）。流式与非流式两条路径都已挡住 —— 后者也是 `/v1/responses` 的来源。thinking 块已开着时的空白照常追加，那是思考文本内部的段落间隔。
 - 不过滤上游 `gpt-5.6-sol` 的 `reasoningContentEvent{text:"..."}`。45 次本地构造请求确认：这是模型在结构化标记任务中产生的推理摘要占位，事件位于正文之后、真签名之前；同一阳性提示在 `effort=none` 时消失，在 `low/high/max` 时稳定作为 reasoning 下发。它会被客户端显示为回复末尾的 `Thought: ...`，但属于上游明确标记的推理内容，不是代理伪造。
 - **正文还扣在 `<invoke>` 嗅探缓冲区时，不再被判定成「本轮没有正文」。** 嗅探器为了等 `</invoke>` 闭合会把行首未闭合的块暂存起来，此时尚无 text 块；`generate_final_events` 原先**先判定、后 flush**，于是把 `stop_reason` 误改成 `max_tokens`，还往正文流里插了一个空格。现在先排空缓冲区再判定。反向验证：撤掉修复后 `stop_reason` 确实变成 `max_tokens`。
+- **上游改了封禁文案后，被封凭据不再退化成「失败过多」被自愈反复复活。** `default_is_account_suspended` 原先要求响应体同时含 `suspended` 与 `locked your account`；2026-08-13 上游把文案改成 `We detected unusual user activity and locked it as a security precaution` —— 后一个短语不再出现，判据静默返回 false。后果链：被封 403 当普通 403 处理 → 按 `TooManyFailures` 禁用 → 而自愈**只**复活 `TooManyFailures` → 每 5 分钟复活再被 403 打死，issue #51 的死循环以换文案的形式复发。实测代价：6 个凭据各白打 15 次上游（3 次失败 × 5 轮自愈），而「反复重试被封账号」本身就是上游判定 unusual activity 的行为。
+  - 判据改为两层：优先认结构化 `reason == TEMPORARILY_SUSPENDED`（上游再改文案也不影响），`reason` 缺失时才退回文案匹配，且第二个短语放宽为 `locked your account` 或 `locked it as a security precaution`。5 条既有断言全部保留，新增 3 条回归锁，其中一条直接用 trace DB 里上游发来的原始字节（282 字符）。
+  - 通用教训写进 AGENTS.md：结构化字段稳、散文文案不稳。同文件的 402 额度判据（`QUOTA_EXHAUSTED_REASONS`）从一开始只认 `reason`，两年没坏；封禁判据只认文案，一次文案微调就失效。且这类失效不报错、不留日志，只是让凭据走进另一条本来正确的路径，只能靠对比 `disabledReason` 与上游实际 body 发现。
+- **新增禁用原因 `TokenRejectedAfterRefresh`：强制刷新成功后上游仍拒绝该 token。** 实测两个凭据分别连吃 17 次和 15 次 `403 {"message":"The bearer token included in the request is invalid.","reason":null}` —— 刷新每次都成功、拿到新 token，业务端每次都不认。它们**从未**吐过封禁文案，所以上面那条修复覆盖不到；原先按 `TooManyFailures` 禁用后同样被自愈每 5 分钟复活，每轮再白烧一次 OIDC 刷新。现按不可自动恢复的终态处理，不参与自愈，需重新登录该账号。
+  - 没有复用 `InvalidRefreshToken`：那个的语义是 OIDC 服务端返回 `invalid_grant`（刷新本身失败），而这里刷新是成功的，复用会让禁用原因与实际发生的事对不上。
+  - 判据键在「本次请求内该凭据**刷新成功过**」，而不是「尝试过刷新」。后者（`force_refreshed`）同时包含刷新失败的凭据 —— 它承担的是「每凭据只试一次刷新」的职责，拿它判终态会把一次 OIDC 网络抖动误判成永久失效，而终态不参与自愈。故新增独立的 `refreshed_ok` 集合。
+- **`400 INVALID_MODEL_ID` 不再直接打死整条请求，改为短时冷却 + 换号。** 上游对「该凭据此刻取不到这个模型」返回 400，与请求格式错误同码不同因，而原先所有 400 都走「重试/切换凭据无意义」的快速失败。trace DB 取样确认它已发生 13 次（`claude-opus-5` 12 次 + `claude-sonnet-5` 1 次），**全部** `finalStatus=error` —— 当时每一条客户端请求都直接失败，而池子里有能用的凭据；其中 9 次是 3 分钟内连撞同一个凭据。
+  - **这是临时状态，不是「订阅不含该模型」。** 订阅确实包含该模型的账号也会收到它，数小时后同一模型又能正常请求。因此绝不据此把凭据对该模型标记为不支持 —— 那等于把已删除的 `supports_opus()` 硬否决换个形式加回来（同样硬否决、同样不自愈，只是触发条件从「订阅标题含 FREE」变成「上游抖了一下」）。`Unsupported` 这个判定只有一个合法来源：真实 `ListAvailableModels` 清单里没有该 model_id。
+  - 复用 429 那套 `throttled_until` 冷却，因此白拿选号排除、面板 `throttledRemainingSecs` 可见、Admin 可手动清除、时长按 `account_throttle_cooldown_secs` 配置。与它一样**只加 `total_failure_count`、不动 `failure_count`** —— 三次抖动不该把健康凭据禁用。
+  - 与 429 的唯一区别：**绝不把当前请求范围冷却成空池。** 429 风控只针对个别账号，而 `INVALID_MODEL_ID` 可能对所有凭据同时成立（请求了一个当前谁都取不到的模型）；无条件冷却会让一次这样的请求把整池按凭据冷却，连**其它模型**的请求也一起打死。故作用域内已无其它候选时跳过冷却，只让本次请求失败。
+  - 判据只认结构化 `reason`，不做文案匹配：那句 `Invalid model ID. Please select a different model to continue.` 是完全可能出现在模型正文里的普通英文（用户就可能在问这条报错是什么意思），文案匹配会把一次正常回答变成冷却一个健康凭据。其余四种已观测的 400（`IMAGE_COUNT_EXCEEDED`、`THINKING_SIGNATURE_INVALID`、`REQUEST_BODY_INVALID`、`CONTENT_LENGTH_EXCEEDS_THRESHOLD`）根因都在请求本身，保持立即失败，回归锁逐条挡住误判。
+  - 顺带修掉一句说谎的注释：原先称首次请求那趟 400「随即被缓存修正」，而全仓没有任何地方在 400 后刷新模型缓存（`refresh_model_cache_for` 只有 `cached_or_refresh_models_for` 与两个 Admin 接口三个调用点）。
 - **Admin 面板的排序字段与升降序现在会持久化。** 展示形态（`credentialView`）与每页数量（`credentialPageSize`）一直存在 localStorage，排序却只活在组件 state 里，刷新或重新登录就悄悄回到「手动顺序」—— 用户以为自己选的排序还在，看到的其实是服务端顺序。现在写 `credentialSortField` / `credentialSortDir` 两个键，读回时按白名单校验、认不出的值回落 `manual`（否则一个比较器不认识的字段会让排序静默失效）；`SortField` / `SortDir` 的取值域随之移到 `storage.ts`，与那份白名单同源，避免两处各写一遍走岔。`applySort` 改为先算出下一组字段/方向再一次落盘 —— 用函数式 `setState` 取不到新值，落盘会滞后一次点击。
 
 ## [0.7.5] - 2026-08-05
