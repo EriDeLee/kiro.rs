@@ -37,7 +37,7 @@ Kiro 的 `reasoning.effort`；不会把 `output_config` / `thinking` 原样下�
 | **不改写客户端提示词** | ✅ 零注入<sup>5</sup> | ❌ 5 类注入 | ❌ 3 类 | ❌ 2 类 |
 | **原生 `web_search` 响应合规** | ✅ 带 `tool_use_id` | ❌ 缺失<sup>6</sup> | ❌ 缺失 | ❌ 缺失 |
 | **不伪造环境信息** | ✅<sup>7</sup> | ❌ 谎报 `macos` + 发真实 cwd | — | ❌ 谎报 `macos` + 发真实 cwd |
-| `<invoke>` XML 泄漏捞回 | ✅ | ✅ | ❌ | ❌ |
+| `<invoke>` XML 泄漏捞回 | 已移除<sup>8</sup> | ✅ | ❌ | ❌ |
 | 工具 JSON 累积器 | ✅ 全路径 | ✅ 主路径 | ❌ | ✅ |
 | 日志脱敏 | ✅ | ❌ | ❌ | ✅ |
 | legacy 端点 | 无 | `/v1/chat/completions`、`/cc/v1/*` | `/cc/v1/*` | `/cc/v1/*` |
@@ -87,6 +87,16 @@ builder 的 `.set_env_state(…)`，`None` 即整个字段不发。本仓库实�
 顺带的效果：纯聊天（无工具、无工具结果）时整个 `userInputMessageContext` 都不再序列化。
 客户端给什么就发什么，没有的不发。
 
+<sup>8</sup> 这一项**曾经**是本仓库相对同源项目的"优势"，后来判定为负债并删除。上游模型退化时会
+把工具调用吐成字面 `<invoke name="...">…</invoke>` 文本，该机制会把那段正文改写成结构化
+`tool_use` 交给客户端 —— 而客户端会真的据此改文件、跑命令。它是"读正文内容猜语义"里后果最重的
+一处，且为了等 `</invoke>` 闭合必须把正文暂存，本身就构成正文延迟与丢失的通路。实测
+`gpt-5.6-sol` 会把含字面 `<thinking>` / `<invoke` 的正文整段作为最终答案下发（签名 payload 的
+非加密 slot 标着 `phase=final_answer`），这类提取一律误伤。现由回归锁禁止重新引入：
+`literal_invoke_in_text_is_passed_through_untouched`（`src/anthropic/stream.rs`）与
+`flush_content_passes_literal_invoke_through_as_text`（`src/anthropic/websearch_loop.rs`）。
+上游吐成字面文字，就照字面文字交给客户端。
+
 ---
 
 ## 快速开始
@@ -132,7 +142,7 @@ cargo build --release
 |---|---|---|
 | `accountThrottleFailover` | `true` | 账号级 429（suspicious activity）时冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
-| `suspendedDetectionEnabled` | `true` | 识别 403 封禁文案（`suspended` + `locked your account`）后立即禁用该凭据且不参与自愈 |
+| `suspendedDetectionEnabled` | `true` | 识别 403 账号封禁后立即禁用该凭据且不参与自愈。优先认结构化 `reason == TEMPORARILY_SUSPENDED`，`reason` 缺失时才退回文案匹配 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时，重置失败计数并重新启用 |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小间隔，打断持续 403 死循环的关键 |
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0` = 不限），超限即停并提示人工介入 |
@@ -160,7 +170,7 @@ CLI 请求日志包含 `api_endpoint=messages|responses` 与 `api_path`。Admin 
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（493 个）
+cargo test --release                      # 后端测试（506 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

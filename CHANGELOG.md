@@ -8,6 +8,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **便携运行：数据文件统一落可执行文件同级的 `data/`。** 此前依赖进程工作目录，从不同位置启动同一个二进制会读到不同的 `credentials.json`。同时把 SQLite 临时文件留在内存（`temp_store=MEMORY`），并给 `rust-embed` 开 `debug-embed`，使 debug 构建不再依赖编译期的绝对路径。
+  - **破坏性：默认监听地址从 `0.0.0.0` 收紧为 `127.0.0.1`。** 容器部署或反向代理后端若依赖外部直连，必须显式配置 `host=0.0.0.0`，否则升级后从外部访问不到。
+- **Admin 面板主题改为自动跟随系统。** 移除手动的日/夜切换按钮，以及贯穿 `App` → `Dashboard` → `HeaderActions` 三层的 `darkMode` / `onToggleDarkMode` 传参；改为在入口用 `matchMedia('(prefers-color-scheme: dark)')` 直接套用并监听 `change` 事件跟随切换，同时同步 `color-scheme` 让表单控件与滚动条一起变色。原实现的初始值读自 `documentElement` 上已有的 class，与系统设置无关 —— 暗色系统下打开面板仍是亮色，点一下才对。
 - `/v1/messages` 现在接受全部 5 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
 - CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
 - 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
@@ -16,6 +19,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **移除二进制在线更新（破坏性）。** 删掉 `src/admin/binary_update.rs`、Admin 的更新对话框与检查 Hook、全部更新路由、相关配置字段，以及 `flate2` / `tar` / `zip` 三个只服务于它的依赖，净删约 2500 行。理由是 AGENTS.md §2.2：它不服务于本项目那条唯一链路，留着就是负债 —— 而一个会自行下载并替换自身二进制的功能，负债不只是代码量。
+  - 升级注意：`config.json` 里的更新相关字段已被忽略（不会报错，但也不再有任何效果）；原先调用那些更新路由的脚本会收到 404。请改用常规方式部署新版本。
 - **流式路径不再解释正文内容。** 删掉 `<thinking>` 字面量提取（`process_content_with_thinking` 及配套的标签查找、缓冲区状态共约 700 行）；thinking 块此后只由上游原生 `reasoningContentEvent` 产生。非流式路径早已删除该逻辑，这次把流式对齐。
 - 删掉跨 chunk 的 `ToolUseXmlLeakFilter`。面向客户端的三条文本路径（流式、非流式、websearch 循环）改为原样透传 + 告警，不再删除任何正文；`strip_tool_use_xml_leaks` 只保留给 Admin 的凭据连通性测试（那里只是把回复显示在管理页面，删噪声不丢数据）。
 - 删掉两条永远走不到的坏 JSON 处理分支。`parse_invoke_block` 原先把入参先 `serde_json::to_string` 再交由调用方 `from_str` 解析回来 —— 解析 serde 自己刚序列化的 `Map<String, String>` 不可能失败，于是两处调用方各背了一条不可达的错误路径，其中流式那条还会连带销毁未消费的正文。现在该函数直接返回 `serde_json::Value`，`extract_invoke_content_blocks` 随之不再需要 `Result`（它已无任何错误来源），8 个调用点一并更新。
@@ -32,6 +37,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **GPT 请求不再 100% 不落 Trace 表。** `/v1/responses` 恒注入原生 `web_search`，所以每个 GPT 请求都进 agentic loop，而 loop 在 stream / non-stream 两条分支之前就 `return` —— `RequestTracer` 原先只在那两条分支内部构造，于是 Admin 请求日志页对 `gpt-5.6` 全组恒为空白，而 usage 统计一切正常。又一例 §3.8 的静默失效：单测全绿 + 真实请求 200 + 有用量数据，只有 trace 表是空的。
+  - `RequestTracer` 构造上提到所有分支之前；`run_web_search_loop` / `run_round` / `decode_round` 接 tracer，首个上游 chunk 调 `mark_first_token`；13 处 `hook.record` 失败出口逐一配对 `trace_error` / `finalize`，每条出口恰好一次，并补齐原先没有收尾的转换失败与序列化失败两条路径。
+  - `finalize` 里把 attempts 按时间重排为 `1..N`：`trace_attempts` 主键是 `(trace_id, attempt)` 且用 `INSERT OR REPLACE`，而 provider 每次 `call_api*` 都从 1 重新编号，多轮 loop 时后一轮会顶掉前一轮，`total_attempts` 与实际行数不一致。反向判据：把重排改成空操作后测试必须翻转，实测 `left [1] / right [1, 2]`。
+  - 入口日志加 `via` 字段区分 `internal:/v1/responses` 与 `http:/v1/messages`。原措辞让 GPT 请求看起来像走错了路由（实际链路正确，是日志在说谎，违反 §2.4）。
+- **图片数超限不再直接打死整条请求，改为丢弃最早的图片后重试。** 上游对超限返回 `IMAGE_COUNT_EXCEEDED`（实测文案 `too many inline media segments: 101 exceeds limit 100`），原先落进「400 一律快速失败」分支 —— 一次长会话攒够图片后，后续每一条请求都失败，而用户并不知道该删哪张。
+  - 每次重试只丢**一张**，按会话顺序从最早开始：先走 `history` 里第一条含图片的 user 消息，只有历史中再无图片时才动 `current_message` —— 当前这一轮用户刚发的图片最后才牺牲。
+  - 重试预算取"本请求实际图片数"（`ConversationState::image_count()`），且**不占用**网络/限流重试预算（`MAX_RETRIES_PER_CREDENTIAL` / `MAX_TOTAL_RETRIES` 照旧），所以不会因为图片多而挤掉正常的故障转移次数。丢到无图可丢时退化为原来的立即失败，不会死循环。
+  - **不计凭据失败、不冷却**：这是请求内容超限，与凭据健康无关。仅写 trace（`outcome::BAD_REQUEST`）并 `warn` 一条剩余张数。
+  - 判据只认结构化 `reason`，顶层与 `error.reason` 两种形状都认；正文里顺口提到 `IMAGE_COUNT_EXCEEDED`、以及 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 都不命中。新增 3 个回归锁，其中 `upstream_image_limit_drops_oldest_image_and_retries` 用本地 axum mock 断言"恰好重试一次"、"重试请求里历史图片已消失"、"当前消息的图片仍在"。
 - **上游报错不再被静默吞掉当成正常结束。** 客户端原先会收到一条「正常结束」的半截回复，把上游的失败当成模型的完整答案，而 Trace 也记成 success，靠状态码查不出来。
   - 流式：`Event::Error` 原先只写一行日志就丢掉，流照旧以 `message_delta{stop_reason:end_turn}` + `message_stop` 收尾。现在补发 Anthropic `error` 事件（带上游原始错误码与消息）、`stop_reason` 置为 `error`、上层把请求记为 error；报错前已发出的正文照旧保留，不因后续失败而回收。
   - 非流式：该 `match` 原先**没有** `Event::Error` 分支，它落进 `_ => {}`。现在返回 502 并带上上游原话，而不是 200 + 半截正文 + `end_turn`。
