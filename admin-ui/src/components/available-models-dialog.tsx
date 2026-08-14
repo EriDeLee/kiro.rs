@@ -42,10 +42,11 @@ function formatSelectionSource(data: AvailableModelsResponse) {
   switch (data.selectionMode) {
     case 'specified':
       return `指定凭据 #${data.id}`
+    // 模式名与顶栏切换按钮、切换成功提示逐字一致：优先级模式 / 均衡负载模式
     case 'priority':
-      return `优先级选择凭据 #${data.id}`
+      return `优先级模式选中凭据 #${data.id}`
     case 'balanced':
-      return `均衡选择凭据 #${data.id}`
+      return `均衡负载模式选中凭据 #${data.id}`
   }
 }
 

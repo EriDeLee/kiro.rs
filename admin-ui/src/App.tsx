@@ -339,7 +339,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
     <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
       <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
         {tab === "overview" && <OverviewPage />}
-        {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
+        {tab === "credentials" && <Dashboard onLogout={onLogout} />}
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}

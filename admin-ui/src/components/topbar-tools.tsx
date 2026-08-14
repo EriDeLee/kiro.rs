@@ -28,7 +28,7 @@ import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
- * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、设置（Key 管理）。
+ * 顶栏右侧通用工具栏：调度模式切换、可用模型、刷新、设置（Key 管理）。
  *
  * 与原 Dashboard 中的工具按钮等价，但全局 Tab 都可访问。刷新按钮会失效
  * 凭据/客户端 Key/统计三类查询，覆盖三个 Tab 的主要数据源。
@@ -287,11 +287,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           onSelect={controls.handleToggleLoadBalancing}
         >
           <Activity />
-          {controls.isLoadingMode
-            ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
+          {loadBalancingActionLabel(controls)}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
@@ -311,6 +307,22 @@ function CompactTools({ controls }: { controls: ToolControls }) {
   )
 }
 
+/**
+ * 调度模式切换控件的文案：**只说点下去会变成什么**，宽屏按钮与窄屏菜单项共用。
+ *
+ * 此前宽屏按钮写当前模式（'均衡负载'）、窄屏菜单项写目标模式（'切换到均衡负载'），
+ * 同一个功能在两种宽度下语义相反；而按钮的默认读法是「写着的就是点了会发生的事」，
+ * 于是宽屏那颗按钮长期被读成「点它切到均衡负载」——恰好与真实状态相反。
+ *
+ * 模式名统一为「优先级模式」/「均衡负载模式」，与切换成功的 toast 逐字一致。
+ */
+function loadBalancingActionLabel(controls: ToolControls): string {
+  if (controls.isLoadingMode) return '调度模式加载中'
+  return controls.loadBalancingMode === 'priority'
+    ? '切换到均衡负载模式'
+    : '切换到优先级模式'
+}
+
 function LoadBalancingButton({ controls }: { controls: ToolControls }) {
   return (
     <Button
@@ -318,16 +330,10 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
       size="sm"
       onClick={controls.handleToggleLoadBalancing}
       disabled={controls.isLoadingMode || controls.isSettingMode}
-      title="切换负载均衡模式"
+      title="点击切换调度模式"
     >
       <Activity className="h-3.5 w-3.5" />
-      <span className="hidden md:inline">
-        {controls.isLoadingMode
-          ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
-      </span>
+      <span className="hidden md:inline">{loadBalancingActionLabel(controls)}</span>
     </Button>
   )
 }

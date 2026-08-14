@@ -13,8 +13,8 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -1191,6 +1191,18 @@ pub struct MultiTokenManager {
     model_cache_generations: Mutex<HashMap<u64, u64>>,
     /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
     model_cache_epoch: AtomicU64,
+    /// 指向自身的弱引用，由 [`Self::install_self_ref`] 在 `Arc` 建成后装入。
+    ///
+    /// 唯一用途：让只持有 `&self` 的方法（`update_credential`、
+    /// `try_reload_credential_from_file` 等都是同步 `&self`）能在清掉某个凭据的模型
+    /// 缓存后就地派一个后台任务把清单重探回来。若不重探，那个凭据会退回「没探过」，
+    /// 而选号的第一排序键正是「探过的排在没探过的前面」，于是它在 balanced 模式下
+    /// 被永久压在其它凭据后面（2026-08-14 实测过这个症状，见
+    /// [`Self::spawn_model_cache_warmup`] 的注释）。
+    ///
+    /// 未装入时（单元测试直接构造 `MultiTokenManager`，不经 `Arc`）重探静默跳过：
+    /// 那等价于本机制引入前的行为，且避免测试触网。
+    self_ref: OnceLock<Weak<MultiTokenManager>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1425,6 +1437,7 @@ impl MultiTokenManager {
             model_refresh_semaphore: Semaphore::new(4),
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
+            self_ref: OnceLock::new(),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1521,6 +1534,45 @@ impl MultiTokenManager {
         let mut generations = self.model_cache_generations.lock();
         *generations.entry(id).or_insert(0) += 1;
         self.model_cache.lock().remove(&id);
+    }
+
+    /// 凭据信息变了（但凭据还在）：清掉旧清单并立刻后台重探一次。
+    ///
+    /// 与直接调用 [`Self::invalidate_model_cache`] 的区别只有「补探」这一下，而这一下
+    /// 是必须的：只清不探会把该凭据留在「没探过」状态，而选号的第一排序键是
+    /// 「探过的排在没探过的前面」且硬压过负载，于是它在 balanced 模式下会被其它
+    /// 已探过的凭据永久挡住，直到有人恰好拉一次模型列表。
+    ///
+    /// 删除凭据请继续用 [`Self::remove_model_cache`]：那时不该再探。
+    fn invalidate_and_reprobe_model_cache(&self, id: u64, reason: &'static str) {
+        self.invalidate_model_cache(id);
+        self.spawn_model_cache_probe_for(id, reason);
+    }
+
+    /// 后台探一次某凭据的模型清单，供只持有 `&self` 的入口使用。
+    ///
+    /// 为什么必须探：`select_next_credential` 的第一排序键是「模型缓存已确认支持该模型」，
+    /// 它**硬压过**成功次数（负载）。而模型缓存只由 [`Self::start_model_cache_warmer`]
+    /// 在进程启动时全量预热一次；此后任何「新增凭据」或「清掉某个凭据的清单」都会留下
+    /// 一个处于 `Unknown` 的凭据，它在 balanced 模式下被已确认的凭据永久挡住，直到有人
+    /// 恰好拉一次 `/v1/models`。
+    ///
+    /// 2026-08-14 实测现场：#22 成功 218 次、#23 成功 244 次，两者均未禁用未冷却，
+    /// 而 #22 连续 40 分钟零次被选中（trace 里 03:28 之后一条 attempt 都没有），
+    /// 因为当时只有 #23 的清单被探到过。
+    ///
+    /// 探测失败只 `warn`：不该让添加凭据 / 刷新 Token 这类操作跟着失败，缓存留空即维持
+    /// `Unknown`，与本机制引入前的行为一致。
+    ///
+    /// 若凭据在探测返回前被删除（批量导入验活失败会回滚删除），`remove_model_cache`
+    /// 已递增该 id 的 generation，写回时的 generation 比对会丢弃这次结果，
+    /// 不会给已删除的 id 留下缓存。
+    fn spawn_model_cache_probe_for(&self, id: u64, reason: &'static str) {
+        match self.self_ref.get().and_then(Weak::upgrade) {
+            Some(manager) => Self::spawn_model_cache_probe(manager, id, reason),
+            // 仅单元测试会走到这里（未经 Arc 构造）：跳过探测，等价于本机制引入前的行为。
+            None => tracing::debug!("凭据 #{} 模型清单探测已跳过（{}）", id, reason),
+        }
     }
 
     fn remove_model_cache(&self, id: u64) {
@@ -1698,6 +1750,36 @@ impl MultiTokenManager {
                     tracing::debug!("没有可用于模型缓存预热的凭据")
                 }
                 Err(error) => tracing::warn!("模型缓存预热失败: {}", error),
+            }
+        });
+    }
+
+    /// 装入指向自身的弱引用，让 `&self` 方法也能派后台重探任务。
+    ///
+    /// 必须在 `Arc::new(manager)` 之后调用一次（`main.rs` 与 `start_model_cache_warmer`
+    /// 相邻）。重复调用无副作用：`OnceLock` 只接受第一次。
+    pub fn install_self_ref(self: &Arc<Self>) {
+        let _ = self.self_ref.set(Arc::downgrade(self));
+    }
+
+    /// 后台探一次某凭据的模型清单并写回缓存。
+    ///
+    /// `reason` 只进日志，用来区分是新增凭据还是某次变更后的补探。
+    fn spawn_model_cache_probe(manager: Arc<Self>, id: u64, reason: &'static str) {
+        tokio::spawn(async move {
+            match manager.refresh_model_cache_for(id, false).await {
+                Ok(response) => tracing::info!(
+                    "凭据 #{} 模型清单已就绪（{}），共 {} 个模型",
+                    id,
+                    reason,
+                    response.models.len()
+                ),
+                Err(error) => tracing::warn!(
+                    "凭据 #{} 模型清单探测失败（{}，之后由发现路径补探）: {}",
+                    id,
+                    reason,
+                    error
+                ),
             }
         });
     }
@@ -2389,7 +2471,7 @@ impl MultiTokenManager {
             }
         }
 
-        self.invalidate_model_cache(id);
+        self.invalidate_and_reprobe_model_cache(id, "IDE token 轮换后自动恢复");
 
         tracing::info!(
             "凭据 #{} 从文件检测到新 refreshToken（疑似 IDE token rotation），已自动恢复，将重试",
@@ -3869,6 +3951,10 @@ impl MultiTokenManager {
         self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
 
+        // 7. 后台探一次模型清单。这里是全部新增路径（单条添加 / 批量导入 / OAuth 登录
+        //    回调）的唯一收口，放在此处就不存在「新加一条入库路径忘了预热」的可能。
+        self.spawn_model_cache_probe_for(new_id, "新增凭据");
+
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
     }
@@ -3921,7 +4007,7 @@ impl MultiTokenManager {
             }
         }
         if invalidate_models {
-            self.invalidate_model_cache(id);
+            self.invalidate_and_reprobe_model_cache(id, "凭据代理变更");
         }
         self.persist_credentials()?;
         Ok(())
@@ -4121,7 +4207,7 @@ impl MultiTokenManager {
             entry.credentials.expires_at = new_expires_at;
             entry.refresh_failure_count = 0;
         }
-        self.invalidate_model_cache(id);
+        self.invalidate_and_reprobe_model_cache(id, "更换 refreshToken");
         self.persist_credentials()?;
         tracing::info!("凭据 #{} refreshToken 已更新", id);
         Ok(())
@@ -4179,7 +4265,7 @@ impl MultiTokenManager {
             entry.reset_health();
         }
 
-        self.invalidate_model_cache(id);
+        self.invalidate_and_reprobe_model_cache(id, "IdC 重新登录");
         self.persist_credentials()?;
         self.select_highest_priority();
         tracing::info!("凭据 #{} IdC 登录凭据已完整更新", id);
@@ -4217,7 +4303,7 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
             }
         }
-        self.invalidate_model_cache(id);
+        self.invalidate_and_reprobe_model_cache(id, "强制刷新 Token");
 
         // 持久化
         if let Err(e) = self.persist_credentials() {
@@ -6695,6 +6781,64 @@ mod tests {
                 None,
             )
             .unwrap();
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Unknown
+        );
+    }
+
+    /// 回归锁：未装自引用时（单元测试直接构造，无 tokio 运行时）补探必须静默跳过。
+    ///
+    /// 若哪天把 `invalidate_and_reprobe_model_cache` 里的 `Weak` 判断删掉、改成无条件
+    /// `tokio::spawn`，本测试会因「no reactor running」直接 panic —— 生产里同样的写法
+    /// 会让 `update_credential` 这类同步入口在非运行时线程上崩掉。
+    #[test]
+    fn reprobe_without_self_ref_is_a_plain_invalidation() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["glm-5"]);
+        let generation_before = manager.model_cache_generation(1);
+
+        manager.invalidate_and_reprobe_model_cache(1, "测试");
+
+        assert_eq!(
+            manager.cached_model_support(1, Some("glm-5")),
+            CachedModelSupport::Unknown
+        );
+        assert_eq!(
+            manager.model_cache_generation(1),
+            generation_before + 1,
+            "代数必须递增，否则在途旧请求会把过期清单写回来"
+        );
+    }
+
+    /// 回归锁：装了自引用之后，同步入口调用补探也不能 panic，且清单照旧被清掉。
+    ///
+    /// 探测本体是分离出去的后台任务，本测试不等它（运行时随测试结束一并丢弃），
+    /// 只锁「调用点同步部分的行为」。
+    #[tokio::test]
+    async fn reprobe_with_self_ref_installed_still_invalidates() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("token", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        manager.install_self_ref();
+        seed_model_cache(&manager, 1, &["glm-5"]);
+
+        manager.invalidate_and_reprobe_model_cache(1, "测试");
 
         assert_eq!(
             manager.cached_model_support(1, Some("glm-5")),

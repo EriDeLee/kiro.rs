@@ -175,6 +175,9 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 装入自引用：凭据变更（换 token / 改代理 / 重新登录）清掉模型清单后要能就地补探，
+    // 否则该凭据退回「没探过」，在均衡负载模式下会被已探过的凭据永久挡住。
+    token_manager.install_self_ref();
     token_manager.start_model_cache_warmer();
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
