@@ -71,12 +71,19 @@ function credentialChartAxes() {
       key="x"
       dataKey="label"
       tick={{ fontSize: 10 }}
+      className="fill-muted-foreground"
       angle={-30}
       textAnchor="end"
       interval={0}
       height={64}
     />,
-    <YAxis key="y" tick={{ fontSize: 11 }} tickFormatter={(v: number) => formatNumber(v)} width={42} />,
+    <YAxis
+      key="y"
+      tick={{ fontSize: 11 }}
+      className="fill-muted-foreground"
+      tickFormatter={(v: number) => formatNumber(v)}
+      width={42}
+    />,
   ]
 }
 

@@ -335,7 +335,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const getStatusIcon = (status: VerificationResult['status']) => {
     switch (status) {
       case 'pending':
-        return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
+        return <div className="w-5 h-5 rounded-full border-2 border-muted-foreground/40" />
       case 'checking':
       case 'verifying':
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />

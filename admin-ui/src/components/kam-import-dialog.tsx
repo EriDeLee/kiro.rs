@@ -500,7 +500,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const getStatusIcon = (status: VerificationResult['status']) => {
     switch (status) {
       case 'pending':
-        return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
+        return <div className="w-5 h-5 rounded-full border-2 border-muted-foreground/40" />
       case 'checking':
       case 'verifying':
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
@@ -511,7 +511,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
       case 'skipped':
-        return <AlertCircle className="w-5 h-5 text-gray-400" />
+        return <AlertCircle className="w-5 h-5 text-muted-foreground" />
       case 'failed':
         return <XCircle className="w-5 h-5 text-red-500" />
     }
@@ -665,7 +665,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 <span className="text-red-600 dark:text-red-400">
                   ✗ 失败: {results.filter(r => r.status === 'failed').length}
                 </span>
-                <span className="text-gray-500">
+                <span className="text-muted-foreground">
                   ○ 跳过: {results.filter(r => r.status === 'skipped').length}
                 </span>
               </div>
