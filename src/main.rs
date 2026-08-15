@@ -212,10 +212,7 @@ async fn main() {
             admin::ClientKeyManager::new()
         }),
     );
-    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
-        cache_dir.clone(),
-        config.usage_log_retention_days as i64,
-    ));
+    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::new(cache_dir.clone()));
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
 
@@ -250,15 +247,15 @@ async fn main() {
         }
     };
 
-    // 启动后定期清理过期 usage_log 与 trace 记录
+    // 启动后定期清理过期 trace 记录。
+    // usage_log 的 JSONL 不在此列 —— 它是唯一的用量账本，一律保留，裁剪只发生在
+    // UsageAggregator 的装载窗口与桶容量上（见 usage_stats.rs 的 STATS_WINDOW_DAYS）。
     {
-        let recorder = usage_recorder.clone();
         let trace_store = trace_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
-                recorder.cleanup_old_logs();
                 if let Some(ts) = &trace_store {
                     ts.cleanup();
                 }
@@ -300,10 +297,7 @@ async fn main() {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
                     .with_kiro_provider(kiro_provider.clone())
-                    .with_log_governance(
-                        Some(admin_trace_store.clone()),
-                        Some(usage_recorder.clone()),
-                    );
+                    .with_log_governance(Some(admin_trace_store.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

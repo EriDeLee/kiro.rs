@@ -353,7 +353,7 @@ export interface UpdateClientKeyRequest {
 
 // ============ 用量统计 ============
 
-export type StatsRange = '24h' | '7d' | '30d'
+export type StatsRange = '24h' | '7d' | '30d' | '12m'
 export type StatsGranularity = 'hour' | 'day'
 
 export interface StatsTimeFilter {

@@ -1,10 +1,12 @@
 //! 请求用量记录 + 时序聚合
 //!
 //! 记录每次 `/v1/messages` 请求的 token 消耗与命中信息：
-//! - 落盘：`usage_log.YYYY-MM-DD.jsonl`，每行一条 [`UsageRecord`]，按本地日期滚动
-//! - 内存：[`UsageAggregator`] 维护近 31 天的小时桶 + 近 31 天的天桶，按需查询
+//! - 落盘：`usage_log.YYYY-MM-DD.jsonl`，每行一条 [`UsageRecord`]，按本地日期滚动。
+//!   **JSONL 文件永不删除** —— 它是唯一的用量账本，删掉就再也算不出历史总量。
+//! - 内存：[`UsageAggregator`] 维护近 31 天的小时桶 + 近 [`STATS_WINDOW_DAYS`] 天的天桶
 //!
-//! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
+//! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。裁剪只发生在这里
+//! （装载窗口 + 桶容量），磁盘上的文件一律保留。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -16,12 +18,19 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike,
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-/// JSONL 文件保留天数
-const RETENTION_DAYS: i64 = 31;
-/// 小时桶数量（31 天）
+/// 天粒度统计窗口：既是启动时装载多少天的 JSONL（[`UsageAggregator::rebuild_from_logs`]），
+/// 也是天桶容量（[`DAY_BUCKETS`]）。两者必须相等，否则要么装载了放不进桶的数据（白读），
+/// 要么桶有容量却没数据可放（前端选了区间也是空的），所以合成同一个常量。
+///
+/// 400 = 前端「12 个月」视图需要的 365 天 + 35 天缓冲，保证最旧那一周不被截断。
+/// 与文件保留无关：JSONL 一律不删，超出本窗口的文件留在磁盘上做归档、不装载。
+const STATS_WINDOW_DAYS: i64 = 400;
+/// 小时桶数量（31 天）。小时粒度只服务 24h / 7d / 30d 三个预设，不跟随
+/// [`STATS_WINDOW_DAYS`] —— 一年前的小时级明细没有意义，而每条记录都要在整个桶数组上
+/// 做线性查找（见 `upsert_bucket`），拉大代价直接反映在启动重建耗时上。
 const HOUR_BUCKETS: usize = 24 * 31;
-/// 天桶数量（31 天）
-const DAY_BUCKETS: usize = 31;
+/// 天桶数量，见 [`STATS_WINDOW_DAYS`]
+const DAY_BUCKETS: usize = STATS_WINDOW_DAYS as usize;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,8 +60,6 @@ pub struct UsageRecord {
 pub struct UsageRecorder {
     inner: Mutex<RecorderState>,
     dir: PathBuf,
-    /// 保留天数（运行时可改），cleanup_old_logs 时读取。
-    retention_days: std::sync::atomic::AtomicI64,
 }
 
 struct RecorderState {
@@ -62,8 +69,7 @@ struct RecorderState {
 }
 
 impl UsageRecorder {
-    /// 指定初始保留天数构造
-    pub fn with_retention(dir: PathBuf, retention_days: i64) -> Self {
+    pub fn new(dir: PathBuf) -> Self {
         // 兜底：调用方传入空路径时归一为 "."，避免 join 出无目录前缀的路径导致写入 CWD
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -81,7 +87,6 @@ impl UsageRecorder {
                 writer: None,
             }),
             dir,
-            retention_days: std::sync::atomic::AtomicI64::new(retention_days.max(1)),
         }
     }
 
@@ -125,38 +130,6 @@ impl UsageRecorder {
         }
     }
 
-    /// 获取保留天数
-    pub fn retention_days(&self) -> i64 {
-        self.retention_days
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// 设置保留天数（>=1）
-    pub fn set_retention_days(&self, days: i64) {
-        self.retention_days
-            .store(days.max(1), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// 清理超过保留期的旧文件
-    pub fn cleanup_old_logs(&self) {
-        let cutoff = Local::now().date_naive() - Duration::days(self.retention_days());
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(it) => it,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let name = match entry.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if let Some(date) = parse_usage_log_filename(&name) {
-                if date < cutoff {
-                    let _ = std::fs::remove_file(entry.path());
-                    tracing::info!("已清理过期 usage_log: {}", name);
-                }
-            }
-        }
-    }
 }
 
 fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
@@ -358,7 +331,7 @@ impl UsageAggregator {
                 return;
             }
         };
-        let cutoff = Local::now().date_naive() - Duration::days(RETENTION_DAYS);
+        let cutoff = Local::now().date_naive() - Duration::days(STATS_WINDOW_DAYS);
         let mut count = 0u64;
         for entry in entries.flatten() {
             let name = match entry.file_name().into_string() {

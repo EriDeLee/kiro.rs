@@ -435,13 +435,12 @@ function Select({
   )
 }
 
-/** 日志治理设置下拉：trace 启用开关 + trace 保留天数 + usage 保留天数 */
+/** 日志治理设置下拉：trace 启用开关 + trace 保留天数 */
 function GovernanceButton() {
   const [open, setOpen] = useState(false)
   const { data: cfg, isLoading } = useLogGovernanceConfig()
   const { mutate, isPending } = useSetLogGovernanceConfig()
   const [traceDays, setTraceDays] = useState('')
-  const [usageDays, setUsageDays] = useState('')
 
   const enabled = cfg?.traceEnabled ?? true
 
@@ -454,7 +453,7 @@ function GovernanceButton() {
 
   const submitDays = (
     e: React.FormEvent,
-    field: 'traceRetentionDays' | 'usageLogRetentionDays',
+    field: 'traceRetentionDays',
     raw: string,
     reset: () => void,
   ) => {
@@ -520,27 +519,9 @@ function GovernanceButton() {
             保存
           </Button>
         </form>
-        <DropdownMenuLabel className="pt-1">
-          usage 日志保留天数（当前 {cfg?.usageLogRetentionDays ?? '—'}）
-        </DropdownMenuLabel>
-        <form
-          onSubmit={(e) => submitDays(e, 'usageLogRetentionDays', usageDays, () => setUsageDays(''))}
-          className="flex items-center gap-1.5 px-2 pb-2"
-        >
-          <Input
-            type="number"
-            min={1}
-            max={365}
-            placeholder="天数"
-            value={usageDays}
-            onChange={(e) => setUsageDays(e.target.value)}
-            disabled={isPending}
-            className="h-7 text-xs"
-          />
-          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !usageDays.trim()}>
-            保存
-          </Button>
-        </form>
+        <p className="px-2 pb-2 pt-1 text-[11px] leading-snug text-muted-foreground">
+          用量日志（usage_log.*.jsonl）永久保留，没有保留天数可调 —— 它是唯一的用量账本。
+        </p>
       </DropdownMenuContent>
     </DropdownMenu>
   )

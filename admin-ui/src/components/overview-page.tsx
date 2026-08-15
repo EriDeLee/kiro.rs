@@ -20,6 +20,7 @@ import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
+import type { ChartGranularity } from '@/components/charts/time-series-chart'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -33,12 +34,42 @@ const RANGES: { label: string; value: StatsRange }[] = [
   { label: '24 小时', value: '24h' },
   { label: '7 天', value: '7d' },
   { label: '30 天', value: '30d' },
+  { label: '12 个月', value: '12m' },
 ]
 
-const GRANULARITIES: { label: string; value: StatsGranularity }[] = [
-  { label: '按小时', value: 'hour' },
-  { label: '按天', value: 'day' },
-]
+/** 「12 个月」视图的天数跨度；图表按 7 天一组合并成周点，约 52 个 */
+const LONG_RANGE_DAYS = 364
+/**
+ * 后端天桶容量，与 `usage_stats.rs` 的 `STATS_WINDOW_DAYS` 对齐。
+ * 自定义区间超过这个跨度时，更早的那部分没有桶，只用于提示而不改查询。
+ */
+const STATS_WINDOW_DAYS = 400
+
+const GRANULARITY_LABELS: Record<ChartGranularity, string> = {
+  hour: '按小时',
+  day: '按天',
+  week: '按周',
+}
+
+/**
+ * 粒度由区间唯一决定，不给选。
+ *
+ * - `24h`：小时。这也是唯一用小时的地方 —— 后端小时桶只有 31 天
+ *   （`HOUR_BUCKETS = 24 * 31`），更长的区间按小时查会只返回最近 31 天的点，
+ *   卡片总额跟着变小且不报错，所以别把小时放开给别的区间。
+ * - `7d` / `30d` / 日历自定义（`undefined`）：天。
+ * - `12m`：周。一年 365 个天点挤成一片，合并成 52 个周点才看得清。
+ */
+function granularityForRange(range?: StatsRange): ChartGranularity {
+  if (range === '24h') return 'hour'
+  if (range === '12m') return 'week'
+  return 'day'
+}
+
+/** 周点是前端合并出来的，发给后端的查询粒度仍是天 */
+function queryGranularityOf(display: ChartGranularity): StatsGranularity {
+  return display === 'week' ? 'day' : display
+}
 
 function toDateInputValue(d: Date): string {
   const year = d.getFullYear()
@@ -56,18 +87,85 @@ function customTimeFilter(
 }
 
 function presetStartDate(range: StatsRange, endDate: string): string {
-  const days = range === '24h' ? 1 : range === '7d' ? 6 : 29
+  const days =
+    range === '24h' ? 1 : range === '7d' ? 6 : range === '30d' ? 29 : LONG_RANGE_DAYS
   const d = new Date(`${endDate}T00:00:00`)
   d.setDate(d.getDate() - days)
   return toDateInputValue(d)
+}
+
+/** 该时间点所在自然周的周一 0 点（本地时区，与后端天桶同一时区口径） */
+function weekStartOf(ts: string): Date {
+  const d = new Date(ts)
+  const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7))
+  return monday
+}
+
+function emptyWeek(ts: string): TimeSeriesPoint {
+  return { ts, inputTokens: 0, outputTokens: 0, calls: 0, errors: 0, credits: 0 }
+}
+
+/**
+ * 把天点合并成**自然周**点。仅用于图表展示；卡片总额走 aggregateSeries 对原始天点
+ * 求和，不受这里影响（两者求和结果相同）。
+ *
+ * 必须按日历分箱、不能按"每 7 个点一组"：后端只返回有数据的天，没请求的那些天根本
+ * 没有桶。按点数切的话，一段空档会把它两侧的日子挤进同一组 —— 实测出现过一个"周"
+ * 横跨 7/27 到 8/8 共 13 个日历天，X 轴就不再是时间轴了。
+ *
+ * 同理，首尾之间缺的周补 0，让空档显示成真实的低谷而不是被折叠掉。首周之前不补，
+ * 免得「12 个月」视图拖着一长条无数据的零线。
+ */
+function rollupWeekly(data: TimeSeriesPoint[]): TimeSeriesPoint[] {
+  if (data.length === 0) return data
+  const buckets = new Map<number, TimeSeriesPoint>()
+  for (const p of data) {
+    const start = weekStartOf(p.ts)
+    const key = start.getTime()
+    const cur = buckets.get(key)
+    if (cur) {
+      cur.inputTokens += p.inputTokens
+      cur.outputTokens += p.outputTokens
+      cur.calls += p.calls
+      cur.errors += p.errors
+      cur.credits += p.credits ?? 0
+    } else {
+      buckets.set(key, {
+        ts: start.toISOString(),
+        inputTokens: p.inputTokens,
+        outputTokens: p.outputTokens,
+        calls: p.calls,
+        errors: p.errors,
+        credits: p.credits ?? 0,
+      })
+    }
+  }
+  const keys = [...buckets.keys()].sort((a, b) => a - b)
+  const last = keys[keys.length - 1]
+  const out: TimeSeriesPoint[] = []
+  // 用 setDate 而不是加固定毫秒数推进，跨夏令时也能落在本地周一 0 点
+  for (const cursor = new Date(keys[0]); cursor.getTime() <= last; cursor.setDate(cursor.getDate() + 7)) {
+    out.push(buckets.get(cursor.getTime()) ?? emptyWeek(cursor.toISOString()))
+  }
+  return out
+}
+
+/** 含首尾的天数跨度；任一端为空返回 0 */
+function daysBetween(startDate?: string, endDate?: string): number {
+  if (!startDate || !endDate) return 0
+  const start = new Date(`${startDate}T00:00:00`).getTime()
+  const end = new Date(`${endDate}T00:00:00`).getTime()
+  if (Number.isNaN(start) || Number.isNaN(end)) return 0
+  return Math.round((end - start) / 86400000) + 1
 }
 
 function formatDateText(value: string): string {
   return value.replace(/-/g, '/')
 }
 
-function timeLabel(filter: StatsTimeFilter): string {
-  const suffix = filter.granularity === 'day' ? '按天' : '按小时'
+function timeLabel(filter: StatsTimeFilter, display: ChartGranularity): string {
+  const suffix = GRANULARITY_LABELS[display]
   if (filter.range) {
     const range = RANGES.find((r) => r.value === filter.range)?.label ?? filter.range
     return `近 ${range} · ${suffix}`
@@ -87,6 +185,12 @@ export function OverviewPage() {
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
   const rangeStats = useMemo(() => aggregateSeries(seriesData), [seriesData])
+  // 「按周」时把天点合并成周点再画，否则一年 365 根线挤成一片。
+  // 卡片用的是未合并的 seriesData，两者求和相同。
+  const chartData = useMemo(
+    () => (filters.appliedGranularity === 'week' ? rollupWeekly(seriesData) : seriesData),
+    [seriesData, filters.appliedGranularity],
+  )
   const selectedKeyLabel = selectedStatsKeyLabel(filters.keyFilter, keysData?.keys ?? [])
   const groupFilterActive = filters.groupFilter !== 'all'
 
@@ -97,7 +201,7 @@ export function OverviewPage() {
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
         stats={rangeStats}
-        timeText={timeLabel(filters.timeFilter)}
+        timeText={timeLabel(filters.timeFilter, filters.appliedGranularity)}
       />
       <KeyFilterCard
         keyFilter={filters.keyFilter}
@@ -109,23 +213,23 @@ export function OverviewPage() {
         onGroupChange={filters.setGroupFilter}
       />
       <TrendCard
+        appliedGranularity={filters.appliedGranularity}
         customEndDate={filters.customEndDate}
         customStartDate={filters.customStartDate}
-        draftGranularity={filters.draftGranularity}
         draftRange={filters.draftRange}
         keyFilter={filters.keyFilter}
-        seriesData={seriesData}
+        seriesData={chartData}
         timeFilter={filters.timeFilter}
-        onApplyCustomRange={filters.applyCustomRange}
         onCustomEndDateChange={filters.setCustomEndDate}
         onCustomStartDateChange={filters.setCustomStartDate}
-        onGranularityChange={filters.setDraftGranularity}
         onPresetRangeChange={filters.selectPresetRange}
+        rangeInvalid={filters.rangeInvalid}
+        spanExceedsWindow={filters.spanExceedsWindow}
       />
       <DistributionPanels
         byCred={credData}
         byModel={modelData}
-        timeText={timeLabel(filters.timeFilter)}
+        timeText={timeLabel(filters.timeFilter, filters.appliedGranularity)}
         groupFilterActive={groupFilterActive}
       />
     </div>
@@ -134,12 +238,15 @@ export function OverviewPage() {
 
 function useOverviewFilters() {
   const today = useMemo(() => toDateInputValue(new Date()), [])
+  const initialStart = useMemo(() => presetStartDate('24h', today), [today])
   const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(() =>
-    customTimeFilter(presetStartDate('24h', today), today, 'hour'),
+    customTimeFilter(initialStart, today, 'hour'),
   )
-  const [customStartDate, setCustomStartDate] = useState(() => presetStartDate('24h', today))
+  const [customStartDate, setCustomStartDate] = useState(initialStart)
   const [customEndDate, setCustomEndDate] = useState(today)
-  const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>('hour')
+  // 已应用的展示粒度。图表按它决定是否合并成周。它必须是 state 而不是从当前区间派生：
+  // 日期填成非法时不发查询、图仍是上一次的结果，派生值会先变，标题就与图对不上。
+  const [appliedGranularity, setAppliedGranularity] = useState<ChartGranularity>('hour')
   const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
   const [keyFilter, setKeyFilter] = useState('all')
   const [groupFilter, setGroupFilter] = useState('all')
@@ -149,36 +256,51 @@ function useOverviewFilters() {
     if (groupFilter !== 'all') f.group = groupFilter
     return f
   }, [keyFilter, groupFilter])
-  const applyCustomRange = () => {
-    setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
+  const rangeInvalid = !customStartDate || !customEndDate || customEndDate < customStartDate
+  const spanExceedsWindow = daysBetween(customStartDate, customEndDate) > STATS_WINDOW_DAYS
+
+  /**
+   * 立即生效。日期非法（缺一端 / 结束早于开始）时不发查询，保留上一次的有效结果 ——
+   * 界面上另有一行提示说明为什么没变，不做无声的空操作。
+   */
+  const apply = (startDate: string, endDate: string, range?: StatsRange) => {
+    if (!startDate || !endDate || endDate < startDate) return
+    const display = granularityForRange(range)
+    setTimeFilter(customTimeFilter(startDate, endDate, queryGranularityOf(display)))
+    setAppliedGranularity(display)
   }
+
   const updateCustomStartDate = (value: string) => {
     setCustomStartDate(value)
     setDraftRange(undefined)
+    apply(value, customEndDate)
   }
   const updateCustomEndDate = (value: string) => {
     setCustomEndDate(value)
     setDraftRange(undefined)
+    apply(customStartDate, value)
   }
   const selectPresetRange = (range: StatsRange) => {
     const endDate = toDateInputValue(new Date())
-    setCustomStartDate(presetStartDate(range, endDate))
+    const startDate = presetStartDate(range, endDate)
+    setCustomStartDate(startDate)
     setCustomEndDate(endDate)
     setDraftRange(range)
+    apply(startDate, endDate, range)
   }
   return {
-    applyCustomRange,
+    appliedGranularity,
     customEndDate,
     customStartDate,
-    draftGranularity,
     draftRange,
     keyFilter,
     groupFilter,
+    rangeInvalid,
     selectPresetRange,
     setCustomEndDate: updateCustomEndDate,
     setCustomStartDate: updateCustomStartDate,
-    setDraftGranularity,
     setKeyFilter,
+    spanExceedsWindow,
     setGroupFilter,
     statsFilter,
     timeFilter,
@@ -338,66 +460,65 @@ function KeyFilterCard({
 }
 
 interface TrendCardProps {
+  appliedGranularity: ChartGranularity
   customEndDate: string
   customStartDate: string
-  draftGranularity: StatsGranularity
   draftRange?: StatsRange
   keyFilter: string
-  onApplyCustomRange: () => void
   onCustomEndDateChange: (value: string) => void
   onCustomStartDateChange: (value: string) => void
-  onGranularityChange: (value: StatsGranularity) => void
   onPresetRangeChange: (value: StatsRange) => void
+  rangeInvalid: boolean
   seriesData: TimeSeriesPoint[]
+  spanExceedsWindow: boolean
   timeFilter: StatsTimeFilter
 }
 
 function TrendCard({
+  appliedGranularity,
   customEndDate,
   customStartDate,
-  draftGranularity,
   draftRange,
   keyFilter,
-  onApplyCustomRange,
   onCustomEndDateChange,
   onCustomStartDateChange,
-  onGranularityChange,
   onPresetRangeChange,
+  rangeInvalid,
   seriesData,
+  spanExceedsWindow,
   timeFilter,
 }: TrendCardProps) {
-  const chartKey = `${timeLabel(timeFilter)}:${keyFilter}`
+  const chartKey = `${timeLabel(timeFilter, appliedGranularity)}:${keyFilter}`
   return (
     <Card className="mb-6">
       <CardContent className="p-4 sm:p-5">
         <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-          <TrendTitle granularity={timeFilter.granularity} />
+          <TrendTitle granularity={appliedGranularity} />
           <TrendControls
             customEndDate={customEndDate}
             customStartDate={customStartDate}
-            draftGranularity={draftGranularity}
             draftRange={draftRange}
-            onApplyCustomRange={onApplyCustomRange}
             onCustomEndDateChange={onCustomEndDateChange}
             onCustomStartDateChange={onCustomStartDateChange}
-            onGranularityChange={onGranularityChange}
             onPresetRangeChange={onPresetRangeChange}
+            rangeInvalid={rangeInvalid}
+            spanExceedsWindow={spanExceedsWindow}
           />
         </div>
         <div key={chartKey} className="chart-range-fade">
-          <TimeSeriesChart data={seriesData} granularity={timeFilter.granularity} />
+          <TimeSeriesChart data={seriesData} granularity={appliedGranularity} />
         </div>
       </CardContent>
     </Card>
   )
 }
 
-function TrendTitle({ granularity }: { granularity: StatsGranularity }) {
+function TrendTitle({ granularity }: { granularity: ChartGranularity }) {
   return (
     <div>
       <h2 className="text-base font-semibold tracking-tight">Token 使用趋势</h2>
       <p className="text-[12px] text-muted-foreground">
-        {granularity === 'day' ? '按天' : '按小时'}聚合 · 输入/输出
+        {GRANULARITY_LABELS[granularity]}聚合 · 输入/输出
       </p>
     </div>
   )
@@ -406,32 +527,30 @@ function TrendTitle({ granularity }: { granularity: StatsGranularity }) {
 function TrendControls({
   customEndDate,
   customStartDate,
-  draftGranularity,
   draftRange,
-  onApplyCustomRange,
   onCustomEndDateChange,
   onCustomStartDateChange,
-  onGranularityChange,
   onPresetRangeChange,
+  rangeInvalid,
+  spanExceedsWindow,
 }: {
   customEndDate: string
   customStartDate: string
-  draftGranularity: StatsGranularity
   draftRange?: StatsRange
-  onApplyCustomRange: () => void
   onCustomEndDateChange: (value: string) => void
   onCustomStartDateChange: (value: string) => void
-  onGranularityChange: (value: StatsGranularity) => void
   onPresetRangeChange: (value: StatsRange) => void
+  rangeInvalid: boolean
+  spanExceedsWindow: boolean
 }) {
   return (
     <div className="flex w-full flex-col gap-2 lg:w-auto lg:flex-row lg:flex-wrap lg:items-end lg:justify-end">
       <PresetRangeButtons currentRange={draftRange} onChange={onPresetRangeChange} />
-      <GranularitySelect value={draftGranularity} onChange={onGranularityChange} />
       <DateRangeInputs
         endDate={customEndDate}
+        invalid={rangeInvalid}
+        spanExceedsWindow={spanExceedsWindow}
         startDate={customStartDate}
-        onApply={onApplyCustomRange}
         onEndDateChange={onCustomEndDateChange}
         onStartDateChange={onCustomStartDateChange}
       />
@@ -447,7 +566,7 @@ function PresetRangeButtons({
   onChange: (value: StatsRange) => void
 }) {
   return (
-    <div className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:items-center">
+    <div className="grid grid-cols-2 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:items-center">
       {RANGES.map((r) => (
         <Button
           key={r.value}
@@ -463,55 +582,40 @@ function PresetRangeButtons({
   )
 }
 
-function GranularitySelect({
-  onChange,
-  value,
-}: {
-  onChange: (value: StatsGranularity) => void
-  value: StatsGranularity
-}) {
-  return (
-    <Select value={value} onValueChange={(v) => onChange(v as StatsGranularity)}>
-      <SelectTrigger className="h-8 w-full lg:w-[96px]">
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent align="end">
-        {GRANULARITIES.map((g) => (
-          <SelectItem key={g.value} value={g.value}>
-            {g.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  )
-}
-
 function DateRangeInputs({
   endDate,
-  onApply,
+  invalid,
   onEndDateChange,
   onStartDateChange,
+  spanExceedsWindow,
   startDate,
 }: {
   endDate: string
-  onApply: () => void
+  invalid: boolean
   onEndDateChange: (value: string) => void
   onStartDateChange: (value: string) => void
+  spanExceedsWindow: boolean
   startDate: string
 }) {
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[374px]:grid-cols-1 lg:flex lg:items-center">
-      <DateInput value={startDate} onChange={onStartDateChange} />
-      <span className="text-center text-xs text-muted-foreground max-[374px]:hidden">至</span>
-      <DateInput value={endDate} onChange={onEndDateChange} />
-      <Button
-        size="sm"
-        className="col-span-3 h-8 px-3 text-xs max-[374px]:col-span-1 lg:col-span-1"
-        disabled={!startDate || !endDate || endDate < startDate}
-        onClick={onApply}
-      >
-        应用
-      </Button>
+    <div className="min-w-0">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[374px]:grid-cols-1 lg:flex lg:items-center">
+        <DateInput value={startDate} onChange={onStartDateChange} />
+        <span className="text-center text-xs text-muted-foreground max-[374px]:hidden">至</span>
+        <DateInput value={endDate} onChange={onEndDateChange} />
+      </div>
+      {/* 日期非法时上面的图保持上一次的结果，这里说明原因，不做无声的空操作 */}
+      {invalid && (
+        <p className="mt-1 text-[11px] text-destructive">
+          结束日期不能早于开始日期，图表仍显示上一次的区间
+        </p>
+      )}
+      {/* 超出统计窗口的那一段没有桶，查了也是空的，说清楚而不是让人以为那段真的没用量 */}
+      {!invalid && spanExceedsWindow && (
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          统计只保留最近 {STATS_WINDOW_DAYS} 天，更早的区间没有数据
+        </p>
+      )}
     </div>
   )
 }

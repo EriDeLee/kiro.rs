@@ -498,7 +498,6 @@ export async function setSelfHealConfig(
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
-  usageLogRetentionDays: number
 }
 
 // 获取日志治理配置

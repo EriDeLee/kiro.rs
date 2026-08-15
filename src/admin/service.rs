@@ -177,8 +177,6 @@ pub struct AdminService {
     social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
     /// 请求链路追踪存储（用于日志治理：开关 + 保留天数运行时可改）
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
-    /// 用量日志记录器（用于日志治理：保留天数运行时可改）
-    usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
 }
 
 /// Social 登录会话状态
@@ -380,7 +378,6 @@ impl AdminService {
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
-            usage_recorder: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -411,14 +408,14 @@ impl AdminService {
         &self.token_manager
     }
 
-    /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
+    /// 注入 trace 存储句柄，用于运行时改 trace 保留期/开关。
+    ///
+    /// 不含 usage 记录器 —— usage_log 的 JSONL 一律保留，没有可供运行时调节的量。
     pub fn with_log_governance(
         mut self,
         trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
-        usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     ) -> Self {
         self.trace_store = trace_store;
-        self.usage_recorder = usage_recorder;
         self
     }
 
@@ -1365,11 +1362,6 @@ impl AdminService {
                 .as_ref()
                 .map(|s| s.retention_days() as u32)
                 .unwrap_or(cfg.trace_retention_days),
-            usage_log_retention_days: self
-                .usage_recorder
-                .as_ref()
-                .map(|r| r.retention_days() as u32)
-                .unwrap_or(cfg.usage_log_retention_days),
         }
     }
 
@@ -1379,27 +1371,18 @@ impl AdminService {
         &self,
         req: SetLogGovernanceConfigRequest,
     ) -> Result<LogGovernanceConfigResponse, AdminServiceError> {
-        if req.trace_enabled.is_none()
-            && req.trace_retention_days.is_none()
-            && req.usage_log_retention_days.is_none()
-        {
+        if req.trace_enabled.is_none() && req.trace_retention_days.is_none() {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 traceEnabled / traceRetentionDays / usageLogRetentionDays 一个字段"
-                    .to_string(),
+                "至少提供 traceEnabled / traceRetentionDays 一个字段".to_string(),
             ));
         }
         // 校验范围：保留天数 1..=365
-        for (name, v) in [
-            ("traceRetentionDays", req.trace_retention_days),
-            ("usageLogRetentionDays", req.usage_log_retention_days),
-        ] {
-            if let Some(d) = v {
-                if !(1..=365).contains(&d) {
-                    return Err(AdminServiceError::InvalidCredential(format!(
-                        "{} 必须在 1..=365 内: {}",
-                        name, d
-                    )));
-                }
+        if let Some(d) = req.trace_retention_days {
+            if !(1..=365).contains(&d) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "traceRetentionDays 必须在 1..=365 内: {}",
+                    d
+                )));
             }
         }
 
@@ -1412,11 +1395,6 @@ impl AdminService {
         if let Some(days) = req.trace_retention_days {
             if let Some(s) = &self.trace_store {
                 s.set_retention_days(days);
-            }
-        }
-        if let Some(days) = req.usage_log_retention_days {
-            if let Some(r) = &self.usage_recorder {
-                r.set_retention_days(days as i64);
             }
         }
 
@@ -1438,9 +1416,6 @@ impl AdminService {
             }
             if let Some(value) = req.trace_retention_days {
                 config.trace_retention_days = value;
-            }
-            if let Some(value) = req.usage_log_retention_days {
-                config.usage_log_retention_days = value;
             }
         })
     }

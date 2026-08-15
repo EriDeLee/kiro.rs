@@ -182,10 +182,6 @@ pub struct Config {
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
 
-    /// 请求用量日志（usage_log.*.jsonl + 聚合桶）保留天数（默认 31）。
-    #[serde(default = "default_usage_log_retention_days")]
-    pub usage_log_retention_days: u32,
-
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -293,10 +289,6 @@ fn default_trace_retention_days() -> u32 {
     7
 }
 
-fn default_usage_log_retention_days() -> u32 {
-    31
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -332,7 +324,6 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
-            usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             config_path: None,
         }

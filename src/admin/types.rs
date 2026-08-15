@@ -556,8 +556,6 @@ pub struct LogGovernanceConfigResponse {
     pub trace_enabled: bool,
     /// trace 记录保留天数
     pub trace_retention_days: u32,
-    /// 用量日志保留天数
-    pub usage_log_retention_days: u32,
 }
 
 /// 更新日志治理配置（字段缺省表示不修改）
@@ -569,9 +567,6 @@ pub struct SetLogGovernanceConfigRequest {
     /// trace 保留天数，1..=365
     #[serde(default)]
     pub trace_retention_days: Option<u32>,
-    /// 用量日志保留天数，1..=365
-    #[serde(default)]
-    pub usage_log_retention_days: Option<u32>,
 }
 
 // ============ 代理池 ============

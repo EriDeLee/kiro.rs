@@ -8,6 +8,5 @@
   "defaultEndpoint": "ide",
   "modelCacheTtlSecs": 3600,
   "traceEnabled": true,
-  "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "traceRetentionDays": 7
 }

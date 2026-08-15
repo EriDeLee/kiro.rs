@@ -6,8 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **概览页新增「12 个月」区间。** 跨度 364 天，图表把天点按**自然周**合并（约 52 个点），首尾之间缺的周补 0；卡片仍对未合并的天点求和，两者总额一致。必须按日历分箱而不是「每 7 个点一组」：后端只返回有数据的天，按点数切会把一段空档两侧的日子挤进同一组 —— 实测出现过一个「周」横跨 7/27 到 8/8 共 13 个日历天，X 轴就不再是时间轴了。
+
 ### Changed
 
+- **概览页去掉粒度选择器与「应用」按钮：粒度由区间唯一决定，切换即生效。** `24h`→按小时，`7d` / `30d` / 日历自定义→按天，`12m`→按周。此前粒度是独立下拉框 + 一个「应用」按钮，两者组合能产出静默错误的视图：小时桶只有 31 天（`HOUR_BUCKETS = 24 * 31`），用小时粒度查更长区间时后端只返回最近 31 天的点，**卡片总额跟着变小且不报错**。现在小时只出现在 `24h` 一处，那条路径不再存在。日期改成即时生效后「应用」按钮不再做任何事，按 §2.2 删除；原先靠它置灰挡住的非法日期（结束早于开始）改为不发查询 + 在日期框下写明「图表仍显示上一次的区间」，不做无声空操作。自定义区间超过 400 天（后端 `STATS_WINDOW_DAYS`）时同样给提示，避免把「没有桶」误读成「那段没有用量」。
+- **趋势图输出序列改挂右轴，X 轴首末标签改锚点。** 输入与输出量级差约 800 倍（实测周点 24 亿 vs 300 万），共用一个线性轴时输出永远是压在 0 上的直线。X 轴此前把每个标签居中在数据点上，最左最右各有一半落在绘图区外被裁（末尾的 `2026-08-15` 显示成 `2026-0`），改为首个标签左对齐、末个右对齐，与标签宽度无关。左轴 `margin.left` 从 `-12` 改回 `0` —— 刻度文字右对齐，负边距会把最宽的那类标签（如 `600M`，比带小数点的 `1.5B` 宽）挤出容器裁掉一个字。
 - **便携运行：数据文件统一落可执行文件同级的 `data/`。** 此前依赖进程工作目录，从不同位置启动同一个二进制会读到不同的 `credentials.json`。同时把 SQLite 临时文件留在内存（`temp_store=MEMORY`），并给 `rust-embed` 开 `debug-embed`，使 debug 构建不再依赖编译期的绝对路径。
   - **破坏性：默认监听地址从 `0.0.0.0` 收紧为 `127.0.0.1`。** 容器部署或反向代理后端若依赖外部直连，必须显式配置 `host=0.0.0.0`，否则升级后从外部访问不到。
 - **Admin 面板主题改为自动跟随系统。** 移除手动的日/夜切换按钮，以及贯穿 `App` → `Dashboard` → `HeaderActions` 三层的 `darkMode` / `onToggleDarkMode` 传参；改为在入口用 `matchMedia('(prefers-color-scheme: dark)')` 直接套用并监听 `change` 事件跟随切换，同时同步 `color-scheme` 让表单控件与滚动条一起变色。原实现的初始值读自 `documentElement` 上已有的 class，与系统设置无关 —— 暗色系统下打开面板仍是亮色，点一下才对。
@@ -19,6 +25,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **移除用量日志的删除机制（破坏性）。** `usage_log.*.jsonl` 是唯一的用量账本 —— 它被删掉，历史总量就再也算不出来（`traces.db` 只留 7 天，`kiro_stats.json` 不含 token 与 credit）。原实现每天按保留天数（默认 31）物理删除整个文件，删了就没了。现删掉 `UsageRecorder::cleanup_old_logs` 与配套的 `retention_days` 原子字段及其读写方法，`with_retention(dir, days)` 收敛为 `new(dir)`，并移除 `usageLogRetentionDays` 配置字段、Admin 日志治理接口的对应字段、以及面板「治理设置」里那个输入框。`AdminService::with_log_governance` 随之只收 trace 句柄 —— 它持有的 `usage_recorder` 已成只写字段，按 §2.2 一并清除。
+  - 裁剪改为只发生在展示侧：`STATS_WINDOW_DAYS = 400` 同时充当启动装载窗口与天桶容量（此前是两个各为 31 的独立常量，其中 `RETENTION_DAYS` 的注释写着「JSONL 文件保留天数」，与它的实际作用不符）。超出窗口的文件留在磁盘上做归档、不装载。
+  - 升级注意：`config.json` 里的 `usageLogRetentionDays` 已被忽略（`Config` 无 `deny_unknown_fields`，不会启动失败）；只带该字段调用 `PUT /api/admin/config/log-governance` 会收到 400「至少提供 traceEnabled / traceRetentionDays 一个字段」。trace 的保留天数不受影响，仍默认 7 天且可运行时调整。
 - **移除二进制在线更新（破坏性）。** 删掉 `src/admin/binary_update.rs`、Admin 的更新对话框与检查 Hook、全部更新路由、相关配置字段，以及 `flate2` / `tar` / `zip` 三个只服务于它的依赖，净删约 2500 行。理由是 AGENTS.md §2.2：它不服务于本项目那条唯一链路，留着就是负债 —— 而一个会自行下载并替换自身二进制的功能，负债不只是代码量。
   - 升级注意：`config.json` 里的更新相关字段已被忽略（不会报错，但也不再有任何效果）；原先调用那些更新路由的脚本会收到 404。请改用常规方式部署新版本。
 - **流式路径不再解释正文内容。** 删掉 `<thinking>` 字面量提取（`process_content_with_thinking` 及配套的标签查找、缓冲区状态共约 700 行）；thinking 块此后只由上游原生 `reasoningContentEvent` 产生。非流式路径早已删除该逻辑，这次把流式对齐。
