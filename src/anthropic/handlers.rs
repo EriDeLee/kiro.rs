@@ -1125,6 +1125,9 @@ async fn handle_non_stream_request(
     // 上游下发的错误 / 异常事件。只记第一条（后续多为同一故障的连带事件），
     // 收尾时返回 502 而不是 200 —— 宁可失败，也不把上游的失败伪装成完整答案。
     let mut upstream_failure: Option<String> = None;
+    // 上游内容过滤拒答：本轮只有 reasoning、没有正文。必须显式标成 refusal，
+    // 否则会被当成正常 end_turn 的空响应返回，客户端会反复重发同一段历史。
+    let mut refused = false;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1171,6 +1174,16 @@ async fn handle_non_stream_request(
                                 }
                             }
                         }
+                        Event::Metadata(metadata) => {
+                            if metadata.is_content_filtered() {
+                                tracing::warn!(
+                                    refusal = %metadata.refusal_summary().unwrap_or_default(),
+                                    "上游内容过滤拒答，本轮以 refusal 结束"
+                                );
+                                refused = true;
+                                stop_reason = "refusal".to_string();
+                            }
+                        }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
@@ -1178,8 +1191,9 @@ async fn handle_non_stream_request(
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
+                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded。
+                            // 拒答轮次后续也会收到 100%，不得覆盖 refusal。
+                            if !refused && context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
@@ -1220,7 +1234,10 @@ async fn handle_non_stream_request(
                             tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                             // `ContentLengthExceededException` 是上游对「输出被长度截断」
                             // 的正常告知，用 stop_reason 表达即可，不是失败。
-                            if exception_type == "ContentLengthExceededException" {
+                            // 拒答轮次：refusal 已定，后到的截断/异常都不得改写终态。
+                            if refused {
+                                // 终态已定，忽略
+                            } else if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             } else if upstream_failure.is_none() {
                                 upstream_failure = Some(format!("{exception_type}: {message}"));
@@ -1238,7 +1255,12 @@ async fn handle_non_stream_request(
 
     // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
     // finish() 返回 IncompleteJson。已有错误则保持不变。
-    if tool_json_error.is_none()
+    // 拒答轮次：拦截可能切断半截工具参数，不捞回、不报错；已完成的工具调用也丢弃，
+    // 避免客户端执行被拦截轮次里的半截动作。
+    if refused {
+        tool_json_error = None;
+        tool_uses.clear();
+    } else if tool_json_error.is_none()
         && let Err(e) = tool_accumulator.finish()
     {
         tracing::error!("{}", e);

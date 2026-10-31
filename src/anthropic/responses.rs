@@ -764,7 +764,7 @@ struct ResponsesView {
 }
 
 fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
-    let status = if p.finish_reason == "length" {
+    let status = if matches!(p.finish_reason.as_str(), "length" | "content_filter") {
         "incomplete".to_string()
     } else {
         "completed".to_string()
@@ -902,7 +902,12 @@ fn build_response_object_from(p: &ParsedResponse, view: &ResponsesView, id: &str
         "tools": [],
     });
     if view.status == "incomplete" {
-        obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        let reason = if p.finish_reason == "content_filter" {
+            "content_filter"
+        } else {
+            "max_output_tokens"
+        };
+        obj["incomplete_details"] = json!({ "reason": reason });
     }
     obj
 }

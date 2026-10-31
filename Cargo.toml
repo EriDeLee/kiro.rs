@@ -7,6 +7,12 @@ edition = "2024"
 default = ["native-tls"]
 native-tls = ["reqwest/native-tls-vendored"]
 
+[profile.dev]
+# 本地开发/测试不生成调试信息：改一处后的 dev 测试编译从默认 debug=2 降到
+# debuginfo=0，实测 35k 行单 crate 增量 17 秒。panic 消息本身仍带文件:行号；
+# 真需要逐行调试时用 `CARGO_PROFILE_DEV_DEBUG=2 cargo build` 单独覆盖。
+debug = 0
+
 [profile.release]
 lto = "thin"
 codegen-units = 16

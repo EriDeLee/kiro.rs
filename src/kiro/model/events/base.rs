@@ -96,6 +96,8 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
+    /// 本轮结束原因（含内容过滤拒答详情）
+    Metadata(super::MetadataEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -175,10 +177,18 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            // `metadataEvent` 只携带 `stopReason`，而停止原因已由
-            // `assistantResponseEvent` / 流式收尾逻辑决定，这里无需二次处理。
-            // 显式匹配的意义在于：让未知事件告警只对**真正未见过的**事件类型触发。
-            EventType::Metadata => Ok(Self::Unknown {}),
+            // `metadataEvent` 常规轮次只携带 `stopReason: END_TURN`，无需处理。
+            // 但上游用 `stopReason: CONTENT_FILTERED` 表达拒答，且这种轮次只有
+            // reasoning、没有正文 —— 整个丢掉会把拒答伪装成“成功的空回答”。
+            // 这里不改变行为，只对非 END_TURN 的原因告警；分类与解释长度可安全打印，
+            // 解释正文不落日志。
+            // `metadataEvent` 常规轮次只携带 `stopReason`（END_TURN / TOOL_USE），
+            // 但上游用 `CONTENT_FILTERED` 表达拒答：这种轮次只有 reasoning、没有
+            // 正文。解析出来交给上层映射，丢弃会把拒答伪装成“成功的空回答”。
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::Unknown => {
                 // 诊断：打印未知事件的**结构骨架**（顶层键名 + 数值型叶子），不含
                 // 任何文本内容。上游加新字段时这是唯一的发现途径 ——

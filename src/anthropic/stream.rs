@@ -24,6 +24,11 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 /// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
+/// 上游内容过滤拒答（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
+/// Anthropic `stop_reason`。一经设置即为终态：同一条流里后到的 contextUsage /
+/// exception 不得把它覆盖成 max_tokens 之类的可重试原因。
+pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
+
 /// 累积完成的工具调用（`ToolUseEvent` 的所有分片拼接、解析成功后的结果）。
 #[derive(Debug, Clone)]
 pub struct CompletedToolUse {
@@ -313,8 +318,12 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason。`refusal` 是终态：拦截后同一条流里再到的
+    /// contextUsage / exception 不得覆盖它。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
     }
 
@@ -549,6 +558,11 @@ pub struct StreamContext {
     ///
     /// 只记第一条：上游一旦开始报错，后续往往是同一故障的连带事件，首条最接近根因。
     upstream_failure: Option<(String, String)>,
+    /// 本轮是否被上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）。
+    ///
+    /// 拒答是终态：不得被后续 contextUsage / exception 覆盖，也不得把半截工具调用
+    /// 或 JSON 错误当成成功或失败上报 —— 客户端应当看到 `stop_reason: refusal`。
+    refused: bool,
 }
 
 impl StreamContext {
@@ -602,11 +616,17 @@ impl StreamContext {
             tool_json_error: None,
             dropped_reasoning_bytes: 0,
             upstream_failure: None,
+            refused: false,
         }
     }
 
     /// 记下上游报的第一条错误 / 异常，并把 stop_reason 置为 `error`。
+    ///
+    /// 拒答是终态：拦截轮次里后到的 error / exception 不得把它改成失败。
     fn record_upstream_failure(&mut self, kind: String, message: String) {
+        if self.refused {
+            return;
+        }
         if self.upstream_failure.is_none() {
             self.upstream_failure = Some((kind, message));
             self.state_manager.set_stop_reason("error");
@@ -678,14 +698,28 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::Metadata(metadata) => {
+                // 内容过滤拒答：上游只发 reasoning、不发正文。映射成 refusal 终态，
+                // 否则客户端会收到“成功的空回答”并反复重发同一段历史。
+                if metadata.is_content_filtered() {
+                    tracing::warn!(
+                        refusal = %metadata.refusal_summary().unwrap_or_default(),
+                        "上游内容过滤拒答，本轮以 refusal 结束"
+                    );
+                    self.refused = true;
+                    self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
+                }
+                Vec::new()
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
-                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if context_usage.context_usage_percentage >= 100.0 {
+                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded。
+                // 拒答轮次后续也会收到 100%，不得覆盖 refusal。
+                if !self.refused && context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
@@ -732,7 +766,10 @@ impl StreamContext {
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 // `ContentLengthExceededException` 是上游对「输出被长度截断」的正常告知，
                 // 用 stop_reason 表达即可，不是失败。其余异常一律当失败上报，不再只留日志。
-                if exception_type == "ContentLengthExceededException" {
+                // 拒答轮次：refusal 已定，后到的截断/异常都不得改写终态。
+                if self.refused {
+                    // 终态已定，忽略
+                } else if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 } else {
                     self.record_upstream_failure(exception_type.clone(), message.clone());
@@ -1209,7 +1246,12 @@ impl StreamContext {
 
         // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
         // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none()
+        // 拒答轮次：拦截可能切断半截工具参数，此时既不捞回也不报 JSON 错误 ——
+        // refusal 是权威终态。
+        if self.refused {
+            self.tool_json_error = None;
+            self.tool_json_accumulator = ToolJsonAccumulator::new();
+        } else if self.tool_json_error.is_none()
             && let Err(e) = self.tool_json_accumulator.finish()
         {
             tracing::error!("{}", e);
@@ -1811,6 +1853,36 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .expect("应有 message_delta");
         assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    /// 回归锁：内容过滤拒答映射为 `refusal`，且同一条流里后到的
+    /// contextUsage 100% 不得把它覆盖成 model_context_window_exceeded。
+    ///
+    /// 2026-10-31 真实抓包：opus-5.5 被 CYBER 类过滤时只下发 reasoning 与
+    /// `metadataEvent{stopReason:"CONTENT_FILTERED"}`，随后 contextUsage 100%。
+    /// 旧实现丢弃 metadataEvent，客户端收到“成功的空回答”。
+    #[test]
+    fn content_filtered_refusal_is_terminal_stop_reason() {
+        use crate::kiro::model::events::{ContextUsageEvent, MetadataEvent};
+
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5.5", 1, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        let metadata: MetadataEvent = serde_json::from_str(
+            r#"{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"cannot continue"}}}"#,
+        )
+        .unwrap();
+        events.extend(ctx.process_kiro_event(&Event::Metadata(metadata)));
+        events.extend(ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 100.0,
+        })));
+        events.extend(ctx.generate_final_events());
+
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "refusal");
+        assert!(!events.iter().any(|e| e.event == "error"), "拒答不是上游故障");
     }
 
     /// 回归锁：流式路径下，正文里的字面 `<invoke>` 原样透传，不许改写成工具调用。

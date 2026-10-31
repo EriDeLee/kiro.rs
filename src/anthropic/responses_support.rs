@@ -185,7 +185,21 @@ fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
+        // 上游内容过滤拒答：OpenAI 口径是 content_filter，不是正常 stop。
+        "refusal" => "content_filter",
         _ if has_tool_calls => "tool_calls",
         _ => "stop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归锁：内容过滤拒答在 OpenAI 口径下是 content_filter，不是正常 stop。
+    #[test]
+    fn refusal_maps_to_content_filter() {
+        assert_eq!(map_finish_reason("refusal", false), "content_filter");
+        assert_eq!(map_finish_reason("end_turn", false), "stop");
     }
 }

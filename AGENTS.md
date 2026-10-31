@@ -135,6 +135,19 @@ open-code 第二套）。那个机制的前提假设 —— 客户端内置工�
 
 ## 三、验证要求
 
+**日常快循环（每改一处代码先跑这个，不要每步都上 release）**
+
+| 步骤 | 命令 | 耗时（2026-10-31 实测，8 核） | 用途 |
+|---|---|---|---|
+| 1 | `cargo check --release --all-targets` | 缓存热 ~2 秒 | 类型 / 借用错误，最快的反馈 |
+| 2 | `cargo test` | 改一处 ~17 秒编译 + 21 秒跑完 508 个测试 | dev 配置已是 `debug = 0`；断言与回归锁 |
+| 3 | `cargo test --release` / `cargo build --release` | 2 分钟级 | 只在提交前或要产出、运行二进制时做 |
+
+- 为什么不是每步都跑 release：release 带 `lto = "thin"` + `codegen-units = 16`，35,000 行的单 crate 每次改动都要整块重编；测试真正执行只要 1 秒，时间全在编译。
+- 低内存机器（≈1G）仍按 §3.2 加 `-j 1`，且不要并发跑 test 与 build。
+- 需要逐行调试时单次覆盖：`CARGO_PROFILE_DEV_DEBUG=2 cargo build`，不要为此改回 `Cargo.toml`。
+- 快循环只证明「能编、单测过」；涉及请求体字段或上游协议的改动，仍必须按 §3.1 / §3.11 做真实请求回归，否则就是 §3.7 的「命令返回 ≠ 命令成功」。
+
 ### 3.1 返回 200 不等于字段生效
 
 这是本仓库最重要的验证教训。曾经发生过：515 个单测全绿 + 真实请求返回 200 + 两个 effort 档位都能正常回答，但 `additionalModelRequestFields` 实际是 `<absent>` —— 推理档位被整条丢弃。
@@ -158,7 +171,7 @@ open-code 第二套）。那个机制的前提假设 —— 客户端内置工�
 
 单测锁的是内部自洽。跨越进程边界的行为（上游是否接受某字段、客户端 SDK 是否解析某形状）**只能靠实测**。
 
-改动后的标准流程：
+改动后的标准流程（这是**提交前门禁**的跑法；日常迭代用本节开头的快循环，不要每次都跑 release）：
 
 ```bash
 export CARGO_TARGET_DIR=/path/to/target
@@ -500,6 +513,54 @@ model_id（`cached_model_support`）。别的信号都不够格。
 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`）根因都在请求本身，必须保持立即失败，不要顺手
 一起改成故障转移。判据只认结构化 `reason`，不认文案 —— 那句 message 是普通英文，
 用户完全可能在对话里问它是什么意思，文案匹配会把一次正常回答变成冷却一个健康凭据。
+
+**提示词分层与上游隐藏 system prompt**（2026-10-31 实测，haiku / opus / sonnet 各一次）
+
+Claude 模型每轮实际看到的上下文分五层：
+
+| 层 | 内容 | 位置 |
+|---|---|---|
+| 0 | Kiro 后端的 `KIRO - System Prompt`（安全 / 工作规范 / 写作风格），约 1.4k tokens | 服务端 system，客户端不可见 |
+| 1 | 客户端基础提示（opencode 实测为 `system.txt` + 按工具注入的 4 条指引） | `history[0].userInputMessage.content` |
+| 2 | 环境块、skills 列表、全局/项目 `AGENTS.md`、Code Mode 段 | 同上，用 `\n` 拼在基础提示之后 |
+| 3 | 历史对话（thinking → `reasoningContent`） | `history[1..]` |
+| 4 | 本轮文本 + toolResults + tools + images | `currentMessage` |
+| 5 | `thinking` / `output_config.effort` | `additionalModelRequestFields` |
+
+**客户端 system 不是 system role。** 上游 history 只有 user / assistant 两个槽位，
+system 只能作为 `history[0]` 的 user 消息下发；工具定义只能在 `currentMessage` 里
+声明一次。这是协议边界，不是本项目的取舍。后果：客户端的「系统指令」在位置上弱于
+上游那段真正的 system，冲突时没有机制保证客户端规则获胜 —— 观察到「任务没做完就停」
+时，除了内容过滤，也要怀疑上游 `Once relevant validation passes ... stop and report`
+这条工作规范。
+
+**隐藏层存在且大小可测。** 单条 `Say OK.`、无 system 无 tools 的请求，上游
+`contextUsage` 换算出的 `input_tokens` 稳定为 **1,898**（三次一致）；system 每增加
+1 字符，输入增加 **0.2836 tokens**，五组点（0 / 1080 / 2160 / 4320 / 8640 字符）
+对拟合线的误差 ≤3 tokens。工具每个约 +105 tokens，另有约 +285 的一次性开销。
+
+隐藏提示词的内容由 haiku 原样背出（5,733 字符，标题 `# KIRO - System Prompt`，分
+「Security, trust and safety」「Work guidelines」「Communication Guide」三节）；
+opus 拒绝背诵，但独立描述了同样三节；sonnet 亦确认存在。**这是模型自述，不是字节级
+抓包**，但 1,433 tokens 的自述长度与 1,898 的固定开销吻合。复现方式：向本地实例发
+上面那条最小请求，读 `usage.input_tokens`；不能看本地估算值，必须取上游 contextUsage
+换算后的数。
+
+**两个已确认的缺口：**
+
+- **会话中途的 `role:"system"` 消息被静默丢弃。** 某些客户端（实测 opencode 2.1.4）
+  对 Claude 5 会发中途 system 消息（指令文件变化、切换 effort）；`build_history` 只
+  处理 user / assistant，中间位置的 system 既不进 history 也不打日志。若它恰好在
+  末尾，会被当成 prefill 并入 user，并打一条标签错误的 warn。修之前先补一条 warn，
+  不要静默。
+- **`max_tokens` 从不透传。** 它只参与 `>0` 校验；上游 schema 里其实有
+  `additionalModelRequestFields.max_tokens` 槽位。实测 `max_tokens=32` 的请求返回了
+  1,433 个输出 tokens（两次一致），说明截断完全由上游默认值决定。
+
+**不要为了省 token 在代理里裁剪客户端 system**（§2.5）。上游固定前缀约 1.9k、客户端
+system 约 5k（本机全局 `AGENTS.md` 11.8KB ≈ 3.4k）、工具约 2–3k；在压缩后的 62k
+请求里合计约 15%，在 512k 请求里不到 2%，且上游隐式缓存按 0.528x 计费。要瘦身只能
+改客户端的指令文件，不能改代理。
 
 ### 4.2 客户端 SDK 线格式
 

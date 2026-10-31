@@ -34,7 +34,10 @@ use super::converter::{ConversionError, convert_request, get_context_window_size
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator, ToolJsonAccumulatorError};
+use super::stream::{
+    CompletedToolUse, REFUSAL_STOP_REASON, SseEvent, ToolJsonAccumulator,
+    ToolJsonAccumulatorError,
+};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 
@@ -204,6 +207,11 @@ fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
 }
 
+/// `refusal` 是终态：同一轮里后到的 contextUsage / exception 不得覆盖它。
+fn is_refusal(override_reason: &Option<String>) -> bool {
+    override_reason.as_deref() == Some(REFUSAL_STOP_REASON)
+}
+
 /// Whether the request is the continuation immediately following a tool result.
 fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
     let Some(last) = payload.messages.last() else {
@@ -311,11 +319,22 @@ async fn decode_round(
                         tool_json_error = Some(e);
                     }
                 },
+                Event::Metadata(metadata) => {
+                    // 内容过滤拒答是终态：本轮不再续跑搜索，stop_reason 也不能被
+                    // 后续 contextUsage / exception 覆盖。
+                    if metadata.is_content_filtered() {
+                        tracing::warn!(
+                            refusal = %metadata.refusal_summary().unwrap_or_default(),
+                            "上游内容过滤拒答，本轮以 refusal 结束"
+                        );
+                        stop_reason_override = Some(REFUSAL_STOP_REASON.to_string());
+                    }
+                }
                 Event::ContextUsage(cu) => {
                     let window = get_context_window_size(model);
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                     context_input_tokens = Some(actual);
-                    if cu.context_usage_percentage >= 100.0 {
+                    if cu.context_usage_percentage >= 100.0 && !is_refusal(&stop_reason_override) {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
@@ -324,7 +343,9 @@ async fn decode_round(
                     last_metering = Some(m.clone());
                 }
                 Event::Exception { exception_type, .. } => {
-                    if exception_type == "ContentLengthExceededException" {
+                    if !is_refusal(&stop_reason_override)
+                        && exception_type == "ContentLengthExceededException"
+                    {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
                 }
@@ -709,7 +730,7 @@ pub(super) async fn run_web_search_loop(
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
-        let round = loop {
+        let mut round = loop {
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,
@@ -781,6 +802,12 @@ pub(super) async fn run_web_search_loop(
 
             break round;
         };
+
+        // 拒答是终态：本轮即便带了 web_search 也不再续跑搜索，直接带 refusal 收尾；
+        // 拦截前的半截工具调用一并丢弃，避免真的执行。
+        if is_refusal(&round.stop_reason_override) {
+            round.tool_uses.clear();
+        }
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
