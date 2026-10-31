@@ -151,7 +151,7 @@ const SUSPENDED_REASON: &str = "TEMPORARILY_SUSPENDED";
 /// `{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}`
 ///
 /// 2026-08-13 从 trace DB 取样确认存在且已发生 13 次（凭据 #4 / #5，
-/// `claude-opus-5` 12 次 + `claude-sonnet-5` 1 次），全部 `finalStatus=error`
+/// `claude-opus-5.5` 12 次 + `claude-sonnet-5.5` 1 次），全部 `finalStatus=error`
 /// —— 即当时整条客户端请求直接失败，没有换号。
 ///
 /// **这个状态是临时的，不代表订阅不含该模型。** 已观察到订阅确实支持该模型的账号

@@ -17,7 +17,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **便携运行：数据文件统一落可执行文件同级的 `data/`。** 此前依赖进程工作目录，从不同位置启动同一个二进制会读到不同的 `credentials.json`。同时把 SQLite 临时文件留在内存（`temp_store=MEMORY`），并给 `rust-embed` 开 `debug-embed`，使 debug 构建不再依赖编译期的绝对路径。
   - **破坏性：默认监听地址从 `0.0.0.0` 收紧为 `127.0.0.1`。** 容器部署或反向代理后端若依赖外部直连，必须显式配置 `host=0.0.0.0`，否则升级后从外部访问不到。
 - **Admin 面板主题改为自动跟随系统。** 移除手动的日/夜切换按钮，以及贯穿 `App` → `Dashboard` → `HeaderActions` 三层的 `darkMode` / `onToggleDarkMode` 传参；改为在入口用 `matchMedia('(prefers-color-scheme: dark)')` 直接套用并监听 `change` 事件跟随切换，同时同步 `color-scheme` 让表单控件与滚动条一起变色。原实现的初始值读自 `documentElement` 上已有的 class，与系统设置无关 —— 暗色系统下打开面板仍是亮色，点一下才对。
-- `/v1/messages` 现在接受全部 5 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
+- `/v1/messages` 现在接受全部 6 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
 - CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
 - 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
 - **Admin 上游失败不再一律显示「上游服务请求失败」。** 余额与模型列表查询的失败现在按已识别的原因给出具体文案：`账号被封禁`、`额度已用尽`、`Token 已失效`、`上游拒绝访问`（403 权限不足）、`上游服务异常`（5xx）。前三条复用数据面的三个判据（同一语义不再有两套字符串），后两条取 `token_manager` 自己按状态码给出的前缀。外发的只有这几个固定字面量，上游原始报文仍然只进日志 —— 原有那条「不泄露 AWS 账号 ID / request-id」的断言未放宽，新增 `upstream_rejected_exposes_only_the_public_reason` 一并锁住。
@@ -46,6 +46,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Claude 白名单换成 5.5 三款，GPT 窗口按 2026-10-31 复测修正。** 白名单现在是 `claude-opus-5.5` / `claude-sonnet-5.5` / `claude-haiku-5.5` + 三个 `gpt-5.6-*`，旧的 `claude-opus-5` / `claude-sonnet-5` 不再接受。实测 `ListAvailableModels` 得到：三个 Claude 5.5 均为 1,000,000 输入 / 64,000 输出，effort 五档（无 `none`）；三个 GPT 5.6 输入窗口已从 372k 变为 **986,000**，输出 64k。`get_context_window_size` 同步改为 986k，否则 contextUsage 百分比换算出的 input_tokens 会偏小约 2.65 倍。
+  - `thinking.type` 的枚举**逐模型不同**（opus-5.5 只有 `adaptive`、sonnet-5.5 多 `between_tools`、haiku-5.5 多 `disabled`），「同族一致」的旧注释已删；本仓库在客户端 `thinking=disabled` 时整个推理字段都不下发，因此不受 opus-5.5 缺 `disabled` 影响。
+  - `/v1/models` 新增 `context_window` 字段，优先取上游 `tokenLimits.maxInputTokens`，缺失时才回退到按族常量。
+- **Windows 上新增 Ctrl+Break 优雅停机。** 进程被放进独立进程组时 Windows 默认屏蔽 Ctrl+C，外部只能发 Ctrl+Break；原先只监听 Ctrl+C，导致只能 `TerminateProcess` 强杀，丢掉 30 秒去抖窗口内的用量计数。
 - **GPT 请求不再 100% 不落 Trace 表。** `/v1/responses` 恒注入原生 `web_search`，所以每个 GPT 请求都进 agentic loop，而 loop 在 stream / non-stream 两条分支之前就 `return` —— `RequestTracer` 原先只在那两条分支内部构造，于是 Admin 请求日志页对 `gpt-5.6` 全组恒为空白，而 usage 统计一切正常。又一例 §3.8 的静默失效：单测全绿 + 真实请求 200 + 有用量数据，只有 trace 表是空的。
   - `RequestTracer` 构造上提到所有分支之前；`run_web_search_loop` / `run_round` / `decode_round` 接 tracer，首个上游 chunk 调 `mark_first_token`；13 处 `hook.record` 失败出口逐一配对 `trace_error` / `finalize`，每条出口恰好一次，并补齐原先没有收尾的转换失败与序列化失败两条路径。
   - `finalize` 里把 attempts 按时间重排为 `1..N`：`trace_attempts` 主键是 `(trace_id, attempt)` 且用 `INSERT OR REPLACE`，而 provider 每次 `call_api*` 都从 1 重新编号，多轮 loop 时后一轮会顶掉前一轮，`total_attempts` 与实际行数不一致。反向判据：把重排改成空操作后测试必须翻转，实测 `left [1] / right [1, 2]`。

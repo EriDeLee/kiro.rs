@@ -6,11 +6,11 @@
 
 本分支的 schema 严格对齐 **[Vercel AI SDK](https://ai-sdk.dev)**（`@ai-sdk/anthropic` / `@ai-sdk/openai`）的实际线格式 —— 该 SDK 是当前 agent 客户端的事实标准，其线格式与官方 REST 规范存在差异之处一律以 SDK 抓包为准。
 
-本分支只服务 5 个白名单模型。`/v1/messages` 是通用入口，接受全部 5 个模型；`/v1/responses` 是 OpenAI 线格式适配器，只接受 GPT 族。客户端入口与上游模型族彼此独立。
+本分支只服务 6 个白名单模型。`/v1/messages` 是通用入口，接受全部 6 个模型；`/v1/responses` 是 OpenAI 线格式适配器，只接受 GPT 族。客户端入口与上游模型族彼此独立。
 
 | 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5`、`claude-sonnet-5`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `output_config.effort` |
+| `POST /v1/messages` | `claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `output_config.effort` |
 | `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
 上游推理字段仍按模型族严格分流：Messages 入口收到 GPT 的 `output_config.effort` 后会转换为

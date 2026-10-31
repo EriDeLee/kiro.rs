@@ -970,7 +970,7 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         // 客户端没要思考（请求里没有 thinking 字段，或显式 disabled）时，上游仍会
-        // 下发 `reasoningContentEvent`：2026-08-12 实测 claude-opus-5 在**不带**
+        // 下发 `reasoningContentEvent`：2026-08-12 实测 claude-opus-5.5 在**不带**
         // thinking 字段时回一段 summarized 思考（反而带 `thinking.type=adaptive`
         // 且不带 display 时完全不回）。
         //

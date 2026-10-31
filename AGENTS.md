@@ -17,11 +17,11 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 
 ## 一、项目目标（硬边界）
 
-只服务 5 个白名单模型。客户端 API 入口与上游模型族必须解耦：
+只服务 6 个白名单模型。客户端 API 入口与上游模型族必须解耦：
 
 | 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | 全部 5 个白名单模型 | `output_config.effort` |
+| `POST /v1/messages` | 全部 6 个白名单模型 | `output_config.effort` |
 | `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
 
 同族内推理字段路径与请求体形状完全一致，扩充模型只是多几个 id，对本项目无新增成本；
@@ -356,12 +356,12 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 这一条不是从 schema 推断的，而是 2026-07-29 端到端实测确认：GPT 族三个模型 `effort=none`
 全部 200、Claude 族两个模型 `effort=none` 全部 400、五个模型 `effort=bogus` 全部 400。
 
-- **Claude 族**（`claude-opus-5`、`claude-sonnet-5`）：`output_config.effort ∈ {low,medium,high,xhigh,max}`（default `high`，**无 `none`**）；`thinking.type ∈ {adaptive, disabled}`（**无 `enabled`**，发了会 400）；`thinking.display ∈ {summarized, omitted}`（上游默认 `omitted`，会吞掉思考文本）
-- **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，`additionalProperties: false`。`reasoning.effort ∈ {none,low,medium,high,xhigh,max}`（default `high`）；`reasoning.mode ∈ {standard, pro}`。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`
-- `effort=xhigh|max` 与 `thinking.type=disabled` 冲突时**整体不下发 thinking 字段**，绝不反向改写 effort
+- **Claude 族**（`claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5`，2026-10-31 实测 schema）：`output_config.effort ∈ {low,medium,high,xhigh,max}`（default 依次 medium / high / medium，**无 `none`**）；`thinking.display ∈ {summarized, omitted}`。`thinking.type` **逐模型不同**：opus-5.5 只有 `{adaptive}`、sonnet-5.5 是 `{adaptive, between_tools}`、haiku-5.5 是 `{adaptive, disabled}` —— 「同族枚举一致」在这里不成立，新增模型必须逐个读 schema。
+- **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，`additionalProperties: false`。2026-10-31 的 schema 只声明 `reasoning.effort ∈ {none,low,medium,high,xhigh,max}`（default `high`）；2026-07 记录的 `reasoning.mode` 已不在该 schema 里，不要下发。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`
+- `effort=xhigh|max` 与 `thinking.type=disabled` 冲突时**整体不下发 thinking 字段**，绝不反向改写 effort（opus-5.5 本身不接受 `disabled`，本仓库在 `thinking=disabled` 时整个推理字段都不下发）
 
 **窗口大小**（`tokenLimits`，2026-07-29 首测，GPT 族三个模型的 `maxInputTokens` 于
-2026-08-10 复测修正为 372,000 —— 表在本节末）：
+2026-08-10 复测修正为 372,000，2026-10-31 再复测为 986,000 —— 表在本节末）：
 
 **上游并不要求的东西**（2026-07-29 直连 `/generateAssistantResponse` 变异测试，
 以代理的真实成功请求为模板，每次只改一处）：
@@ -406,13 +406,14 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 | 模型 | maxInputTokens | maxOutputTokens |
 |---|---|---|
-| `claude-opus-5` | 1,000,000 | 128,000 |
-| `claude-sonnet-5` | 1,000,000 | **64,000** |
-| `gpt-5.6-sol` | **372,000** | 128,000 |
-| `gpt-5.6-terra` | **372,000** | 128,000 |
-| `gpt-5.6-luna` | **372,000** | 128,000 |
+| `claude-opus-5.5` | 1,000,000 | **64,000** |
+| `claude-sonnet-5.5` | 1,000,000 | **64,000** |
+| `claude-haiku-5.5` | 1,000,000 | **64,000** |
+| `gpt-5.6-sol` | **986,000** | **64,000** |
+| `gpt-5.6-terra` | **986,000** | **64,000** |
+| `gpt-5.6-luna` | **986,000** | **64,000** |
 
-`get_context_window_size` 只取 `maxInputTokens`（Claude 族 1M；GPT 族三个模型均为 372k），它参与 contextUsage 百分比 → 绝对 token 换算，取错会让上报的 input_tokens 系统性偏差。`maxOutputTokens` 由 `/v1/models` 从上游原样透出 —— 注意 `claude-sonnet-5` 是 64k，与同族 opus-5 的 128k 不同，不可按族推断输出上限。GPT 族的 372k 是 **2026-08-10 复测**值；2026-07-29 首测记的 272k 已作废（见 §5），此后再看到 272k 的说法一律不采信。
+`get_context_window_size` 只取 `maxInputTokens`（Claude 族 1M；GPT 族三个模型均为 986k），它参与 contextUsage 百分比 → 绝对 token 换算，取错会让上报的 input_tokens 系统性偏差。`maxOutputTokens` 由 `/v1/models` 从上游原样透出 —— 三个 Claude 5.5 与三个 GPT 5.6 于 2026-10-31 实测均为 64k，同族也不可互相推断（上一代 opus-5 是 128k、sonnet-5 是 64k）。GPT 族的 986k 是 **2026-10-31 复测**值；2026-08-10 记的 372k、2026-07-29 首测的 272k 均已作废（见 §5）。
 
 **prompt cache 不可用**（端到端实证）：
 
@@ -545,7 +546,7 @@ model_id（`cached_model_support`）。别的信号都不够格。
 | "客户端发顶层 `effort`" | 11 个 SDK 版本抓包证明只有 `output_config.effort`；混淆了 providerOptions 与 wire format |
 | `metadataEvent` 完全静默无害 | 一直在下发，只是从未被看见；加 warn 后立刻暴露 |
 | 上游 `reasoningContent` "仅响应侧支持，请求 history 传入会 400" | Smithy 模型中该 shape 只有序列化器无反序列化器（input-only），实测回传成功 |
-| GPT 族 `maxInputTokens` 是 272,000（2026-07-29 首测所记） | 2026-08-10 复测为 **372,000**；旧值已作废。教训：`tokenLimits` 是上游随时可调的运行时数据，不是固化协议常量，跟窗口有关的换算出现偏差时先复测 `ListAvailableModels` |
+| GPT 族 `maxInputTokens` 是 272,000（2026-07-29 首测所记） | 2026-08-10 复测为 **372,000**，2026-10-31 再复测为 **986,000**；旧值全部作废。教训：`tokenLimits` 是上游随时可调的运行时数据，不是固化协议常量；窗口值必须现场拉 `ListAvailableModels`，或直接透出上游返回值，不要长期依赖代码常量 |
 | "claude-opus-5 实测 0 次触发 XML 模式，所以留着 `<thinking>` 提取路径无害" | 结论本身没错，但**结论范围被悄悄放大**了：那次实测只测了 Claude。2026-08-10 实测 `gpt-5.6-sol` 会把含字面 `<thinking>` 的正文整段作为最终答案下发，该路径立刻误伤正文。教训：一个模型的实测结论不能推广到别的模型族；「实测 0 次触发」只说明**当时那个模型**不触发，不说明代码无害 |
 | "Kiro API 要求：历史消息中引用的工具必须在 `currentMessage.tools` 中有定义"（`create_placeholder_tool` 上方注释） | 2026-08-12 实测推翻：历史里带 `bash` 的 `tool_use` / `tool_result`、本轮**一个 tools 都不声明**，上游返回 200 并正常作答。该注释是无实测支撑的断言，却支撑着一处 §2.5 违规（给客户端没声明的工具补 `properties: {}` 空壳定义）。代价：`claude-opus-5` 认为 `bash` 可用却没有字段能装参数，把 `<invoke name="bash"><parameter name="command">…` 当正文打出来并自编一行命令输出 |
 | "客户端没启用 thinking，上游就不会下发思考文本"（`!thinking_enabled` 分支把 reasoning 当正文发的隐含前提） | 恰好相反。2026-08-12 单变量实测 `claude-opus-5`（同一问题只改 thinking 字段）：**不带** thinking 字段 → 上游回一段 summarized 思考；`thinking.type=adaptive` + `display=summarized` → 思考在独立 thinking 块（signature 848 字节）；`thinking.type=adaptive` **不带** `display` → 上游完全不回思考。即「不要思考」的请求反而拿到思考，代理再把它混进正文 |

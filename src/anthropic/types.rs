@@ -49,6 +49,9 @@ pub struct Model {
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    /// 输入上下文窗口（`maxInputTokens`）。取自上游 `tokenLimits`，
+    /// 上游未给出时回退到按模型族计算的默认值。
+    pub context_window: i32,
 }
 
 /// 模型列表响应

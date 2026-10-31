@@ -5379,7 +5379,7 @@ mod tests {
         let remaining = manager.report_model_unavailable_for_request(
             1,
             StdDuration::from_secs(300),
-            Some("claude-opus-5"),
+            Some("claude-opus-5.5"),
             None,
         );
         assert_eq!(remaining, 1, "应报告 #2 仍可用，让调用方换号而不是失败");
@@ -5402,7 +5402,7 @@ mod tests {
         let remaining = manager.report_model_unavailable_for_request(
             2,
             StdDuration::from_secs(300),
-            Some("claude-opus-5"),
+            Some("claude-opus-5.5"),
             None,
         );
         assert_eq!(remaining, 0, "无其它候选时应返回 0");
@@ -6983,10 +6983,11 @@ mod tests {
         let mut free = grouped_cred("free", &[]);
         free.subscription_title = Some("KIRO FREE".to_string());
 
-        // 白名单全部 5 个模型都不因订阅档位被拦
+        // 白名单全部 6 个模型都不因订阅档位被拦
         for model in [
-            crate::model::allowlist::MODEL_OPUS_5,
-            crate::model::allowlist::MODEL_SONNET_5,
+            crate::model::allowlist::MODEL_OPUS_5_5,
+            crate::model::allowlist::MODEL_SONNET_5_5,
+            crate::model::allowlist::MODEL_HAIKU_5_5,
             crate::model::allowlist::MODEL_GPT_56_SOL,
             crate::model::allowlist::MODEL_GPT_56_TERRA,
             crate::model::allowlist::MODEL_GPT_56_LUNA,
@@ -7001,12 +7002,12 @@ mod tests {
         let bound = grouped_cred("bound", &["g1"]);
         assert!(credential_matches_request(
             &bound,
-            Some(crate::model::allowlist::MODEL_OPUS_5),
+            Some(crate::model::allowlist::MODEL_OPUS_5_5),
             Some("g1")
         ));
         assert!(!credential_matches_request(
             &bound,
-            Some(crate::model::allowlist::MODEL_OPUS_5),
+            Some(crate::model::allowlist::MODEL_OPUS_5_5),
             Some("g2")
         ));
     }
@@ -7076,8 +7077,8 @@ mod tests {
         .unwrap();
 
         // 上游清单：#1 只有 sonnet-5，#2 两个都有。
-        seed_model_cache(&manager, 1, &["claude-sonnet-5"]);
-        seed_model_cache(&manager, 2, &["claude-opus-5", "claude-sonnet-5"]);
+        seed_model_cache(&manager, 1, &["claude-sonnet-5.5"]);
+        seed_model_cache(&manager, 2, &["claude-opus-5.5", "claude-sonnet-5.5"]);
 
         // 先把 current_id 预热到优先级最高的 #1。
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -7085,7 +7086,7 @@ mod tests {
 
         // 请求 opus-5：#1 被上游清单排除，必须切到 #2。
         let opus = manager
-            .acquire_context(Some("claude-opus-5"), None)
+            .acquire_context(Some("claude-opus-5.5"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -7097,7 +7098,7 @@ mod tests {
         // 而 #2 也支持 sonnet-5，就继续用 #2，不会因为 #1 优先级更高而切回去。
         // 这是设计意图（避免无谓切换），不是就近选优先级。
         let sonnet = manager
-            .acquire_context(Some("claude-sonnet-5"), None)
+            .acquire_context(Some("claude-sonnet-5.5"), None)
             .await
             .unwrap();
         assert_eq!(

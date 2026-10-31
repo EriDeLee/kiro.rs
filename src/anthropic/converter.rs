@@ -230,7 +230,7 @@ pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
     }
-    // 白名单是唯一权威：只认 Claude 组（claude-opus-5 / claude-sonnet-5）与
+    // 白名单是唯一权威：只认 Claude 组（claude-opus-5.5 / claude-sonnet-5.5）与
     // GPT 组（gpt-5.6-sol / -terra / -luna），其余一律 None。API 入口策略由
     // handlers / responses 校验；converter 只按上游模型族分流。
     crate::model::allowlist::normalize(model).map(str::to_string)
@@ -240,19 +240,19 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`：
 ///
-/// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：1,000,000
-/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：372,000
+/// - Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）：1,000,000
+/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：986,000
 ///
 /// 这个值参与 contextUsageEvent 的百分比 → 绝对 token 数换算，取错会让上报的
 /// input_tokens 系统性偏差，进而误导客户端的上下文压缩时机。
 ///
-/// 注：输出上限（opus-5 128k / sonnet-5 64k / gpt 族 128k）不在此函数职责内 ——
+/// 注：输出上限（三个 Claude 5.5 实测均为 64k / GPT 族 128k）不在此函数职责内 ——
 /// `/v1/models` 的 `max_tokens` 直接取上游 `maxOutputTokens`，本函数只管输入窗口。
 pub fn get_context_window_size(model: &str) -> i32 {
     use crate::model::allowlist::{ModelFamily, family_for_model};
     match map_model(model).as_deref().and_then(family_for_model) {
         Some(ModelFamily::Claude) => 1_000_000,
-        Some(ModelFamily::Gpt) => 372_000,
+        Some(ModelFamily::Gpt) => 986_000,
         // 白名单之外的模型走不到这里（map_model 已返回 None），保留保守默认值。
         None => 200_000,
     }
@@ -260,7 +260,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
 
 /// 是否向该模型下发 `additionalModelRequestFields.output_config` + `thinking`。
 ///
-/// 实测 Claude 族（`claude-opus-5`、`claude-sonnet-5`）的 schema 接受
+/// 实测 Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）的 schema 接受
 /// `output_config.effort ∈ {low,medium,high,xhigh,max}` 与 `thinking.{type,display}`；
 /// GPT 族只接受 `reasoning`，走另一条分支。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
@@ -389,7 +389,7 @@ impl EffortTier {
 
 /// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema），按模型族分组。
 ///
-/// - Claude 族（`claude-opus-5`、`claude-sonnet-5`）：low / medium / high / xhigh / max
+/// - Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）：low / medium / high / xhigh / max
 ///   （**无 none**）
 /// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：
 ///   none / low / medium / high / xhigh / max
@@ -623,7 +623,7 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 /// 这里原先写着「Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有
 /// 定义」。2026-08-12 实测推翻了这条陈述的普适性：历史里带 `bash` 的 tool_use /
 /// tool_result、本轮**一个 tools 都不声明**，上游返回 200 并正常作答。所以零工具场景
-/// 不再补占位符（补出来的空壳 schema 会让 claude-opus-5 把工具调用当正文打出来）。
+/// 不再补占位符（补出来的空壳 schema 会让 claude-opus-5.5 把工具调用当正文打出来）。
 ///
 /// 仍保留「客户端声明了工具、但历史里用过另一个没再带上」这一分支：那种情况**未**单独
 /// 实测过上游是否真要求定义，维持既有行为是保守选择；此时模型本来就有工具可用，占位符
@@ -755,7 +755,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     //
     // 2026-08-12 实测后果：OpenCode 的 compaction 请求不带 tools，但历史里满是
     // bash / read / edit 的 tool_use，于是这里给每个名字都补一个 `properties: {}` 的
-    // 空壳工具。claude-opus-5 因此认为 bash 可用，却没有任何结构化字段能装命令，直接把
+    // 空壳工具。claude-opus-5.5 因此认为 bash 可用，却没有任何结构化字段能装命令，直接把
     // `<invoke name="bash"><parameter name="command">…` 当正文打出来，还编了一行命令
     // 输出，整篇压缩摘要作废。GPT 族不模仿这套 XML 方言，所以同一条链路上 GPT 的压缩
     // 一直正常 —— 这就是它只在 Claude 上暴露的原因。
@@ -1607,7 +1607,7 @@ mod tests {
     /// 内容，等于替客户端做它没要求的决定。
     #[test]
     fn tool_result_only_turn_sends_client_content_verbatim() {
-        let req = tool_result_turn_request("claude-opus-5", None);
+        let req = tool_result_turn_request("claude-opus-5.5", None);
         let result = convert_request(&req).expect("应转换成功");
         let user_input = &result.conversation_state.current_message.user_input_message;
 
@@ -1626,13 +1626,13 @@ mod tests {
     ///
     /// 旧行为按「Kiro 要求历史引用的工具必须有定义」给每个历史工具名补一个
     /// `properties: {}` 的空壳工具。2026-08-12 实测代价：OpenCode 的 compaction 请求不带
-    /// tools，但历史里满是 bash / read / edit，补出来的空壳让 claude-opus-5 认为 bash 可用
+    /// tools，但历史里满是 bash / read / edit，补出来的空壳让 claude-opus-5.5 认为 bash 可用
     /// 又没有字段能装命令，于是把 `<invoke name="bash"><parameter name="command">…` 当正文
     /// 打出来（并自编一行命令输出），整篇压缩摘要作废。GPT 族不模仿这套 XML 方言，所以
     /// 同一条链路上只有 Claude 暴露。
     #[test]
     fn no_client_tools_means_no_placeholder_tools() {
-        let req = tool_result_turn_request("claude-opus-5", None);
+        let req = tool_result_turn_request("claude-opus-5.5", None);
         assert!(req.tools.is_none(), "前提：客户端没声明任何工具");
 
         let result = convert_request(&req).expect("应转换成功");
@@ -1660,7 +1660,7 @@ mod tests {
     fn declared_tools_still_get_history_placeholders() {
         use super::super::types::Tool as AnthropicTool;
 
-        let mut req = tool_result_turn_request("claude-opus-5", None);
+        let mut req = tool_result_turn_request("claude-opus-5.5", None);
         req.tools = Some(vec![AnthropicTool {
             tool_type: None,
             name: "bash".to_string(),
@@ -1694,7 +1694,7 @@ mod tests {
     /// 回归锁：客户端给了文本就原样带上。
     #[test]
     fn tool_result_turn_keeps_user_text_when_present() {
-        let req = tool_result_turn_request("claude-opus-5", Some("继续"));
+        let req = tool_result_turn_request("claude-opus-5.5", Some("继续"));
         let result = convert_request(&req).expect("应转换成功");
         assert_eq!(
             result
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_output_config_normalizes_effort_case_and_spacing() {
-        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "  MAX  ");
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5.5", "  MAX  ");
         let result = convert_request(&req).unwrap();
 
         let fields = result
@@ -1754,7 +1754,7 @@ mod tests {
     #[test]
     fn unsupported_effort_is_rejected_not_downgraded() {
         // 无法识别的值
-        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "extreme");
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5.5", "extreme");
         let err = convert_request(&req).expect_err("非法 effort 必须被拒绝");
         let msg = format!("{err:?}");
         assert!(msg.contains("unrecognized effort"), "got: {msg}");
@@ -1764,12 +1764,12 @@ mod tests {
         );
 
         // GPT 族独有的 none 档：Claude 族不支持，同样拒绝而非回落
-        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "none");
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5.5", "none");
         let err = convert_request(&req).expect_err("opus-5 不支持 none 档");
         assert!(format!("{err:?}").contains("not supported by model"));
 
         // 合法档位仍正常下发
-        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5", "xhigh");
+        let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5.5", "xhigh");
         let fields = convert_request(&req)
             .expect("合法 effort 应通过")
             .additional_model_request_fields
@@ -1777,16 +1777,17 @@ mod tests {
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
-    /// 白名单从 2 个模型扩到 5 个后，档位枚举必须按**模型族**分组，而不是只认
-    /// 当初那一个 id。漏改的后果是新模型拿到错误的枚举：sonnet-5 会被误允许 `none`
+    /// 白名单扩到 6 个模型后，档位枚举必须按**模型族**分组，而不是只认
+    /// 当初那一个 id。漏改的后果是新模型拿到错误的枚举：sonnet-5.5 会被误允许 `none`
     /// （上游 400），terra/luna 会被误拒 `none`（客户端合法请求被拒）。
     #[test]
     fn effort_tiers_are_grouped_by_model_family() {
         use crate::model::allowlist::{
-            MODEL_GPT_56_LUNA, MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_OPUS_5, MODEL_SONNET_5,
+            MODEL_GPT_56_LUNA, MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_HAIKU_5_5,
+            MODEL_OPUS_5_5, MODEL_SONNET_5_5,
         };
 
-        for model in [MODEL_OPUS_5, MODEL_SONNET_5] {
+        for model in [MODEL_OPUS_5_5, MODEL_SONNET_5_5, MODEL_HAIKU_5_5] {
             let tiers = model_effort_tiers(model);
             assert!(
                 !tiers.contains(&EffortTier::None),
@@ -1811,7 +1812,7 @@ mod tests {
     /// 否则上游 400 REQUEST_BODY_INVALID）。
     #[test]
     fn reasoning_fields_route_by_model_family() {
-        for model in ["claude-opus-5", "claude-sonnet-5"] {
+        for model in ["claude-opus-5.5", "claude-sonnet-5.5", "claude-haiku-5.5"] {
             let req = minimal_adaptive_thinking_request_with_effort(model, "max");
             let fields = convert_request(&req)
                 .unwrap_or_else(|e| panic!("{model} 应转换成功: {e:?}"))
@@ -1882,18 +1883,18 @@ mod tests {
     #[test]
     fn context_window_size_matches_measured_limits() {
         // Claude 族 1M in
-        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5.5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5.5"), 1_000_000);
         assert_eq!(
-            get_context_window_size("claude-sonnet-5-thinking"),
+            get_context_window_size("claude-sonnet-5.5-thinking"),
             1_000_000
         );
-        // GPT 族三个模型实测均为 372k in。
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 372_000);
-        assert_eq!(get_context_window_size("gpt-5.6-sol-latest"), 372_000);
-        assert_eq!(get_context_window_size("gpt-5.6-terra"), 372_000);
-        assert_eq!(get_context_window_size("gpt-5-6-terra"), 372_000);
-        assert_eq!(get_context_window_size("gpt-5.6-luna"), 372_000);
+        // GPT 族三个模型实测均为 986k in。
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 986_000);
+        assert_eq!(get_context_window_size("gpt-5.6-sol-latest"), 986_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 986_000);
+        assert_eq!(get_context_window_size("gpt-5-6-terra"), 986_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 986_000);
         // 白名单外 → 保守默认值（这条路径实际走不到，端点层已 400）
         assert_eq!(get_context_window_size("claude-sonnet-4.6"), 200_000);
         assert_eq!(get_context_window_size("glm-5"), 200_000);
@@ -1914,7 +1915,7 @@ mod tests {
 
     #[test]
     fn disabled_thinking_emits_nothing_even_for_supported_model() {
-        let req = minimal_thinking_request("claude-opus-5", "disabled");
+        let req = minimal_thinking_request("claude-opus-5.5", "disabled");
         let result = convert_request(&req).unwrap();
         assert!(
             result.additional_model_request_fields.is_none(),
@@ -1964,7 +1965,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1993,7 +1994,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2187,7 +2188,7 @@ mod tests {
     fn convert_request_does_not_rewrite_tool_input_keys() {
         use super::super::types::Message as AnthropicMessage;
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2256,7 +2257,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2311,7 +2312,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2374,7 +2375,7 @@ mod tests {
     /// 补占位定义（上游要求历史引用的工具在 tools 里有定义）。
     ///
     /// 这个测试原本断言的是「客户端 `tools: None` 时也补占位符」。那条行为已被删除 ——
-    /// 它让不带 tools 的 compaction 请求凭空获得 bash / read 能力，claude-opus-5 于是把
+    /// 它让不带 tools 的 compaction 请求凭空获得 bash / read 能力，claude-opus-5.5 于是把
     /// 工具调用当正文打了出来。零工具那一侧现在由
     /// `no_client_tools_means_no_placeholder_tools` 反向锁住。
     #[test]
@@ -2383,7 +2384,7 @@ mod tests {
 
         // 客户端本轮声明了 write，历史里却用过 read（本轮没再带上）
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -2490,7 +2491,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2523,7 +2524,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -2558,7 +2559,7 @@ mod tests {
         // 测试孤立的 tool_result 被过滤
         // 历史中没有 tool_use，但 tool_results 中有 tool_result
         let history = vec![
-            Message::User(HistoryUserMessage::new("Hello", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Hello", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage::new("Hi there!")),
         ];
 
@@ -2582,7 +2583,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2611,7 +2612,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2639,7 +2640,7 @@ mod tests {
         ]);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2673,14 +2674,14 @@ mod tests {
         ]);
 
         // 构建历史中的 user 消息，包含 tool_result
-        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5");
+        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5.5");
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
 
         let history = vec![
             // 第一轮：用户请求
-            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5.5")),
             // 第一轮：assistant 使用工具
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg1,
@@ -2716,13 +2717,13 @@ mod tests {
         ]);
 
         // 历史中已有 tool_result
-        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5");
+        let mut user_msg_with_result = UserMessage::new("", "claude-opus-5.5");
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
 
         let history = vec![
-            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Read the file", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2816,7 +2817,7 @@ mod tests {
         ]);
 
         let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2854,7 +2855,7 @@ mod tests {
         ]);
 
         let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5")),
+            Message::User(HistoryUserMessage::new("Do something", "claude-opus-5.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
             }),
@@ -2884,7 +2885,7 @@ mod tests {
     fn assistant_prefill_is_converted_to_trailing_user_directive() {
         use super::super::types::Message as AnthropicMessage;
 
-        let mut req = minimal_request_with_output_config("claude-opus-5");
+        let mut req = minimal_request_with_output_config("claude-opus-5.5");
         req.messages = vec![
             AnthropicMessage {
                 role: "user".to_string(),
@@ -2937,7 +2938,7 @@ mod tests {
 
         const CLIENT_SYSTEM: &str = "You are a helpful assistant. Follow the user's style.";
 
-        let mut req = minimal_request_with_output_config("claude-opus-5");
+        let mut req = minimal_request_with_output_config("claude-opus-5.5");
         req.system = Some(vec![SystemMessage {
             text: CLIENT_SYSTEM.to_string(),
             cache_control: None,
@@ -2993,7 +2994,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let with_sig = |sig: &str| {
-            let mut req = minimal_request_with_output_config("claude-opus-5");
+            let mut req = minimal_request_with_output_config("claude-opus-5.5");
             req.messages = vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -3089,7 +3090,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3159,7 +3160,7 @@ mod tests {
 
         // user question -> assistant tool_use -> user tool_result (with image + text)
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -3220,7 +3221,7 @@ mod tests {
 
         // text-only tool_result: regression unchanged, should produce no top-level image
         let req = MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {

@@ -44,7 +44,7 @@ pub struct KiroRequest {
     /// }
     /// ```
     /// 档位枚举按模型族而异，见 `converter::model_effort_tiers`：
-    /// Claude 族（claude-opus-5 / claude-sonnet-5）接受 low/medium/high/xhigh/max，
+    /// Claude 族（claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）接受 low/medium/high/xhigh/max，
     /// GPT 族（gpt-5.6-sol / -terra / -luna）额外接受 none。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -57,7 +57,7 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// `thinking` 控制（仅 Claude 族接受：claude-opus-5 / claude-sonnet-5）。
+    /// `thinking` 控制（仅 Claude 族接受：claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）。
     ///
     /// 实测 schema：`type ∈ {adaptive, disabled}`（**没有 `enabled`**）、
     /// `display ∈ {summarized, omitted}`，`display` 缺省为 `omitted`（吞掉思考文本）。
@@ -74,7 +74,7 @@ pub struct AdditionalModelRequestFields {
     pub reasoning: Option<KiroReasoningConfig>,
 }
 
-/// `thinking` 控制（Claude 族：claude-opus-5 / claude-sonnet-5）。
+/// `thinking` 控制（Claude 族：claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroThinkingConfig {
     #[serde(rename = "type")]

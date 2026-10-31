@@ -1,10 +1,10 @@
 //! 模型白名单、模型族与 API 入口策略
 //!
-//! 本部署只服务 5 个模型。客户端入口与上游模型族是两个独立维度：
+//! 本部署只服务 6 个模型。客户端入口与上游模型族是两个独立维度：
 //!
 //! | 入口 | 允许的模型 |
 //! |---|---|
-//! | `/v1/messages` | 全部 5 个白名单模型 |
+//! | `/v1/messages` | 全部 6 个白名单模型 |
 //! | `/v1/responses` | GPT 族 3 个模型 |
 //!
 //! 上游推理字段仍严格按模型族分流：Claude 族使用
@@ -12,9 +12,11 @@
 //! `reasoning.effort`。入口不得参与上游 schema 判断。
 
 /// Claude 族上游 Kiro modelId。
-pub const MODEL_OPUS_5: &str = "claude-opus-5";
+pub const MODEL_OPUS_5_5: &str = "claude-opus-5.5";
 /// Claude 族上游 Kiro modelId。
-pub const MODEL_SONNET_5: &str = "claude-sonnet-5";
+pub const MODEL_SONNET_5_5: &str = "claude-sonnet-5.5";
+/// Claude 族上游 Kiro modelId。
+pub const MODEL_HAIKU_5_5: &str = "claude-haiku-5.5";
 /// GPT 族上游 Kiro modelId。
 pub const MODEL_GPT_56_SOL: &str = "gpt-5.6-sol";
 /// GPT 族上游 Kiro modelId。
@@ -22,11 +24,12 @@ pub const MODEL_GPT_56_TERRA: &str = "gpt-5.6-terra";
 /// GPT 族上游 Kiro modelId。
 pub const MODEL_GPT_56_LUNA: &str = "gpt-5.6-luna";
 
-const CLAUDE_MODELS: &[&str] = &[MODEL_OPUS_5, MODEL_SONNET_5];
+const CLAUDE_MODELS: &[&str] = &[MODEL_OPUS_5_5, MODEL_SONNET_5_5, MODEL_HAIKU_5_5];
 const GPT_MODELS: &[&str] = &[MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA];
 const ALL_MODELS: &[&str] = &[
-    MODEL_OPUS_5,
-    MODEL_SONNET_5,
+    MODEL_OPUS_5_5,
+    MODEL_SONNET_5_5,
+    MODEL_HAIKU_5_5,
     MODEL_GPT_56_SOL,
     MODEL_GPT_56_TERRA,
     MODEL_GPT_56_LUNA,
@@ -91,8 +94,9 @@ pub fn family_for_model(model_id: &str) -> Option<ModelFamily> {
 pub fn normalize(model: &str) -> Option<&'static str> {
     let m = strip_aliases(model);
     match m.as_str() {
-        "claude-opus-5" => Some(MODEL_OPUS_5),
-        "claude-sonnet-5" => Some(MODEL_SONNET_5),
+        "claude-opus-5.5" => Some(MODEL_OPUS_5_5),
+        "claude-sonnet-5.5" => Some(MODEL_SONNET_5_5),
+        "claude-haiku-5.5" => Some(MODEL_HAIKU_5_5),
         "gpt-5.6-sol" | "gpt-5-6-sol" => Some(MODEL_GPT_56_SOL),
         "gpt-5.6-terra" | "gpt-5-6-terra" => Some(MODEL_GPT_56_TERRA),
         "gpt-5.6-luna" | "gpt-5-6-luna" => Some(MODEL_GPT_56_LUNA),
@@ -172,11 +176,13 @@ mod tests {
     #[test]
     fn normalize_accepts_allowlisted_models_and_aliases() {
         for (requested, expected) in [
-            ("claude-opus-5", MODEL_OPUS_5),
-            ("Claude-Opus-5-thinking", MODEL_OPUS_5),
-            ("claude-opus-5-20260101-latest", MODEL_OPUS_5),
-            ("claude-sonnet-5", MODEL_SONNET_5),
-            ("claude-sonnet-5-20260101-thinking", MODEL_SONNET_5),
+            ("claude-opus-5.5", MODEL_OPUS_5_5),
+            ("Claude-Opus-5.5-thinking", MODEL_OPUS_5_5),
+            ("claude-opus-5.5-20260101-latest", MODEL_OPUS_5_5),
+            ("claude-sonnet-5.5", MODEL_SONNET_5_5),
+            ("claude-sonnet-5.5-20260101-thinking", MODEL_SONNET_5_5),
+            ("claude-haiku-5.5", MODEL_HAIKU_5_5),
+            ("claude-haiku-5.5-latest", MODEL_HAIKU_5_5),
             ("gpt-5.6-sol", MODEL_GPT_56_SOL),
             ("gpt-5-6-sol-latest", MODEL_GPT_56_SOL),
             ("GPT-5.6-Terra", MODEL_GPT_56_TERRA),
@@ -190,10 +196,10 @@ mod tests {
     /// 回归锁：白名单是穷举的，绝不做家族/版本号模糊推断。
     ///
     /// 这些 id 上游账号里确实有，但本部署不服务它们。最危险的是「差一点点」的名字：
-    /// 相邻版本号（`claude-sonnet-4.6` vs `claude-sonnet-5`）、多一个字母
+    /// 相邻版本号（`claude-sonnet-4.6` vs `claude-sonnet-5.5`）、多一个字母
     /// （`gpt-5.6-terran` vs `gpt-5.6-terra`、`gpt-5.6-lunar` vs `gpt-5.6-luna`）。
-    /// 一旦有人把匹配改松（例如「名字里带 claude-sonnet 就算 claude-sonnet-5」），
-    /// 客户端会以为自己在用 5 代，实际不是 —— 这条测试就是拦它的。
+    /// 一旦有人把匹配改松（例如「名字里带 claude-sonnet 就算 claude-sonnet-5.5」），
+    /// 客户端会以为自己在用 5.5 代，实际不是 —— 这条测试就是拦它的。
     #[test]
     fn normalize_rejects_everything_else() {
         for model in [
@@ -210,6 +216,10 @@ mod tests {
             "claude-fable-5",
             "claude-haiku-4.5",
             "claude-haiku-5",
+            // 上一代 5.0：已被 5.5 替换，不允许继续进白名单
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-5-thinking",
             // 同族但不在白名单内的 id
             "gpt-5.6",
             "gpt-5.6-pro",
@@ -311,9 +321,9 @@ mod tests {
 
     #[test]
     fn errors_describe_the_current_endpoint_policy() {
-        let wrong = resolve("claude-opus-5", ApiEndpoint::Responses)
+        let wrong = resolve("claude-opus-5.5", ApiEndpoint::Responses)
             .unwrap_err()
-            .message("claude-opus-5");
+            .message("claude-opus-5.5");
         assert!(wrong.contains("/v1/responses"), "{wrong}");
         assert!(wrong.contains("/v1/messages"), "{wrong}");
 

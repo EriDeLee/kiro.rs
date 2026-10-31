@@ -1381,7 +1381,7 @@ mod tests {
 
     fn payload_with_last_block(block: Value) -> MessagesRequest {
         MessagesRequest {
-            model: "claude-opus-5".to_string(),
+            model: "claude-opus-5.5".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),

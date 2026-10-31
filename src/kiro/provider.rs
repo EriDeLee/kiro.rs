@@ -1398,14 +1398,14 @@ mod image_retry_tests {
         );
 
         let history = vec![Message::User(HistoryUserMessage {
-            user_input_message: UserMessage::new("old", "claude-opus-5")
+            user_input_message: UserMessage::new("old", "claude-opus-5.5")
                 .with_images(vec![KiroImage::from_base64("jpeg", encoded.clone())]),
         })];
         let request = KiroRequest {
             conversation_state: ConversationState::new("image-retry-test")
                 .with_history(history)
                 .with_current_message(CurrentMessage::new(
-                    UserInputMessage::new("current", "claude-opus-5")
+                    UserInputMessage::new("current", "claude-opus-5.5")
                         .with_images(vec![KiroImage::from_base64("png", encoded)]),
                 )),
             profile_arn: None,

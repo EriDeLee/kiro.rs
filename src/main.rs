@@ -337,7 +337,7 @@ async fn main() {
     tracing::info!("监听地址: {}", addr);
     tracing::info!("可用 API（Messages 接受全部白名单模型；Responses 仅接受 GPT）:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages              [全部 5 个白名单模型]");
+    tracing::info!("  POST /v1/messages              [全部 6 个白名单模型]");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  POST /v1/responses             [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]");
     tracing::info!("Admin: /api/admin/* + UI /admin");
@@ -383,8 +383,25 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        ctrl_c.await;
-        tracing::info!("收到 Ctrl-C，开始优雅关机");
+        // Windows 上被服务管理器 / agent harness 以 CREATE_NEW_PROCESS_GROUP 启动时，
+        // 该进程组默认屏蔽 Ctrl+C，外部控制台只能送 Ctrl+Break。两者都监听，
+        // 否则进程只能被 TerminateProcess 强杀 —— 那样 30 秒去抖窗口内的用量计数会丢。
+        let ctrl_break = async {
+            match tokio::signal::windows::ctrl_break() {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(e) => {
+                    tracing::warn!("监听 Ctrl-Break 失败: {}", e);
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("收到 Ctrl-C，开始优雅关机"),
+            _ = ctrl_break => tracing::info!("收到 Ctrl-Break，开始优雅关机"),
+        }
     }
 }
 

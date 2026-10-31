@@ -443,6 +443,15 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         .and_then(|limit| i32::try_from(limit).ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(64_000);
+    // 上游 `tokenLimits` 是运行时数据：缺字段或非正数时才回退到按族推算的窗口，
+    // 不能反过来用常量覆盖上游返回值。
+    let context_window = upstream
+        .token_limits
+        .as_ref()
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| super::converter::get_context_window_size(&upstream.model_id));
     Model {
         display_name: upstream
             .model_name
@@ -454,6 +463,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         created: 0,
         model_type: "chat".to_string(),
         max_tokens,
+        context_window,
     }
 }
 
@@ -489,7 +499,7 @@ fn aggregate_available_models_inner(upstream_models: Vec<UpstreamModel>) -> Vec<
 
 /// 汇总可用模型清单。
 ///
-/// 只保留白名单内的模型：Claude 组（`claude-opus-5`、`claude-sonnet-5`）与 GPT 组
+/// 只保留白名单内的模型：Claude 组（`claude-opus-5.5`、`claude-sonnet-5.5`）与 GPT 组
 ///（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）。全部模型可走 `/v1/messages`，
 /// GPT 组也可走 `/v1/responses`；其余一律在请求阶段 400。若这里仍列出白名单外
 /// 的模型，客户端会看到一个「能选但一用就报错」
@@ -1386,7 +1396,7 @@ fn build_non_stream_content(
         } else if !text_content.is_empty() {
             // 只认原生 `reasoningContentEvent`（带真 signature）。上游若把思考写进
             // 正文的 `<thinking>` 标签，那是 legacy 形态：此处不再解析提取，正文
-            // 原样输出。2026-07 实测 claude-opus-5 在长推理 / 工具调用 / 流式与
+            // 原样输出。2026-07 实测 claude-opus-5.5 在长推理 / 工具调用 / 流式与
             // 非流式全部走原生模式（406 个 reasoning 事件，XML 模式 0 次）。
             content.push(json!({
                 "type": "text",
@@ -1427,7 +1437,7 @@ fn build_non_stream_content(
 
 /// 模型名带 `-thinking` 后缀时开启思考。
 ///
-/// 白名单接受 `claude-opus-5-thinking` 作为 `claude-opus-5` 的别名（`allowlist`
+/// 白名单接受 `claude-opus-5.5-thinking` 作为 `claude-opus-5.5` 的别名（`allowlist`
 /// 只校验不改写 `payload.model`，所以后缀在此仍可见）。
 ///
 /// 上游 Claude 族只接受 `thinking.type = adaptive`，发 `enabled` 会 400；
@@ -1639,7 +1649,7 @@ mod tests {
 
     /// 回归锁：legacy `<thinking>` XML 提取已移除，只认原生 reasoningContentEvent。
     ///
-    /// 上游若把思考写进正文标签（2026-07 实测 claude-opus-5 从不这样：406 个
+    /// 上游若把思考写进正文标签（2026-07 实测 claude-opus-5.5 从不这样：406 个
     /// reasoning 事件全部走原生模式），这里不再解析成 thinking 块，正文原样输出。
     /// 伪造出的 thinking 块带不了真 signature，回传上游必然验签失败。
     #[test]
@@ -1713,15 +1723,15 @@ mod tests {
     #[test]
     fn dynamic_models_do_not_synthesize_claude_thinking_alias() {
         let models = aggregate_available_models(vec![UpstreamModel {
-            model_id: "claude-opus-5".to_string(),
+            model_id: "claude-opus-5.5".to_string(),
             model_name: Some("Claude Opus 5".to_string()),
             description: None,
             token_limits: None,
         }]);
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
-        assert!(ids.contains(&"claude-opus-5"));
-        assert!(!ids.contains(&"claude-opus-5-thinking"));
+        assert!(ids.contains(&"claude-opus-5.5"));
+        assert!(!ids.contains(&"claude-opus-5.5-thinking"));
     }
 
     #[test]
@@ -1784,7 +1794,7 @@ mod tests {
     fn dynamic_models_merge_metadata_and_do_not_use_input_limit_as_output_limit() {
         let models = aggregate_available_models(vec![
             UpstreamModel {
-                model_id: "claude-opus-5".to_string(),
+                model_id: "claude-opus-5.5".to_string(),
                 model_name: None,
                 description: Some("first".to_string()),
                 token_limits: Some(TokenLimits {
@@ -1793,7 +1803,7 @@ mod tests {
                 }),
             },
             UpstreamModel {
-                model_id: "claude-opus-5".to_string(),
+                model_id: "claude-opus-5.5".to_string(),
                 model_name: Some("Claude Opus 5".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
@@ -1808,6 +1818,8 @@ mod tests {
         // owned_by 按模型名前缀推断：claude-* → anthropic
         assert_eq!(models[0].owned_by, "anthropic");
         assert_eq!(models[0].max_tokens, 32_000);
+        // 合并时输入窗口取两个来源的较大值。
+        assert_eq!(models[0].context_window, 1_000_000);
     }
 
     /// 回归锁：`/v1/models` 只能列出白名单内的模型。
@@ -1819,7 +1831,7 @@ mod tests {
     fn available_models_only_lists_allowlisted() {
         let upstream = vec![
             UpstreamModel {
-                model_id: "claude-opus-5".to_string(),
+                model_id: "claude-opus-5.5".to_string(),
                 model_name: Some("Claude Opus 5".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
@@ -1828,7 +1840,7 @@ mod tests {
                 }),
             },
             UpstreamModel {
-                model_id: "claude-sonnet-5".to_string(),
+                model_id: "claude-sonnet-5.5".to_string(),
                 model_name: Some("Claude Sonnet 5".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
@@ -1847,7 +1859,7 @@ mod tests {
                 model_name: Some("GPT 5.6 Terra".to_string()),
                 description: None,
                 token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(372_000),
+                    max_input_tokens: Some(986_000),
                     max_output_tokens: Some(128_000),
                 }),
             },
@@ -1864,7 +1876,7 @@ mod tests {
                 description: None,
                 token_limits: None,
             },
-            // 相邻版本号：绝不能被误判成 claude-sonnet-5
+            // 相邻版本号：绝不能被误判成 claude-sonnet-5.5
             UpstreamModel {
                 model_id: "claude-sonnet-4.6".to_string(),
                 model_name: None,
@@ -1891,8 +1903,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "claude-opus-5",
-                "claude-sonnet-5",
+                "claude-opus-5.5",
+                "claude-sonnet-5.5",
                 "gpt-5.6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
@@ -1900,10 +1912,17 @@ mod tests {
         );
         // sonnet-5 的输出上限是 64k，与 opus-5 的 128k 不同 —— 上游值必须原样透出，
         // 不能被同族的另一个模型的值污染。
-        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5").unwrap();
+        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5.5").unwrap();
         assert_eq!(sonnet.max_tokens, 64_000);
-        let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
+        // 输入窗口同样来自上游 tokenLimits，而不是按族推断的常量。
+        assert_eq!(sonnet.context_window, 1_000_000);
+        let opus = models.iter().find(|m| m.id == "claude-opus-5.5").unwrap();
         assert_eq!(opus.max_tokens, 128_000);
+        // 上游没给 tokenLimits 的模型回退到按族计算的窗口。
+        let luna = models.iter().find(|m| m.id == "gpt-5.6-luna").unwrap();
+        assert_eq!(luna.context_window, 986_000);
+        let terra = models.iter().find(|m| m.id == "gpt-5.6-terra").unwrap();
+        assert_eq!(terra.context_window, 986_000);
     }
 
     #[test]
