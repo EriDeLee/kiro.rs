@@ -600,13 +600,22 @@ fn is_valid_uuid(s: &str) -> bool {
 }
 
 /// 收集历史消息中使用的所有工具名称
-fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
+fn collect_history_tool_names(
+    history: &[Message],
+    server_tool_ids: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let mut tool_names = Vec::new();
 
     for msg in history {
         if let Message::Assistant(assistant_msg) = msg {
             if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 for tool_use in tool_uses {
+                    // server_tool_use（web_search 等）是 Anthropic 服务端能力，
+                    // 客户端没有声明过。把它们当成客户端历史工具会触发占位符注入，
+                    // 等于凭空给模型一个它不该有的工具。
+                    if server_tool_ids.contains(&tool_use.tool_use_id) {
+                        continue;
+                    }
                     if !tool_names.contains(&tool_use.name) {
                         tool_names.push(tool_use.name.clone());
                     }
@@ -660,50 +669,74 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. assistant prefill：Kiro 上游没有预填槽位，转成末尾 user 指令而非丢弃。
+    // 2.5. 末尾 assistant（prefill）与末尾 system 消息。
     //
+    // assistant prefill：Kiro 上游没有预填槽位，转成末尾 user 指令而非丢弃。
     // 客户端在 agent 达到步数上限时会发一条末尾 assistant 消息（内容形如「已达
     // 最大步数，只许输出文字」）—— 这是 Anthropic 协议的合法形态，不是客户端错误。
     // 无条件 400 会把会话打死，且错误信息难以溯源。
     //
-    // prefill 的语义是「约束模型接下来的输出」，转成 user 消息末尾的指令语义损失
-    // 最小，也不丢任何信息。这不是静默降级：转换会记 warn。
-    let prefilled: Option<Vec<super::types::Message>> =
-        match req.messages.last().filter(|m| m.role != "user") {
-            None => None,
-            Some(tail) => {
-                let directive = collect_message_text(&tail.content);
-                if directive.trim().is_empty() {
-                    // 空 prefill 没有可转换的约束，直接去掉尾巴。
-                    tracing::warn!("末尾 assistant 消息为空，已移除（上游无 prefill 槽位）");
-                    Some(req.messages[..req.messages.len() - 1].to_vec())
-                } else {
-                    tracing::warn!(
-                        directive_len = directive.len(),
-                        "检测到 assistant prefill（常见来源：opencode 的 agent steps 上限），\
-                         上游无预填槽位，已转为末尾 user 指令"
-                    );
-                    let mut rebuilt = req.messages[..req.messages.len() - 1].to_vec();
-                    match rebuilt.last_mut().filter(|m| m.role == "user") {
-                        // 末尾已是 user：把指令并入该消息，避免产生连续 user 消息。
-                        Some(last_user) => {
-                            let mut merged = collect_message_text(&last_user.content);
-                            if !merged.is_empty() {
-                                merged.push_str("\n\n");
-                            }
-                            merged.push_str(&directive);
-                            last_user.content = serde_json::Value::String(merged);
-                        }
-                        None => rebuilt.push(super::types::Message {
-                            role: "user".to_string(),
-                            content: serde_json::Value::String(directive),
-                        }),
-                    }
-                    Some(rebuilt)
+    // 末尾 system：上游同样没有 system 槽位，并入最后一条 user 消息；空内容的
+    // system 是客户端的 effort 更新，没有正文可转，直接忽略。
+    //
+    // 两种尾巴都只克隆一次消息列表；没有尾巴时保持借用，不复制整段历史。
+    let mut messages_buf: std::borrow::Cow<'_, [super::types::Message]> =
+        std::borrow::Cow::Borrowed(&req.messages);
+    let merge_directive = |rebuilt: &mut Vec<super::types::Message>, directive: String| {
+        match rebuilt.last_mut().filter(|m| m.role == "user") {
+            // 末尾已是 user：把指令并入该消息，避免产生连续 user 消息。
+            Some(last_user) => {
+                let mut merged = collect_message_text(&last_user.content);
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
                 }
+                merged.push_str(&directive);
+                last_user.content = serde_json::Value::String(merged);
             }
-        };
-    let messages: &[_] = prefilled.as_deref().unwrap_or(&req.messages);
+            None => rebuilt.push(super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(directive),
+            }),
+        }
+    };
+
+    if messages_buf.last().is_some_and(|m| m.role == "assistant") {
+        let directive = collect_message_text(
+            &messages_buf.last().expect("just checked assistant tail").content,
+        );
+        let rebuilt = messages_buf.to_mut();
+        rebuilt.pop();
+        if directive.trim().is_empty() {
+            // 空 prefill 没有可转换的约束，直接去掉尾巴。
+            tracing::warn!("末尾 assistant 消息为空，已移除（上游无 prefill 槽位）");
+        } else {
+            tracing::warn!(
+                directive_len = directive.len(),
+                "检测到 assistant prefill（常见来源：opencode 的 agent steps 上限），\
+                 上游无预填槽位，已转为末尾 user 指令"
+            );
+            merge_directive(rebuilt, directive);
+        }
+    }
+
+    if messages_buf.last().is_some_and(|m| m.role == "system") {
+        let directive =
+            collect_message_text(&messages_buf.last().expect("just checked system tail").content);
+        let rebuilt = messages_buf.to_mut();
+        rebuilt.pop();
+        if directive.trim().is_empty() {
+            // 客户端的 per-turn effort 更新就是 content: [] 的 system 消息。
+            tracing::debug!("末尾 system 消息无正文（可能是 effort 更新），已忽略");
+        } else {
+            tracing::warn!(
+                text_len = directive.len(),
+                "末尾 system 消息上游无 system 槽位，已并入最后一条 user 消息"
+            );
+            merge_directive(rebuilt, directive);
+        }
+    }
+
+    let messages: &[_] = messages_buf.as_ref();
     if messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
     }
@@ -730,7 +763,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let (mut history, server_tool_ids) = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -744,7 +777,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
-    let history_tool_names = collect_history_tool_names(&history);
+    let history_tool_names = collect_history_tool_names(&history, &server_tool_ids);
     let existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
@@ -846,15 +879,21 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    process_message_content_dedup(content, None)
+    process_message_content_dedup(content, None, true)
 }
 
 /// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
 /// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
 /// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
+///
+/// `current` 区分「本轮消息」与「历史」：
+/// - 本轮里出现上游无法接收的附件（PDF、HEIC 等）→ 400，让客户端立刻知道内容没送达；
+/// - 历史里出现同样的附件 → 占位符 + warn，因为历史无法要求客户端重发，400 会让整个
+///   会话永久打不开。
 fn process_message_content_dedup(
     content: &serde_json::Value,
     mut dedup: Option<&mut std::collections::HashSet<String>>,
+    current: bool,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -887,13 +926,27 @@ fn process_message_content_dedup(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source
-                                && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images)
-                            {
-                                text_parts.push(placeholder);
+                            match block.source {
+                                Some(source) => {
+                                    if let Some(placeholder) =
+                                        extract_kiro_image(&source, &mut dedup, &mut images, current)?
+                                    {
+                                        text_parts.push(placeholder);
+                                    }
+                                }
+                                None => tracing::warn!("image 块缺少 source，已丢弃"),
                             }
                         }
+                        // 附件：`text/*` 的 source.data 已是明文（opencode 的 PlainTextSource），
+                        // 直接内联；PDF 上游不支持（supportedInputTypes 仅 TEXT,IMAGE）。
+                        "document" => match block.source {
+                            Some(source) => {
+                                if let Some(text) = document_to_text(&source, current)? {
+                                    text_parts.push(text);
+                                }
+                            }
+                            None => tracing::warn!("document 块缺少 source，已丢弃"),
+                        },
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(
@@ -917,7 +970,14 @@ fn process_message_content_dedup(
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
-                        _ => {}
+                        _ => {
+                            // document 已在上面显式处理；走到这里的是 search_result、
+                            // container_upload 等上游没有对应槽位的块。不能静默丢。
+                            tracing::warn!(
+                                block_type = %block.block_type,
+                                "用户消息中的内容块类型无法转发，已丢弃"
+                            );
+                        }
                     }
                 }
             }
@@ -943,20 +1003,40 @@ fn get_image_format(media_type: &str) -> Option<String> {
 ///
 /// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
 /// so an image inside a tool_result is lifted into the top-level images field the same way.
-/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
+/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted.
+///
+/// 上游只接受 jpeg/png/gif/webp。其他格式（HEIC、BMP…）不能静默丢：
+/// 当前轮 400，历史里用占位符，让模型至少知道有一张图没送达。
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
-) -> Option<String> {
-    let format = get_image_format(&source.media_type)?;
+    current: bool,
+) -> Result<Option<String>, ConversionError> {
+    if source.source_type != "base64" {
+        return unsupported_attachment(
+            current,
+            format!("{} source（上游只接受 base64 内联）", source.source_type),
+        );
+    }
+    let Some(format) = get_image_format(&source.media_type) else {
+        return unsupported_attachment(
+            current,
+            format!(
+                "{} 图片（上游只接受 jpeg/png/gif/webp）",
+                source.media_type
+            ),
+        );
+    };
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
         hasher.update(source.data.as_bytes());
         let digest = format!("{:x}", hasher.finalize());
         if !seen.insert(digest) {
-            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+            return Ok(Some(
+                "[image omitted: identical to an earlier screenshot]".to_string(),
+            ));
         }
     }
     let cfg = ResizeConfig::from_env();
@@ -965,7 +1045,42 @@ fn extract_kiro_image(
         processed.format,
         processed.data_base64,
     ));
-    None
+    Ok(None)
+}
+
+/// 本轮无法转发的附件 → 400；历史里的同样内容 → 占位符 + warn。
+///
+/// 历史不能 400：那会让整个会话在每次请求时都失败，客户端只能 rewind 才能恢复，
+/// 而多数客户端会把 400 当成请求错误反复重试。占位符至少把「有东西没送达」告诉模型。
+fn unsupported_attachment(
+    current: bool,
+    detail: String,
+) -> Result<Option<String>, ConversionError> {
+    if current {
+        return Err(ConversionError::UnsupportedRequest(format!(
+            "上游不接受 {detail}；请转换格式后重试"
+        )));
+    }
+    tracing::warn!(detail = %detail, "历史附件无法转发，已替换为占位符");
+    Ok(Some(format!("[attachment omitted: {detail}]")))
+}
+
+/// `document` 块 → 文本。
+///
+/// - `source.type == "text"`：`data` 已是明文（opencode 的 PlainTextSource），直接内联。
+/// - `application/pdf`：上游 `supportedInputTypes` 只有 TEXT/IMAGE，当前轮 400；历史用占位符。
+/// - 其他：当前轮 400，历史用占位符。
+fn document_to_text(
+    source: &ImageSource,
+    current: bool,
+) -> Result<Option<String>, ConversionError> {
+    if source.source_type == "text" {
+        return Ok(Some(source.data.clone()));
+    }
+    if source.media_type == "application/pdf" {
+        return unsupported_attachment(current, "PDF 文档".to_string());
+    }
+    unsupported_attachment(current, format!("{} 文档", source.media_type))
 }
 
 /// 提取工具结果内容
@@ -986,15 +1101,46 @@ fn extract_tool_result_content(
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
-                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                    continue;
+                }
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("<none>");
+                if item_type == "image"
                     && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
-                        parts.push(placeholder);
+                    match extract_kiro_image(&source, dedup, images, false) {
+                        Ok(Some(placeholder)) => parts.push(placeholder),
+                        Ok(None) => {}
+                        // current=false 不会返回 Err；真出现也按占位符处理，不打死整轮。
+                        Err(e) => {
+                            tracing::warn!("工具结果中的图片无法转发: {}", e);
+                            parts.push("[image omitted]".to_string());
+                        }
                     }
+                    continue;
                 }
+                if item_type == "document"
+                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
+                    && let Some(source) = block.source
+                {
+                    // 工具结果属于对话历史：不可转发时用占位符，不 400。
+                    match document_to_text(&source, false) {
+                        Ok(Some(text)) => parts.push(text),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("工具结果中的文档无法转发: {}", e);
+                            parts.push("[document omitted]".to_string());
+                        }
+                    }
+                    continue;
+                }
+                // 非文本项（search_result、container_upload 等）不能静默丢。
+                tracing::warn!(
+                    item_type = %item_type,
+                    "tool_result 中的非文本项无法转发，已替换为占位符"
+                );
+                parts.push(format!("[unsupported tool_result item: {item_type}]"));
             }
             if parts.is_empty() && had_image {
                 "[image attached]".to_string()
@@ -1232,8 +1378,12 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
-) -> Result<Vec<Message>, ConversionError> {
+) -> Result<(Vec<Message>, std::collections::HashSet<String>), ConversionError> {
     let mut history = Vec::new();
+    // Anthropic 的 server tool（server_tool_use，如 web_search）不是客户端声明的能力。
+    // 这些 id 只用于历史回放；不能让它们触发 `create_placeholder_tool`，否则会给客户
+    // 端凭空造出一个它没声明的 web_search 工具。
+    let mut server_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 生成thinking前缀（如果需要）
     // 白名单内的模型（Claude 组 / GPT 组）都走 Kiro 原生 reasoning 字段
@@ -1298,7 +1448,7 @@ fn build_history(
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
                 let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-                history.push(Message::Assistant(merged));
+                push_assistant_message(&mut history, merged, model_id, &mut server_tool_ids);
                 assistant_buffer.clear();
             }
             user_buffer.push(msg);
@@ -1311,13 +1461,38 @@ fn build_history(
             }
             // 累积 assistant 消息（支持连续多条）
             assistant_buffer.push(msg);
+        } else if msg.role == "system" {
+            // 上游 history 没有 system 槽位。原位转成 user 消息，内容原样保留；
+            // 空 content 的是客户端 per-turn effort 更新，没有正文可转。
+            if !assistant_buffer.is_empty() {
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                push_assistant_message(&mut history, merged, model_id, &mut server_tool_ids);
+                assistant_buffer.clear();
+            }
+            if !user_buffer.is_empty() {
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+                history.push(Message::User(merged_user));
+                user_buffer.clear();
+            }
+            let text = collect_message_text(&msg.content);
+            if text.trim().is_empty() {
+                tracing::debug!("中途 system 消息无正文（可能是 effort 更新），已忽略");
+            } else {
+                tracing::warn!(
+                    text_len = text.len(),
+                    "中途 system 消息上游无 system 槽位，已转为 user 消息"
+                );
+                history.push(Message::User(HistoryUserMessage::new(text, model_id)));
+            }
+        } else {
+            tracing::warn!(role = %msg.role, "历史消息的角色无法转发，已丢弃");
         }
     }
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
         let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-        history.push(Message::Assistant(merged));
+        push_assistant_message(&mut history, merged, model_id, &mut server_tool_ids);
     }
 
     // 处理结尾的孤立 user 消息
@@ -1328,7 +1503,33 @@ fn build_history(
         history.push(Message::User(merged_user));
     }
 
-    Ok(history)
+    Ok((history, server_tool_ids))
+}
+
+/// 把一条（可能合并过的）assistant 消息写入历史。
+///
+/// server tool 的结果（`web_search_tool_result`）在 Anthropic 里属于 assistant 消息，
+/// 但 Kiro 的 `assistantResponseMessage` 没有 toolResults 字段，只能挂在 user 消息上。
+/// 这里在 assistant 后面补一条 content 为空的 user 消息承载它们；顺序与 Anthropic 一致。
+fn push_assistant_message(
+    history: &mut Vec<Message>,
+    converted: ConvertedAssistant,
+    model_id: &str,
+    all_server_tool_ids: &mut std::collections::HashSet<String>,
+) {
+    let ConvertedAssistant {
+        message,
+        server_tool_results,
+        server_tool_ids,
+    } = converted;
+    history.push(Message::Assistant(message));
+    all_server_tool_ids.extend(server_tool_ids);
+    if !server_tool_results.is_empty() {
+        let ctx = UserInputMessageContext::new().with_tool_results(server_tool_results);
+        history.push(Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new("", model_id).with_context(ctx),
+        }));
+    }
 }
 
 /// 合并多个 user 消息
@@ -1343,7 +1544,7 @@ fn merge_user_messages(
 
     for msg in messages {
         let (text, images, tool_results) =
-            process_message_content_dedup(&msg.content, Some(dedup))?;
+            process_message_content_dedup(&msg.content, Some(dedup), false)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1370,16 +1571,30 @@ fn merge_user_messages(
     })
 }
 
+/// assistant 消息转换结果。
+///
+/// `server_tool_results` 不能留在 assistant 消息里（Kiro 的
+/// `assistantResponseMessage` 没有 toolResults 字段），由调用方补一条 user 消息承载。
+struct ConvertedAssistant {
+    message: HistoryAssistantMessage,
+    server_tool_results: Vec<ToolResult>,
+    /// `server_tool_use` 的 id，用于阻止 `create_placeholder_tool` 把它们当成
+    /// 客户端声明的能力。
+    server_tool_ids: Vec<String>,
+}
+
 /// 转换 assistant 消息
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
+) -> Result<ConvertedAssistant, ConversionError> {
     let mut thinking_content = String::new();
     let mut thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
+    let mut server_tool_results = Vec::new();
+    let mut server_tool_ids = Vec::new();
 
     match &msg.content {
         serde_json::Value::String(s) => {
@@ -1442,7 +1657,51 @@ fn convert_assistant_message(
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
-                        _ => {}
+                        // Anthropic 的 server tool（当前只有 web_search）与客户端 tool_use
+                        // 结构相同；上游没有 server tool 概念，按普通 tool_use 回放，
+                        // 让历史里的调用与结果仍然成对。
+                        "server_tool_use" => {
+                            if let (Some(id), Some(name)) = (block.id, block.name) {
+                                let input = block.input.unwrap_or(serde_json::json!({}));
+                                let mapped_name = map_tool_name(&name, tool_name_map);
+                                server_tool_ids.push(id.clone());
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                            } else {
+                                tracing::warn!("server_tool_use 缺少 id 或 name，已丢弃");
+                            }
+                        }
+                        // server tool 的结果：内容原样 JSON 序列化，由调用方挂到
+                        // assistant 之后的合成 user 消息上。
+                        "web_search_tool_result" => {
+                            if let Some(id) = block.tool_use_id {
+                                let text = block
+                                    .content
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default();
+                                if text.is_empty() {
+                                    tracing::warn!(
+                                        tool_use_id = %id,
+                                        "web_search_tool_result 没有 content，按空结果回放"
+                                    );
+                                }
+                                let result = if block.is_error.unwrap_or(false) {
+                                    ToolResult::error(&id, text)
+                                } else {
+                                    ToolResult::success(&id, text)
+                                };
+                                server_tool_results.push(result);
+                            } else {
+                                tracing::warn!("web_search_tool_result 缺少 tool_use_id，已丢弃");
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                block_type = %block.block_type,
+                                "assistant 消息中的内容块类型无法转发，已丢弃"
+                            );
+                        }
                     }
                 }
             }
@@ -1468,8 +1727,12 @@ fn convert_assistant_message(
             .with_reasoning_content(ReasoningContent::text(thinking_content, thinking_signature));
     }
 
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
+    Ok(ConvertedAssistant {
+        message: HistoryAssistantMessage {
+            assistant_response_message: assistant,
+        },
+        server_tool_results,
+        server_tool_ids,
     })
 }
 
@@ -1478,7 +1741,7 @@ fn convert_assistant_message(
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
+) -> Result<ConvertedAssistant, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
         return convert_assistant_message(messages[0], tool_name_map);
@@ -1486,13 +1749,17 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    let mut all_server_tool_results: Vec<ToolResult> = Vec::new();
+    let mut all_server_tool_ids: Vec<String> = Vec::new();
     // `reasoningContent` 是 Smithy union，合并后的单条消息只能带一个。
     // 保留最后一条非空的：它对应最近一次推理，与紧随其后的 tool_use 配对。
     let mut merged_reasoning: Option<ReasoningContent> = None;
 
     for msg in messages {
         let converted = convert_assistant_message(msg, tool_name_map)?;
-        let am = converted.assistant_response_message;
+        all_server_tool_results.extend(converted.server_tool_results);
+        all_server_tool_ids.extend(converted.server_tool_ids);
+        let am = converted.message.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
         }
@@ -1518,8 +1785,12 @@ fn merge_assistant_messages(
     if let Some(rc) = merged_reasoning {
         assistant = assistant.with_reasoning_content(rc);
     }
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
+    Ok(ConvertedAssistant {
+        message: HistoryAssistantMessage {
+            assistant_response_message: assistant,
+        },
+        server_tool_results: all_server_tool_results,
+        server_tool_ids: all_server_tool_ids,
     })
 }
 
@@ -2000,7 +2271,7 @@ mod tests {
             }),
         ];
 
-        let tool_names = collect_history_tool_names(&history);
+        let tool_names = collect_history_tool_names(&history, &std::collections::HashSet::new());
         assert_eq!(tool_names.len(), 2);
         assert!(tool_names.contains(&"read".to_string()));
         assert!(tool_names.contains(&"write".to_string()));
@@ -2760,12 +3031,13 @@ mod tests {
         let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
         assert_eq!(
-            result.assistant_response_message.content, "",
+            result.message.assistant_response_message.content, "",
             "客户端没给正文，就原样发空串，不许补占位符"
         );
 
         // 验证 tool_uses 被正确保留
         let tool_uses = result
+            .message
             .assistant_response_message
             .tool_uses
             .expect("应该有 tool_uses");
@@ -2791,12 +3063,13 @@ mod tests {
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
-            result.assistant_response_message.content,
+            result.message.assistant_response_message.content,
             "Let me read that file for you."
         );
 
         // 验证 tool_uses 被正确保留
         let tool_uses = result
+            .message
             .assistant_response_message
             .tool_uses
             .expect("应该有 tool_uses");
@@ -3053,7 +3326,7 @@ mod tests {
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
         let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
 
-        let content = &result.assistant_response_message.content;
+        let content = &result.message.assistant_response_message.content;
         // 思考不再拼进 content，而是走结构化 reasoningContent（上游解密 signature
         // 重建思维链，content 里的明文对模型无效且会污染上下文）。
         assert!(
@@ -3065,6 +3338,7 @@ mod tests {
             "应包含第二条消息的 text 内容"
         );
         let rc = result
+            .message
             .assistant_response_message
             .reasoning_content
             .as_ref()
@@ -3077,6 +3351,7 @@ mod tests {
         );
 
         let tool_uses = result
+            .message
             .assistant_response_message
             .tool_uses
             .expect("应有 tool_uses");
@@ -3264,6 +3539,271 @@ mod tests {
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
+        );
+    }
+
+    fn history_user_texts(history: &[Message]) -> Vec<String> {
+        history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(u.user_input_message.content.clone()),
+                Message::Assistant(_) => None,
+            })
+            .collect()
+    }
+
+    /// `.txt` 附件：opencode 发 source.type=text，data 已是明文。
+    /// 上游没有 document 槽位，必须内联成正文，不能静默丢。
+    #[test]
+    fn text_document_is_inlined_as_text() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "hello from file"}
+            }]),
+        }];
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(msg.content, "hello from file");
+    }
+
+    /// PDF 当前轮：上游 supportedInputTypes 只有 TEXT/IMAGE，必须 400 而不是静默丢。
+    #[test]
+    fn pdf_document_in_current_turn_is_rejected() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}
+            }]),
+        }];
+
+        let err = convert_request(&req).unwrap_err();
+        assert!(
+            matches!(&err, ConversionError::UnsupportedRequest(m) if m.contains("PDF")),
+            "应明确拒绝 PDF，实际: {err}"
+        );
+    }
+
+    /// PDF 在历史里：不能每次请求都 400（会话会永久打不开），用占位符 + warn。
+    #[test]
+    fn pdf_document_in_history_becomes_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("continue"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let texts = history_user_texts(&result.conversation_state.history);
+        assert_eq!(texts.len(), 1);
+        assert!(
+            texts[0].contains("[attachment omitted: PDF"),
+            "历史 PDF 应变成占位符，实际: {}",
+            texts[0]
+        );
+    }
+
+    /// 不支持的图片格式：当前轮 400，不能静默丢。
+    #[test]
+    fn unsupported_image_in_current_turn_is_rejected() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/heic", "data": "AAAA"}
+            }]),
+        }];
+
+        let err = convert_request(&req).unwrap_err();
+        assert!(
+            matches!(&err, ConversionError::UnsupportedRequest(m) if m.contains("image/heic")),
+            "应明确拒绝 HEIC，实际: {err}"
+        );
+    }
+
+    /// 中途 system：上游 history 没有 system 槽位，原位转成 user 消息，内容不丢。
+    #[test]
+    fn mid_conversation_system_becomes_user_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("first"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("answer"),
+            },
+            AnthropicMessage {
+                role: "system".to_string(),
+                content: serde_json::json!("extra rule"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("second"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let texts = history_user_texts(&result.conversation_state.history);
+        assert!(
+            texts.contains(&"extra rule".to_string()),
+            "中途 system 内容必须保留，实际: {texts:?}"
+        );
+    }
+
+    /// Anthropic server tool 历史：server_tool_use → toolUses，
+    /// web_search_tool_result → 紧邻的合成 user 消息；且不生成 web_search 占位工具。
+    #[test]
+    fn server_tool_history_is_preserved_without_placeholder_tool() {
+        use super::super::types::Message as AnthropicMessage;
+        use super::super::types::Tool;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.tools = Some(vec![Tool {
+            tool_type: None,
+            name: "read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: std::collections::BTreeMap::new(),
+            max_uses: None,
+            cache_control: None,
+        }]);
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("search something"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "x"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                        {"type": "web_search_result", "title": "T", "url": "https://example.com"}
+                    ]},
+                    {"type": "text", "text": "answer"}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("next"),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let history = &result.conversation_state.history;
+
+        let assistant = history
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant(a) => Some(&a.assistant_response_message),
+                Message::User(_) => None,
+            })
+            .expect("应有 assistant 消息");
+        let tool_uses = assistant.tool_uses.as_ref().expect("应保留 server_tool_use");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "srvtoolu_1");
+
+        let synthetic = history
+            .iter()
+            .find_map(|m| match m {
+                Message::User(u)
+                    if u
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .any(|r| r.tool_use_id == "srvtoolu_1") =>
+                {
+                    Some(&u.user_input_message)
+                }
+                _ => None,
+            })
+            .expect("搜索结果的合成 user 消息应存在");
+        assert_eq!(synthetic.content, "");
+        let text = synthetic.user_input_message_context.tool_results[0].content[0]
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(text.contains("https://example.com"), "结果内容应保留: {text}");
+
+        let tool_names: Vec<&str> = result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(
+            !tool_names.contains(&"web_search"),
+            "server tool 不能变成客户端占位工具: {tool_names:?}"
+        );
+    }
+
+    /// tool_result 里的非文本项：占位符 + warn，不能静默丢。
+    #[test]
+    fn tool_result_unknown_item_gets_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut req = minimal_request_with_effort("claude-opus-5.5", "high");
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("read it"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "search_result", "url": "https://example.com"}
+                    ]}
+                ]),
+            },
+        ];
+
+        let result = convert_request(&req).unwrap();
+        let tr = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("[unsupported tool_result item: search_result]")
         );
     }
 }

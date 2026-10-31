@@ -546,16 +546,21 @@ opus 拒绝背诵，但独立描述了同样三节；sonnet 亦确认存在。**
 上面那条最小请求，读 `usage.input_tokens`；不能看本地估算值，必须取上游 contextUsage
 换算后的数。
 
-**两个已确认的缺口：**
+**附件与 server tool 的历史处理**（2026-10-31 实现并实测）：
 
-- **会话中途的 `role:"system"` 消息被静默丢弃。** 某些客户端（实测 opencode 2.1.4）
-  对 Claude 5 会发中途 system 消息（指令文件变化、切换 effort）；`build_history` 只
-  处理 user / assistant，中间位置的 system 既不进 history 也不打日志。若它恰好在
-  末尾，会被当成 prefill 并入 user，并打一条标签错误的 warn。修之前先补一条 warn，
-  不要静默。
-- **`max_tokens` 从不透传。** 它只参与 `>0` 校验；上游 schema 里其实有
-  `additionalModelRequestFields.max_tokens` 槽位。实测 `max_tokens=32` 的请求返回了
-  1,433 个输出 tokens（两次一致），说明截断完全由上游默认值决定。
+- `document` 的 `source.type == "text"`（.txt / .md 附件）直接内联为正文；PDF 当前轮
+  400，历史里换占位符 —— 历史不能 400，否则会话永久打不开。
+- 图片只接受 jpeg/png/gif/webp；其它格式当前轮 400，历史里换占位符。
+- `tool_result` 里的非文本项（`search_result`、`container_upload` 等）换占位符 + warn。
+- `server_tool_use` 映射成 `toolUses`，`web_search_tool_result` 挂到 assistant 之后
+  合成的 user 消息 `toolResults` 上；server tool 的 id 不参与占位工具生成，否则等于
+  给客户端凭空造一个它没声明的 `web_search`。
+- 中途 `role:"system"` 原位转成 user 消息，内容原样保留；空 content 的 effort 更新
+  只记 debug。
+
+**仍存在的缺口：`max_tokens` 从不透传。** 它只参与 `>0` 校验；上游 schema 里有
+`additionalModelRequestFields.max_tokens` 槽位，本项目没填。实测 `max_tokens=32`
+仍返回 1,433 个输出 tokens，截断完全由上游默认值决定。
 
 **不要为了省 token 在代理里裁剪客户端 system**（§2.5）。上游固定前缀约 1.9k、客户端
 system 约 5k（本机全局 `AGENTS.md` 11.8KB ≈ 3.4k）、工具约 2–3k；在压缩后的 62k

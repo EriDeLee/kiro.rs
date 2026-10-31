@@ -46,6 +46,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **附件与 server tool 历史不再静默丢失。** 之前 5 类内容块被 `_ => {}` 吞掉，模型完全看不到、用户也无从察觉。现在：
+  - `document` 的 `source.type == "text"`（opencode 的 .txt 附件）直接内联成正文；PDF 当前轮 400「上游不接受 PDF 文档」，历史里换占位符 —— 历史 400 会让整个会话永久打不开。
+  - 图片只接受 jpeg/png/gif/webp；HEIC 等当前轮 400，历史里换占位符。
+  - `tool_result` 里的非文本项换 `[unsupported tool_result item: <type>]` + warn。
+  - 中途 `role:"system"` 原位转成 user 消息，内容不丢；空 content 的 effort 更新只记 debug。
+  - `server_tool_use` → `toolUses`，`web_search_tool_result` → assistant 之后合成的 user 消息 `toolResults`；server tool 的 id 不参与占位工具生成，避免凭空造出客户端没声明的 `web_search`。
+  - 实测：text 附件返回 `ORANGE-42`、中途 system 返回 `Teal.`、server tool 历史返回 `42`；PDF 与 HEIC 均 400。测试 512 → 519。
 - **Claude 白名单换成 5.5 三款，GPT 窗口按 2026-10-31 复测修正。** 白名单现在是 `claude-opus-5.5` / `claude-sonnet-5.5` / `claude-haiku-5.5` + 三个 `gpt-5.6-*`，旧的 `claude-opus-5` / `claude-sonnet-5` 不再接受。实测 `ListAvailableModels` 得到：三个 Claude 5.5 均为 1,000,000 输入 / 64,000 输出，effort 五档（无 `none`）；三个 GPT 5.6 输入窗口已从 372k 变为 **986,000**，输出 64k。`get_context_window_size` 同步改为 986k，否则 contextUsage 百分比换算出的 input_tokens 会偏小约 2.65 倍。
   - `thinking.type` 的枚举**逐模型不同**（opus-5.5 只有 `adaptive`、sonnet-5.5 多 `between_tools`、haiku-5.5 多 `disabled`），「同族一致」的旧注释已删；本仓库在客户端 `thinking=disabled` 时整个推理字段都不下发，因此不受 opus-5.5 缺 `disabled` 影响。
   - `/v1/models` 新增 `context_window` 字段，优先取上游 `tokenLimits.maxInputTokens`，缺失时才回退到按族常量。
