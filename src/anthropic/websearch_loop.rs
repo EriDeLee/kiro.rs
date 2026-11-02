@@ -888,7 +888,6 @@ pub(super) async fn run_web_search_loop(
         // web_search must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
         // as a raw tool_use (the client host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
@@ -965,6 +964,12 @@ pub(super) async fn run_web_search_loop(
         );
 
         let output_tokens = token::estimate_output_tokens(&content);
+        // contextUsage 含本轮输出，先扣掉再上报，与 /v1/messages 主路径同口径。
+        let final_input = token::input_tokens_excluding_output(
+            last_context_input,
+            fallback_input_tokens,
+            output_tokens,
+        );
         hook.record(
             last_credential_id,
             final_input,

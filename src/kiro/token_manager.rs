@@ -1195,10 +1195,12 @@ pub struct MultiTokenManager {
     ///
     /// 唯一用途：让只持有 `&self` 的方法（`update_credential`、
     /// `try_reload_credential_from_file` 等都是同步 `&self`）能在清掉某个凭据的模型
-    /// 缓存后就地派一个后台任务把清单重探回来。若不重探，那个凭据会退回「没探过」，
-    /// 而选号的第一排序键正是「探过的排在没探过的前面」，于是它在 balanced 模式下
-    /// 被永久压在其它凭据后面（2026-08-14 实测过这个症状，见
-    /// [`Self::spawn_model_cache_warmup`] 的注释）。
+    /// 缓存后就地派一个后台任务把清单重探回来。若不重探，那个凭据会退回「没探过」：
+    /// priority 模式的第一排序键是「探过的排在没探过的前面」，它会被其它已探到的凭据
+    /// 挡住；balanced 模式已改为随机（见 `select_next_credential`），不会再永久挡住，
+    /// 但仍可能被选中去请求它不支持的模型，白费一次上游 400 与冷却换号。
+    /// 2026-08-14 实测过清单未探到导致的长期倾斜，见
+    /// [`Self::spawn_model_cache_warmup`] 的注释。
     ///
     /// 未装入时（单元测试直接构造 `MultiTokenManager`，不经 `Arc`）重探静默跳过：
     /// 那等价于本机制引入前的行为，且避免测试触网。
@@ -1539,9 +1541,9 @@ impl MultiTokenManager {
     /// 凭据信息变了（但凭据还在）：清掉旧清单并立刻后台重探一次。
     ///
     /// 与直接调用 [`Self::invalidate_model_cache`] 的区别只有「补探」这一下，而这一下
-    /// 是必须的：只清不探会把该凭据留在「没探过」状态，而选号的第一排序键是
-    /// 「探过的排在没探过的前面」且硬压过负载，于是它在 balanced 模式下会被其它
-    /// 已探过的凭据永久挡住，直到有人恰好拉一次模型列表。
+    /// 是必须的：只清不探会把该凭据留在「没探过」状态 —— priority 模式下它会被已探到
+    /// 的凭据挡住；balanced 模式（随机）下则可能被选中去请求它不支持的模型，多一次
+    /// 上游 400 与冷却换号。
     ///
     /// 删除凭据请继续用 [`Self::remove_model_cache`]：那时不该再探。
     fn invalidate_and_reprobe_model_cache(&self, id: u64, reason: &'static str) {
@@ -1551,15 +1553,17 @@ impl MultiTokenManager {
 
     /// 后台探一次某凭据的模型清单，供只持有 `&self` 的入口使用。
     ///
-    /// 为什么必须探：`select_next_credential` 的第一排序键是「模型缓存已确认支持该模型」，
-    /// 它**硬压过**成功次数（负载）。而模型缓存只由 [`Self::start_model_cache_warmer`]
-    /// 在进程启动时全量预热一次；此后任何「新增凭据」或「清掉某个凭据的清单」都会留下
-    /// 一个处于 `Unknown` 的凭据，它在 balanced 模式下被已确认的凭据永久挡住，直到有人
-    /// 恰好拉一次 `/v1/models`。
+    /// 为什么必须探：`select_next_credential` 在 priority 模式下仍把「模型缓存已确认支持
+    /// 该模型」当作第一排序键，它**硬压过**优先级之外的一切。而模型缓存只由
+    /// [`Self::start_model_cache_warmer`] 在进程启动时全量预热一次；此后任何「新增凭据」
+    /// 或「清掉某个凭据的清单」都会留下一个处于 `Unknown` 的凭据。balanced 模式已改为
+    /// 随机（上游 c38ca44），不会被 Confirmed 的凭据永久挡住，但 Unknown 凭据可能被随机
+    /// 选中去请求它不支持的模型 —— 探测仍能把这种白费的 400 挡在调度之前。
     ///
     /// 2026-08-14 实测现场：#22 成功 218 次、#23 成功 244 次，两者均未禁用未冷却，
     /// 而 #22 连续 40 分钟零次被选中（trace 里 03:28 之后一条 attempt 都没有），
-    /// 因为当时只有 #23 的清单被探到过。
+    /// 因为当时只有 #23 的清单被探到过。那次修复只补了「探测」，balanced 的排序键
+    /// 本身直到 c38ca44 才被改掉。
     ///
     /// 探测失败只 `warn`：不该让添加凭据 / 刷新 Token 这类操作跟着失败，缓存留空即维持
     /// `Unknown`，与本机制引入前的行为一致。
@@ -2002,13 +2006,14 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (discovery_rank, e.success_count, e.credentials.priority)
-                })?;
-
+                // 均匀随机：候选已排除禁用、冷却、RPM 打满、分组不匹配与「缓存明确不支持」。
+                //
+                // 不再按「清单探过的优先 + 成功次数最少」排序。那两个排序键都会饿死凭据：
+                // 清单没探到的排在已探到的后面，只要还有一个已探到的可用，它就永远轮不到；
+                // 成功次数又是历史累计，0 次的新凭据一旦被选中，会独占流量直到追平老凭据。
+                // 2026-08-14 本仓实测过 #22 连续 40 分钟零次被选中；上游 c38ca44 同样把
+                // balanced 改成了随机。
+                let (entry, _) = available[fastrand::usize(..available.len())];
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
@@ -5975,12 +5980,20 @@ mod tests {
             .unwrap();
 
         assert!(is_balanced);
-        assert_eq!(context.id, 2);
-        assert_eq!(manager.snapshot().current_id, 1);
+        let picked = context.id;
+        assert!(picked == 1 || picked == 2);
+        assert_eq!(
+            manager.snapshot().current_id,
+            1,
+            "只读选择不得推进 current_id"
+        );
 
         let context = manager.acquire_context(None, None).await.unwrap();
-        assert_eq!(context.id, 2);
-        assert_eq!(manager.snapshot().current_id, 2);
+        assert_eq!(
+            manager.snapshot().current_id,
+            context.id,
+            "真实业务请求才推进 current_id"
+        );
     }
 
     #[tokio::test]
@@ -7183,18 +7196,89 @@ mod tests {
         )
         .unwrap();
 
-        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
-        manager.report_success(1);
-        manager.report_success(1);
-        let pick = manager.select_next_credential(None, Some("g1"));
+        // balanced 在 g1 的两个凭据之间随机，但绝不跨到 g2
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(manager.select_next_credential(None, Some("g1")).map(|(id, _)| id));
+        }
         assert_eq!(
-            pick.map(|(id, _)| id),
-            Some(2),
-            "balanced 应在 g1 内选 success_count 最小的 B"
+            seen,
+            std::collections::HashSet::from([Some(1), Some(2)]),
+            "balanced 应在 g1 内随机选择，不得跨分组"
         );
-        // g2 不受 g1 计数影响，仍只会选到 C(id3)
-        let pick_g2 = manager.select_next_credential(None, Some("g2"));
-        assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+        // g2 不受 g1 影响，仍只会选到 C(id3)
+        for _ in 0..20 {
+            let pick_g2 = manager.select_next_credential(None, Some("g2"));
+            assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+        }
+    }
+
+    /// 回归锁：清单没探到的凭据不能被已探到的凭据永久挡住。
+    ///
+    /// 旧实现按「探过的优先」排序，只要还有一个 Confirmed 可用，Unknown 的凭据
+    /// 就一次都选不到 —— 2026-08-14 实测 #22 连续 40 分钟零次被选中。
+    #[test]
+    fn balanced_mode_does_not_starve_an_unconfirmed_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 只有 #1 的清单被探到，#2 保持 Unknown。
+        seed_model_cache(&manager, 1, &["m"]);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let pick = manager.select_next_credential(Some("m"), None);
+            seen.insert(pick.map(|(id, _)| id).unwrap());
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([1, 2]),
+            "Unknown 清单的凭据也要能被选中"
+        );
+    }
+
+    /// 回归锁：成功次数是历史累计值，不能让它把流量永久绑在一个凭据上。
+    ///
+    /// 旧实现选 success_count 最小的那个：老凭据攒到 10,000 次后，新凭据 0 次会
+    /// 独占流量直到追平。
+    #[test]
+    fn balanced_mode_does_not_let_a_zero_success_credential_take_everything() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .expect("id 1")
+                .success_count = 10_000;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let pick = manager.select_next_credential(None, None);
+            seen.insert(pick.map(|(id, _)| id).unwrap());
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([1, 2]),
+            "成功次数不能把另一个凭据饿死"
+        );
     }
 
     #[tokio::test]

@@ -692,8 +692,15 @@ impl StreamContext {
     /// （上游百分比 × 模型窗口），拿不到时回退客户端估算值。
     ///
     /// 上游不回传 cache 明细，故无 cache 字段可分摊（见 AGENTS.md §4.1）。
+    ///
+    /// `contextUsage` 覆盖的是生成结束后的整个上下文（含本轮输出），必须先把本轮
+    /// 输出扣掉，否则同一段回答会在 `input_tokens` 与 `output_tokens` 里各算一次。
     pub fn resolved_usage(&self) -> i32 {
-        self.context_input_tokens.unwrap_or(self.input_tokens)
+        crate::token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            self.input_tokens,
+            self.output_tokens,
+        )
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、

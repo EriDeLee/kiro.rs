@@ -55,6 +55,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **账号级 429 的判据认结构化 `reason`。** 此前只认两句英文文案（`suspicious activity` + `temporary limits`），上游一改文案就静默失效（封禁判据 2026-08-13 就是这样坏的，见 §5），账号级限流被当成普通 429，不冷却、不换号。现在先认顶层或 `error.reason` 里的 `USER_REQUEST_RATE_EXCEEDED`（zyphr 与 kiro-lb 都观察到）、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED`（后两个仅 zyphr 观察到，**本仓 trace 里尚未抓到过**），文案兜底保留；容量类与月度额度的 `reason` 不命中。
 - **API 区域跟随真实 profileArn 的区域。** Enterprise / IdC 账号的 profile 不在默认区域时，请求此前发往全局配置的区域。现在优先级是 `apiRegion` > 真实 profileArn 的区域 > `config.apiRegion` > `config.region`；BuilderID 占位符与格式异常的 ARN 不参与。**有意不采纳** zyphr 的另一半（把凭据自己的 `region` 也当 API 区域回退）：本仓的 `region` 只管认证，认证区域与 API 区域可以不同，当回退会把这类账号的请求发到不存在的 API 主机；`test_effective_api_region_ignores_credential_region` 继续锁住这一点。
 - **所有 SSE 响应带 `X-Accel-Buffering: no`。** 前面有 nginx 时默认 `proxy_buffering on`，流式分片会被先攒着再转发，文字成块到达；这个头只作用于当前响应。源码扫描测试防止新增 SSE 端点漏带。`/v1/responses` 的 `stream:true` 本身仍是先收完整个回答再一次性合成 SSE，这个头对它没有实际效果。
+
+> 2026-11-02 再追加两条：仍只搬实现，不合并分支。
+
+- **输入 token 不再把本轮输出算两遍。** `contextUsageEvent` 在流末尾才到达，其百分比覆盖的是生成结束后的整个上下文（含本轮输出），此前直接当 `input_tokens` 上报，绝大部分请求的输入都偏大、偏大量≈本轮输出长度（上游实测样本：context 换算 8404 − 输出 1514 = 6890）。现在只在 `contextUsage` 路径扣掉输出，无 `contextUsage` 时的客户端 prompt 估算保持原值（本就不含输出）。流式与非流式同口径，`input_tokens + output_tokens` 不再重复计费。上游 `6a75c96` / `700fbdb` / `baacf84`，本仓未采用其 cache 分摊（该子系统已删除）。
+- **balanced 调度改为在可用凭据中随机选号。** 原实现按「清单探过的优先 + 成功次数最少」排序，两个排序键都会饿死凭据：清单没探到的排在已探到的后面（2026-08-14 实测 #22 连续 40 分钟零次被选中），成功次数又是历史累计（0 次的新凭据会独占流量直到追平）。现在候选池已排除禁用、冷却、RPM 打满、分组不匹配与「缓存明确不支持」，在其中均匀随机；会话粘性与 priority 模式不变。上游 `c38ca44`。
 - **附件与 server tool 历史不再静默丢失。** 之前 5 类内容块被 `_ => {}` 吞掉，模型完全看不到、用户也无从察觉。现在：
   - `document` 的 `source.type == "text"`（opencode 的 .txt 附件）直接内联成正文；PDF 当前轮 400「上游不接受 PDF 文档」，历史里换占位符 —— 历史 400 会让整个会话永久打不开。
   - 图片只接受 jpeg/png/gif/webp；HEIC 等当前轮 400，历史里换占位符。

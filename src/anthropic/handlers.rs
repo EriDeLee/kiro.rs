@@ -431,14 +431,6 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens
-fn resolve_usage_input_tokens(
-    fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
-}
-
 fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
     if max_tokens <= 0 {
         Err(ErrorResponse::new(
@@ -1521,8 +1513,11 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算。
+    // contextUsage 覆盖生成结束后的整个上下文（含本轮输出），先扣掉输出再上报，
+    // 否则同一段回答会在 input_tokens 与 output_tokens 里各算一次。
+    let total_input_tokens =
+        token::input_tokens_excluding_output(context_input_tokens, input_tokens, output_tokens);
     let final_input_tokens = total_input_tokens;
 
     // 构建 Anthropic 响应
