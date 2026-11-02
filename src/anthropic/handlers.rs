@@ -630,6 +630,10 @@ pub async fn post_messages(
         endpoint: ApiEndpoint::Messages,
         external_stream: payload.stream,
     });
+    // 模型名首尾空白不改变语义（白名单匹配本就 trim 后比较），但用量统计、trace 与
+    // 日志按原始字符串分组时，同一模型会裂成「claude-sonnet-5.5」与「claude-sonnet-5.5 」
+    // 两行。入站统一去掉首尾空白；-thinking / -latest 等有语义的后缀原样保留。
+    payload.model = payload.model.trim().to_string();
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(

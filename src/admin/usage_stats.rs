@@ -582,18 +582,21 @@ fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max
 }
 
 fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
+    // 历史日志里存在带首尾空白的模型名（例：2026-10-31 的 39 条
+    // "claude-sonnet-5.5 "）。装载时统一 trim，否则同一模型会分成两行。
+    let model = rec.model.trim();
     bucket.overall.add(rec);
     bucket.by_key.entry(rec.key_id).or_default().add(rec);
     bucket
         .by_model
-        .entry(rec.model.clone())
+        .entry(model.to_string())
         .or_default()
         .add(rec);
     bucket
         .by_key_model
         .entry(rec.key_id)
         .or_default()
-        .entry(rec.model.clone())
+        .entry(model.to_string())
         .or_default()
         .add(rec);
     if rec.credential_id == 0 {
@@ -710,6 +713,36 @@ mod tests {
         let by_cred = agg.query_by_credential(window, None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
+    }
+
+    /// 回归锁：模型名尾随空白不能把同一模型拆成两行。
+    ///
+    /// 2026-10-31 的生产日志里有 39 条 `"claude-sonnet-5.5 "`（带尾随空格），
+    /// 导致「按模型分布」出现两个肉眼相同的 sonnet 行。
+    #[test]
+    fn model_with_trailing_whitespace_merges_into_one_row() {
+        let agg = UsageAggregator::new();
+        let base = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            credential_id: 31,
+            model: "claude-sonnet-5.5".to_string(),
+            input_tokens: 10,
+            output_tokens: 2,
+            credits: 0.0,
+            duration_ms: 1,
+            status: "success".to_string(),
+        };
+        let mut padded = base.clone();
+        padded.model = "claude-sonnet-5.5 ".to_string();
+        agg.ingest(&base);
+        agg.ingest(&padded);
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let by_model = agg.query_by_model(window, None);
+        assert_eq!(by_model.len(), 1, "{by_model:?}");
+        assert_eq!(by_model[0].model, "claude-sonnet-5.5");
+        assert_eq!(by_model[0].calls, 2);
     }
 
     #[test]
