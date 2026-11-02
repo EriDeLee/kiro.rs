@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
@@ -127,6 +128,10 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 是否已落过库。`finalize` 靠它保证只生效一次，`Drop` 兜底才不会和显式收尾双写。
+    finalized: AtomicBool,
+    /// 上游响应头是否已到达。取消发生在头到达之前还是之后，决定 Drop 兜底记哪种分类。
+    upstream_headers_received: AtomicBool,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -165,7 +170,14 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            finalized: AtomicBool::new(false),
+            upstream_headers_received: AtomicBool::new(false),
         }
+    }
+
+    /// 标记上游响应头已到达（`call_api*` 返回成功之后）。
+    pub fn mark_upstream_headers_received(&self) {
+        self.upstream_headers_received.store(true, Ordering::SeqCst);
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -185,6 +197,10 @@ impl RequestTracer {
         interrupted_after_bytes: Option<u64>,
         usage: TraceUsage,
     ) {
+        // 幂等：显式收尾与 Drop 兜底可能先后到达，只有第一次生效。
+        if self.finalized.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let Some(store) = &self.store else { return };
         let mut attempts = std::mem::take(&mut *self.attempts.lock());
         // 按时间顺序统一重排 attempt 编号。它是 `trace_attempts` 主键
@@ -224,6 +240,34 @@ impl RequestTracer {
             attempts,
         };
         store.insert(&rec);
+    }
+}
+
+/// 请求没有任何显式收尾就被丢弃（客户端取消、前置网关等头超时断开）时，补一行
+/// `interrupted` 记录。这类请求上游可能已在生成并计费，trace 里却此前毫无痕迹。
+///
+/// 取消原因在这一层长得完全一样（用户 ESC、客户端读超时、进程退出），分类只区分
+/// 「响应头到达之前」与「之后」；已正常收尾的请求 `finalized` 已置位，此处是空操作。
+impl Drop for RequestTracer {
+    fn drop(&mut self) {
+        let (error_type, message) = if self.upstream_headers_received.load(Ordering::SeqCst) {
+            (
+                outcome::STREAM_INTERRUPTED,
+                "request was cancelled after upstream response headers arrived",
+            )
+        } else {
+            (
+                outcome::ABANDONED_BEFORE_HEADERS,
+                "request was cancelled before upstream response headers arrived",
+            )
+        };
+        self.finalize(
+            "interrupted",
+            Some(error_type),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -778,6 +822,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let declared_tools = super::stream::declared_tool_requirements(payload.tools.as_ref());
 
     if payload.stream {
         // 流式响应
@@ -788,6 +833,7 @@ pub async fn post_messages(
             total_input_tokens,
             thinking_enabled,
             tool_name_map,
+            declared_tools,
             hook,
             tracer,
             key_ctx.group.clone(),
@@ -803,6 +849,7 @@ pub async fn post_messages(
             total_input_tokens,
             extract_thinking,
             tool_name_map,
+            declared_tools,
             hook,
             tracer,
             key_ctx.group.clone(),
@@ -819,6 +866,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    declared_tools: std::collections::HashMap<String, bool>,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
@@ -844,10 +892,12 @@ async fn handle_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    tracer.mark_upstream_headers_received();
 
     // 创建流处理上下文
     let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+            .with_declared_tools(declared_tools);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -861,6 +911,7 @@ async fn handle_stream_request(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -891,10 +942,12 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
+    // 结算对象随状态一起移动：正常结束、上游中断时显式结算，客户端取消时靠它的 Drop 兜底。
+    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement)| async move {
             if finished {
                 return None;
             }
@@ -905,8 +958,8 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            tracer.mark_first_token();
-                            sent_bytes += chunk.len() as u64;
+                            settlement.tracer.mark_first_token();
+                            settlement.sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -941,60 +994,46 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            settlement.update(&ctx);
+
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
-                            // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            tracer.finalize(
-                                "interrupted",
-                                Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
-                                Some(sent_bytes),
-                                stream_trace_usage(&ctx),
-                            );
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            // 传输层读流失败（网络、超时、对端重置）：流已经返回 200，只能补 error 事件。
+                            // 绝不走正常收尾：那会发 end_turn + message_stop，客户端把半截回答当成答完。
+                            let bytes = settlement.interrupt(&mut ctx, &e.to_string());
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement)))
                         }
                         None => {
+                            // 上游关了连接但一个字节都没给，或最后一帧只到了一半：
+                            // 都是没说完就断了，按中断处理，不当成功。
+                            if settlement.sent_bytes == 0 {
+                                let bytes = settlement.interrupt(&mut ctx, "Upstream returned an empty event stream");
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement)));
+                            }
+                            if decoder.has_pending_data() {
+                                let bytes = settlement.interrupt(&mut ctx, "Upstream ended with an incomplete event frame");
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement)));
+                            }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            settlement.update(&ctx);
                             if let Some(message) = ctx
                                 .upstream_failure_message()
                                 .or_else(|| ctx.tool_json_error_message())
                             {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
-                                    "error",
-                                    Some(outcome::BAD_REQUEST),
-                                    Some(&message),
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                                settlement.finish("error", "error", Some(outcome::BAD_REQUEST), Some(&message), None);
                             } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                                settlement.finish("success", "success", None, None, None);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement)))
                         }
                     }
                 }
@@ -1002,7 +1041,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement)))
                 }
             }
         },
@@ -1012,28 +1051,134 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 从 StreamContext 提取最终用量并写入 hook
-fn record_stream_usage(
-    hook: &UsageRecordHook,
-    ctx: &StreamContext,
+/// 流式响应的「恰好记一次」结算。
+///
+/// 正常结束与上游中断走显式的 [`Self::finish`] / [`Self::interrupt`]；客户端中途取消时
+/// axum 丢弃响应体，连带丢弃手里的 unfold 状态，`Drop` 用最近一次快照补记用量并落 trace，
+/// 上游已经计费的 credits 不至于在统计里凭空消失。
+struct StreamSettlement {
+    hook: UsageRecordHook,
     credential_id: u64,
-    status: &str,
-) {
-    let input = ctx.resolved_usage();
-    hook.record(credential_id, input, ctx.output_tokens, ctx.credits, status);
+    tracer: std::sync::Arc<RequestTracer>,
+    input_tokens: i32,
+    output_tokens: i32,
+    credits: f64,
+    sent_bytes: u64,
+    settled: bool,
 }
 
-/// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
-fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
-    let input = ctx.resolved_usage();
-    TraceUsage {
-        input_tokens: input.max(0) as u64,
-        output_tokens: ctx.output_tokens.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
-            ctx.credits
-        } else {
-            0.0
-        },
+impl StreamSettlement {
+    fn new(
+        hook: UsageRecordHook,
+        credential_id: u64,
+        tracer: std::sync::Arc<RequestTracer>,
+        ctx: &StreamContext,
+    ) -> Self {
+        let mut settlement = Self {
+            hook,
+            credential_id,
+            tracer,
+            input_tokens: 0,
+            output_tokens: 0,
+            credits: 0.0,
+            sent_bytes: 0,
+            settled: false,
+        };
+        settlement.update(ctx);
+        settlement
+    }
+
+    /// 记下最新用量快照；客户端取消时 `Drop` 只能用它。
+    fn update(&mut self, ctx: &StreamContext) {
+        self.input_tokens = ctx.resolved_usage();
+        self.output_tokens = ctx.output_tokens;
+        self.credits = ctx.credits;
+    }
+
+    fn trace_usage(&self) -> TraceUsage {
+        TraceUsage {
+            input_tokens: self.input_tokens.max(0) as u64,
+            output_tokens: self.output_tokens.max(0) as u64,
+            credits: if self.credits.is_finite() && self.credits > 0.0 {
+                self.credits
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// 结算一次：用量日志与 trace 各写一条，之后再调用（含 `Drop`）都是空操作。
+    fn finish(
+        &mut self,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        interrupted_after_bytes: Option<u64>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.hook.record(
+            self.credential_id,
+            self.input_tokens,
+            self.output_tokens,
+            self.credits,
+            usage_status,
+        );
+        self.tracer.finalize(
+            trace_status,
+            error_type,
+            error_message,
+            interrupted_after_bytes,
+            self.trace_usage(),
+        );
+    }
+
+    /// 上游中途断流：补 `error` 事件（不发 message_delta / message_stop），
+    /// 用量记 error，trace 记 interrupted 并带上已发送字节数。
+    ///
+    /// 给客户端的类型用 `overloaded_error`：Anthropic 约定的「可重试」类型。客户端
+    /// （opencode 按报错文字里的 overloaded 判断）据此自动重试，一次断流不会停掉整个
+    /// agent 循环。代价：重试会让模型重新生成整段，断流前那一段已被上游计费。
+    fn interrupt(
+        &mut self,
+        ctx: &mut StreamContext,
+        cause: &str,
+    ) -> Vec<Result<Bytes, Infallible>> {
+        tracing::error!("上游响应流中断: {}", cause);
+        self.update(ctx);
+        let elapsed = self.hook.started_at.elapsed().as_secs();
+        let events = ctx.generate_error_events(
+            "overloaded_error",
+            &format!(
+                "Upstream connection was interrupted before the response finished (after {elapsed}s). Please retry."
+            ),
+        );
+        self.finish(
+            "error",
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some(cause),
+            Some(self.sent_bytes),
+        );
+        events
+            .into_iter()
+            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+            .collect()
+    }
+}
+
+impl Drop for StreamSettlement {
+    fn drop(&mut self) {
+        self.finish(
+            "error",
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("response stream was cancelled before completion"),
+            Some(self.sent_bytes),
+        );
     }
 }
 
@@ -1047,6 +1192,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    declared_tools: std::collections::HashMap<String, bool>,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
@@ -1071,6 +1217,7 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    tracer.mark_upstream_headers_received();
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1120,7 +1267,7 @@ async fn handle_non_stream_request(
 
     // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
-    let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
+    let mut tool_accumulator = super::stream::ToolJsonAccumulator::with_declared_tools(declared_tools);
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
     // 上游下发的错误 / 异常事件。只记第一条（后续多为同一故障的连带事件），
     // 收尾时返回 502 而不是 200 —— 宁可失败，也不把上游的失败伪装成完整答案。
@@ -1253,6 +1400,35 @@ async fn handle_non_stream_request(
         }
     }
 
+    // 空流、被截断的最后一帧：上游没说完就断了。非流式路径尚未发送任何字节，
+    // 直接回 502，不把半截内容当成功返回。
+    let truncated = if body_bytes.is_empty() {
+        Some("Upstream returned an empty event stream")
+    } else if decoder.has_pending_data() {
+        Some("Upstream ended with an incomplete event frame")
+    } else {
+        None
+    };
+    if let Some(message) = truncated {
+        tracing::error!("{}", message);
+        hook.record(credential_id, input_tokens, 0, 0.0, "error");
+        tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                format!("upstream {message}"),
+            )),
+        )
+            .into_response();
+    }
+
     // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
     // finish() 返回 IncompleteJson。已有错误则保持不变。
     // 拒答轮次：拦截可能切断半截工具参数，不捞回、不报错；已完成的工具调用也丢弃，
@@ -1260,11 +1436,21 @@ async fn handle_non_stream_request(
     if refused {
         tool_json_error = None;
         tool_uses.clear();
-    } else if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    } else if tool_json_error.is_none() {
+        // 无参工具：0 字节且无 stop 的缓冲，在「干净结束 + 该工具没有必填参数」时按 `{}` 收口。
+        // 空流与残帧已在上面返回 502，走到这里说明响应体是完整读完的。
+        match tool_accumulator.finish(&tool_name_map, upstream_failure.is_none()) {
+            Ok(completed) => {
+                for tool in completed {
+                    has_tool_use = true;
+                    tool_uses.push(tool.to_anthropic_block());
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}", e);
+                tool_json_error = Some(e);
+            }
+        }
     }
 
     // 上游报了错 / 异常：非流式路径尚未发送任何字节，直接回 502，把上游的失败如实
@@ -1574,6 +1760,179 @@ mod tests {
         assert_eq!(numbers, vec![1, 2], "跨轮 attempt 必须重排为 1..N");
         let credentials: Vec<u64> = rows[0].attempts.iter().map(|a| a.credential_id).collect();
         assert_eq!(credentials, vec![11, 22], "重排不得改变时间顺序");
+    }
+
+    /// 回归锁：每个 SSE 响应都带 `X-Accel-Buffering: no`。
+    ///
+    /// 前面有 nginx 时，默认会先攒着流式分片再转发，文字成块到达。这个头只作用于当前响应，
+    /// 不用改反代全局配置。靠源码扫描防止以后新增的 SSE 端点漏带。
+    #[test]
+    fn every_sse_response_disables_proxy_buffering() {
+        let sources = [
+            ("anthropic/handlers.rs", include_str!("handlers.rs")),
+            ("anthropic/responses.rs", include_str!("responses.rs")),
+            ("anthropic/websearch_loop.rs", include_str!("websearch_loop.rs")),
+            ("admin/handlers.rs", include_str!("../admin/handlers.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            let sse = production.matches("\"text/event-stream\"").count();
+            let guarded = production.matches("\"x-accel-buffering\"").count();
+            assert!(sse >= 1, "{name} 应当至少有一个 SSE 响应，扫描目标可能已变");
+            assert_eq!(sse, guarded, "{name}: 每个 SSE 响应都要带 x-accel-buffering: no");
+        }
+    }
+
+    fn rows_for(store: &SharedTraceStore, model: &str) -> Vec<crate::admin::trace_db::TraceRecord> {
+        store
+            .query_paged(&TraceQuery {
+                model: Some(model.to_string()),
+                ..Default::default()
+            })
+            .0
+    }
+
+    /// 回归锁：请求没有任何显式收尾就被丢弃（客户端取消）时，trace 里必须留下一行。
+    ///
+    /// 此前这类请求在日志里毫无痕迹，而上游可能已经在生成并计费。
+    #[test]
+    fn cancelled_request_leaves_an_interrupted_trace_row() {
+        let store: SharedTraceStore =
+            std::sync::Arc::new(TraceStore::open_in_memory().expect("内存 trace store"));
+
+        drop(test_tracer(&store, "cancel-before-headers"));
+
+        let after = test_tracer(&store, "cancel-after-headers");
+        after.mark_upstream_headers_received();
+        drop(after);
+
+        let before_rows = rows_for(&store, "cancel-before-headers");
+        assert_eq!(before_rows.len(), 1);
+        assert_eq!(before_rows[0].final_status, "interrupted");
+        assert_eq!(
+            before_rows[0].error_type.as_deref(),
+            Some(outcome::ABANDONED_BEFORE_HEADERS)
+        );
+
+        let after_rows = rows_for(&store, "cancel-after-headers");
+        assert_eq!(after_rows.len(), 1);
+        assert_eq!(
+            after_rows[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+    }
+
+    /// 显式收尾必须压过 Drop 兜底：已落库的请求不能被再写一行覆盖成「中断」。
+    #[test]
+    fn explicit_finalize_is_not_overwritten_by_drop() {
+        let store: SharedTraceStore =
+            std::sync::Arc::new(TraceStore::open_in_memory().expect("内存 trace store"));
+        let tracer = test_tracer(&store, "finished-normally");
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+        tracer.finalize("error", Some(outcome::UNKNOWN), None, None, TraceUsage::zero());
+        drop(tracer);
+
+        let rows = rows_for(&store, "finished-normally");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].final_status, "success", "只有第一次收尾生效");
+    }
+
+    fn settlement_fixture(
+        model: &str,
+    ) -> (
+        StreamSettlement,
+        StreamContext,
+        SharedAggregator,
+        SharedTraceStore,
+    ) {
+        use crate::admin::usage_stats::UsageAggregator;
+        let store: SharedTraceStore =
+            std::sync::Arc::new(TraceStore::open_in_memory().expect("内存 trace store"));
+        let aggregator: SharedAggregator = std::sync::Arc::new(UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 1,
+            model: model.to_string(),
+            started_at: Instant::now(),
+        };
+        let mut ctx =
+            StreamContext::new_with_thinking(model, 100, false, std::collections::HashMap::new());
+        ctx.output_tokens = 40;
+        ctx.credits = 0.5;
+        let tracer = std::sync::Arc::new(test_tracer(&store, model));
+        (
+            StreamSettlement::new(hook, 7, tracer, &ctx),
+            ctx,
+            aggregator,
+            store,
+        )
+    }
+
+    /// 回归锁：客户端中途取消，流被丢弃时，用量与 trace 各补记一次。
+    ///
+    /// 上游此时已在生成并计费；此前这条请求在用量统计和请求日志里都不存在。
+    #[test]
+    fn cancelled_stream_is_settled_once_from_the_last_snapshot() {
+        let (mut settlement, ctx, aggregator, store) = settlement_fixture("cancel-stream");
+        settlement.sent_bytes = 1234;
+        settlement.update(&ctx);
+        drop(settlement);
+
+        assert_eq!(aggregator.overview().today_calls, 1, "用量只记一次");
+        assert_eq!(aggregator.overview().today_input_tokens, 100);
+        let rows = rows_for(&store, "cancel-stream");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].final_status, "interrupted");
+        assert_eq!(rows[0].error_type.as_deref(), Some(outcome::STREAM_INTERRUPTED));
+        assert_eq!(rows[0].interrupted_after_bytes, Some(1234));
+        assert_eq!(rows[0].output_tokens, 40);
+    }
+
+    #[test]
+    fn finished_stream_is_not_settled_again_on_drop() {
+        let (mut settlement, _ctx, aggregator, store) = settlement_fixture("finished-stream");
+        settlement.finish("success", "success", None, None, None);
+        drop(settlement);
+
+        assert_eq!(aggregator.overview().today_calls, 1);
+        let rows = rows_for(&store, "finished-stream");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].final_status, "success", "Drop 不得把已完成的请求改成中断");
+    }
+
+    /// 上游断流：客户端收到 `overloaded_error`（可重试），没有 message_stop；用量记 error，
+    /// trace 记 interrupted；之后的 Drop 不再重复结算。
+    #[test]
+    fn interrupted_stream_tells_the_client_to_retry_and_settles_once() {
+        let (mut settlement, mut ctx, aggregator, store) = settlement_fixture("cut-stream");
+        settlement.sent_bytes = 77;
+
+        let frames = settlement.interrupt(&mut ctx, "error decoding response body");
+        let wire: String = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame.as_ref().unwrap()).to_string())
+            .collect();
+        assert!(wire.contains("event: error"), "{wire}");
+        assert!(wire.contains("overloaded_error"), "{wire}");
+        assert!(!wire.contains("message_stop"), "不得声称正常结束: {wire}");
+        assert!(!wire.contains("message_delta"), "不得声称正常结束: {wire}");
+        assert!(
+            !wire.contains("error decoding response body"),
+            "底层错误细节只进日志，不发给客户端"
+        );
+        drop(settlement);
+
+        assert_eq!(aggregator.overview().today_calls, 1);
+        let rows = rows_for(&store, "cut-stream");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].final_status, "interrupted");
+        assert_eq!(rows[0].interrupted_after_bytes, Some(77));
+        assert_eq!(
+            rows[0].error_message.as_deref(),
+            Some("error decoding response body")
+        );
     }
 
     #[test]

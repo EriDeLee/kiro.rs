@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_stream_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -141,8 +141,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_stream_client(proxy.as_ref(), tls_backend).expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
@@ -172,7 +172,7 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_stream_client(effective.as_ref(), self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }

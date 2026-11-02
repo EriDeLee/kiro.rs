@@ -419,11 +419,51 @@ impl KiroCredentials {
             .unwrap_or(config.effective_auth_region())
     }
 
+    /// 真实 profileArn 里声明的 Region（`arn:aws:codewhisperer:<region>:<account>:profile/<id>`）。
+    ///
+    /// Enterprise / IdC 账号的 profile 属于某个 Region，数据面请求必须发到该 Region 的端点。
+    /// profileArn 缺失、是 BuilderID 占位符或格式异常时返回 `None`，不参与 Region 推断。
+    fn profile_arn_region(&self) -> Option<&str> {
+        let arn = self.effective_profile_arn()?;
+        let mut parts = arn.split(':');
+        let (
+            Some("arn"),
+            Some(partition),
+            Some("codewhisperer"),
+            Some(region),
+            Some(account),
+            Some(resource),
+            None,
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        )
+        else {
+            return None;
+        };
+        let well_formed = !partition.is_empty()
+            && !region.is_empty()
+            && !account.is_empty()
+            && resource
+                .strip_prefix("profile/")
+                .is_some_and(|id| !id.is_empty());
+        well_formed.then_some(region)
+    }
+
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region > 真实 profileArn 的 Region > config.api_region > config.region
+    ///
+    /// 凭据自己的 `region` 只管认证（见 [`Self::effective_auth_region`]），不参与这条链：
+    /// 认证区域与 API 区域可以不同，把它当回退会把这类账号的请求发到不存在的 API 主机。
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or_else(|| self.profile_arn_region())
             .unwrap_or(config.effective_api_region())
     }
 
@@ -1259,6 +1299,59 @@ mod tests {
         creds.region = Some("cred-region".to_string());
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    fn creds_with_profile_arn(profile_arn: &str) -> KiroCredentials {
+        serde_json::from_value(serde_json::json!({
+            "region": "cred-region",
+            "profileArn": profile_arn,
+        }))
+        .unwrap()
+    }
+
+    /// 回归锁：Enterprise / IdC 账号的 profile 不在默认区域时，API 请求要发到 profile 所在区域。
+    #[test]
+    fn test_effective_api_region_follows_real_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+        let creds = creds_with_profile_arn("arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL123");
+
+        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
+        // 认证区域不受 profileArn 影响，仍按原链路。
+        assert_eq!(creds.effective_auth_region(&config), "cred-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_explicit_api_region_beats_profile_arn() {
+        let config = Config::default();
+        let mut creds =
+            creds_with_profile_arn("arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL123");
+        creds.api_region = Some("ap-southeast-2".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "ap-southeast-2");
+    }
+
+    /// BuilderID 占位符与格式异常的 ARN 不参与 Region 推断，仍落到 config。
+    #[test]
+    fn test_effective_api_region_ignores_placeholder_and_malformed_profile_arn() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+
+        // 占位符的 Region 是 us-east-1，与 config-region 不同：若被当成真实 ARN，结果会是 us-east-1。
+        let placeholder = creds_with_profile_arn(BUILDER_ID_PROFILE_ARN);
+        assert_eq!(placeholder.effective_api_region(&config), "config-region");
+
+        for malformed in [
+            "arn:aws:other-service:eu-central-1:123456789012:profile/REAL123",
+            "arn:aws:codewhisperer:eu-central-1:123456789012:resource/REAL123",
+            "arn:aws:codewhisperer::123456789012:profile/REAL123",
+            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/",
+            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL123:extra",
+            "not-an-arn",
+        ] {
+            let creds = creds_with_profile_arn(malformed);
+            assert_eq!(creds.effective_api_region(&config), "config-region", "{malformed}");
+        }
     }
 
     #[test]

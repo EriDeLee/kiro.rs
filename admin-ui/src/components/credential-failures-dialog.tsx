@@ -36,6 +36,8 @@ function outcomeStyle(outcome: string | null): {
       return { label: "请求错误", variant: "destructive" };
     case "stream_interrupted":
       return { label: "流中断", variant: "warning" };
+    case "abandoned_before_headers":
+      return { label: "头前取消", variant: "warning" };
     default:
       return { label: outcome || "未知", variant: "secondary" };
   }

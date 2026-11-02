@@ -2,7 +2,7 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
 use uuid::Uuid;
@@ -134,12 +134,50 @@ impl std::error::Error for ToolJsonAccumulatorError {}
 pub struct ToolJsonAccumulator {
     /// tool_use_id -> (工具名, 已累积的 JSON 分片)
     buffers: HashMap<String, (String, String)>,
+    /// 已收到 `stop` 的 tool_use_id。`stop` 之后同 id 又来一个空分片，不能被当成新的无参调用。
+    stopped_ids: HashSet<String>,
+    /// 客户端声明的工具：客户端工具名 → 其 input_schema 是否要求参数。
+    /// 只用于判断 0 字节缓冲能否按 `{}` 收口，见 [`Self::finish`]。
+    declared: HashMap<String, bool>,
+}
+
+/// 从请求的工具声明里提取「各工具是否要求参数」，供 [`ToolJsonAccumulator::finish`] 判断。
+///
+/// 顶层 `required` 非空即要求参数。顶层带 `anyOf` / `oneOf` / `allOf` / `$ref` 的形状，以及带
+/// `type` 的服务端工具（如 `web_search_20250305`，没有 `input_schema`），这里读不出来，
+/// 一律当作要求参数（保守：宁可报错也不放行空参数）。
+pub fn declared_tool_requirements(tools: Option<&Vec<super::types::Tool>>) -> HashMap<String, bool> {
+    tools
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let required = tool
+                .input_schema
+                .get("required")
+                .and_then(|value| value.as_array())
+                .is_some_and(|names| !names.is_empty());
+            let opaque = ["anyOf", "oneOf", "allOf", "$ref"]
+                .iter()
+                .any(|key| tool.input_schema.contains_key(*key));
+            (tool.name.clone(), required || opaque || tool.tool_type.is_some())
+        })
+        .collect()
 }
 
 impl ToolJsonAccumulator {
     pub fn new() -> Self {
         Self {
             buffers: HashMap::new(),
+            stopped_ids: HashSet::new(),
+            declared: HashMap::new(),
+        }
+    }
+
+    /// 带上客户端的工具声明（见 [`declared_tool_requirements`]）。
+    pub fn with_declared_tools(declared: HashMap<String, bool>) -> Self {
+        Self {
+            declared,
+            ..Self::new()
         }
     }
 
@@ -167,6 +205,7 @@ impl ToolJsonAccumulator {
             return Ok(None);
         }
 
+        self.stopped_ids.insert(tool_use.tool_use_id.clone());
         let (kiro_name, input_json) = self
             .buffers
             .remove(&tool_use.tool_use_id)
@@ -192,12 +231,33 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
+    /// 流结束时收尾，返回此刻可以补发的完整工具调用。
+    ///
+    /// 仍留在缓冲里、从未收到 `stop=true` 的调用分两种：
+    ///
+    /// - **有内容**：上游在参数写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个）。
+    ///   截断优先于下一种。
+    /// - **0 字节**（纯空白同口径）：无参工具的正常形态 —— 上游对无参工具只发一条 input 为空、
+    ///   `stop` 缺省为 false 的事件，之后不会补 `stop`。按 `{}` 收口，**但必须同时满足**：
+    ///   `clean_end`（上游流是干净结束的，不是中途断的），且客户端声明的这个工具没有必填参数。
+    ///   不满足就仍按截断报错：上游刚开始写参数就断流时，不能给有必填参数的工具发出空参数
+    ///   调用 —— 客户端会拿着空参数真的去执行（§2.3 第 1 条）。
+    ///
+    /// `tool_name_map` 用来把上游的短名还原成客户端声明的名字，再去查工具声明。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+        clean_end: bool,
+    ) -> Result<Vec<CompletedToolUse>, ToolJsonAccumulatorError> {
+        // 已 stop 过的 id 又冒出来的空分片是异常帧，丢弃，不当成新的调用。
+        let stopped = &self.stopped_ids;
+        self.buffers
+            .retain(|id, (_, input)| !(stopped.contains(id) && input.trim().is_empty()));
+
         if let Some((tool_use_id, (name, input))) = self
             .buffers
             .iter()
+            .filter(|(_, (_, input))| !input.trim().is_empty())
             .max_by_key(|(_, (_, input))| input.len())
             .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
         {
@@ -208,7 +268,38 @@ impl ToolJsonAccumulator {
                 bytes: input.len(),
             });
         }
-        Ok(())
+
+        // 剩下的全是 0 字节缓冲。先逐个检查，任何一个不满足条件就整体报错，不放行一半。
+        let mut ids: Vec<String> = self.buffers.keys().cloned().collect();
+        ids.sort();
+        for id in &ids {
+            let kiro_name = &self.buffers[id].0;
+            let client_name = tool_name_map.get(kiro_name).unwrap_or(kiro_name);
+            let takes_no_args = self.declared.get(client_name) == Some(&false);
+            if !(clean_end && takes_no_args) {
+                let name = kiro_name.clone();
+                let tool_use_id = id.clone();
+                self.buffers.remove(&tool_use_id);
+                return Err(ToolJsonAccumulatorError::IncompleteJson {
+                    tool_use_id,
+                    name,
+                    bytes: 0,
+                });
+            }
+        }
+
+        let mut completed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some((kiro_name, _)) = self.buffers.remove(&id) {
+                completed.push(CompletedToolUse::from_kiro(
+                    id,
+                    &kiro_name,
+                    serde_json::json!({}),
+                    tool_name_map,
+                ));
+            }
+        }
+        Ok(completed)
     }
 }
 
@@ -498,6 +589,37 @@ impl SseStateManager {
 
         events
     }
+
+    /// 异常终止：关掉仍开着的内容块，并把消息标为已结束。
+    ///
+    /// 故意不发 `message_delta` / `message_stop`：那两个事件等于告诉客户端「本轮正常结束」，
+    /// 而上游其实是中途断了。块按索引顺序关闭，输出可复现。
+    pub fn abort_open_blocks(&mut self) -> Vec<SseEvent> {
+        let mut open: Vec<i32> = self
+            .active_blocks
+            .iter()
+            .filter(|(_, block)| block.started && !block.stopped)
+            .map(|(index, _)| *index)
+            .collect();
+        open.sort_unstable();
+
+        let mut events = Vec::new();
+        for index in open {
+            if let Some(block) = self.active_blocks.get_mut(&index) {
+                block.stopped = true;
+            }
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({
+                    "type": "content_block_stop",
+                    "index": index
+                }),
+            ));
+        }
+        self.message_delta_sent = true;
+        self.message_ended = true;
+        events
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -585,6 +707,12 @@ impl StreamContext {
         self.upstream_failure
             .as_ref()
             .map(|(kind, message)| format!("{kind}: {message}"))
+    }
+
+    /// 带上客户端的工具声明，让收尾时能判断 0 字节的工具调用是不是无参工具。
+    pub fn with_declared_tools(mut self, declared: HashMap<String, bool>) -> Self {
+        self.tool_json_accumulator = ToolJsonAccumulator::with_declared_tools(declared);
+        self
     }
 
     /// 创建 StreamContext
@@ -1251,12 +1379,24 @@ impl StreamContext {
         if self.refused {
             self.tool_json_error = None;
             self.tool_json_accumulator = ToolJsonAccumulator::new();
-        } else if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
-        {
-            tracing::error!("{}", e);
-            self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        } else if self.tool_json_error.is_none() {
+            // 干净结束 = 上游没报错帧。传输层断流不会走到这里（见 `generate_error_events`）。
+            match self
+                .tool_json_accumulator
+                .finish(&self.tool_name_map, self.upstream_failure.is_none())
+            {
+                // 无参工具：0 字节且无 stop 的缓冲按 `{}` 收口，照常发出。
+                Ok(completed) => {
+                    for tool in completed {
+                        events.extend(self.emit_completed_tool_use(tool));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("{}", e);
+                    self.tool_json_error = Some(e);
+                    self.state_manager.set_stop_reason("error");
+                }
+            }
         }
 
         let final_input_tokens = self.resolved_usage();
@@ -1298,6 +1438,32 @@ impl StreamContext {
             ));
         }
 
+        events
+    }
+
+    /// 上游中途断流（传输层错误、空流、残帧）时的收尾。
+    ///
+    /// 流已经返回 200，状态码改不了，只能补一个 Anthropic `error` 事件。不能走
+    /// [`Self::generate_final_events`]：它会补发 `message_delta{end_turn}` 与 `message_stop`，
+    /// 客户端把半截回答当成答完，agent 循环就此停住，只能靠用户手动重来。
+    ///
+    /// 未收到 `stop` 的工具调用缓冲在此丢弃，不转发：半截参数不能交给客户端执行。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.is_thinking_block_open() {
+            events.extend(self.close_open_thinking_block());
+        }
+        events.extend(self.state_manager.abort_open_blocks());
+        events.push(SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message
+                }
+            }),
+        ));
         events
     }
 }
@@ -1405,13 +1571,147 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
+        let err = acc.finish(&HashMap::new(), true).unwrap_err();
         assert!(matches!(
             err,
             ToolJsonAccumulatorError::IncompleteJson { .. }
         ));
         // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        assert!(acc.finish(&HashMap::new(), true).unwrap().is_empty());
+    }
+
+    /// 无参工具：上游只发一条 input 为空、stop 缺省为 false 的事件，永远不会补 stop。
+    fn push_bare_call(acc: &mut ToolJsonAccumulator, id: &str, name: &str) {
+        assert!(acc.push(&tool_evt(id, name, "", false), &HashMap::new()).unwrap().is_none());
+    }
+
+    fn declared(entries: &[(&str, bool)]) -> HashMap<String, bool> {
+        entries.iter().map(|(n, req)| (n.to_string(), *req)).collect()
+    }
+
+    /// 回归锁（严格版）：0 字节且无 stop 的缓冲，在干净结束 + 该工具声明里没有必填参数时，
+    /// 按 `{}` 收口成一个完整的工具调用，而不是报「半截 JSON」。
+    #[test]
+    fn bare_call_of_a_tool_without_required_args_completes_as_empty_object() {
+        let mut acc = ToolJsonAccumulator::with_declared_tools(declared(&[("list_todos", false)]));
+        push_bare_call(&mut acc, "t1", "list_todos");
+
+        let completed = acc.finish(&HashMap::new(), true).expect("无参工具不是截断");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "t1");
+        assert_eq!(completed[0].name, "list_todos");
+        assert_eq!(completed[0].input, serde_json::json!({}));
+    }
+
+    /// 回归锁：有必填参数的工具，0 字节缓冲仍是截断。上游刚开始写参数就断流时，
+    /// 不能给它发出空参数调用 —— 客户端会拿着空参数真的去执行（§2.3 第 1 条）。
+    #[test]
+    fn bare_call_of_a_tool_with_required_args_stays_a_truncation() {
+        let mut acc = ToolJsonAccumulator::with_declared_tools(declared(&[("write_file", true)]));
+        push_bare_call(&mut acc, "t1", "write_file");
+
+        let err = acc.finish(&HashMap::new(), true).unwrap_err();
+        assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { bytes: 0, .. }));
+    }
+
+    #[test]
+    fn bare_call_is_a_truncation_unless_the_stream_ended_cleanly() {
+        let mut acc = ToolJsonAccumulator::with_declared_tools(declared(&[("list_todos", false)]));
+        push_bare_call(&mut acc, "t1", "list_todos");
+
+        let err = acc.finish(&HashMap::new(), false).unwrap_err();
+        assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { bytes: 0, .. }));
+    }
+
+    #[test]
+    fn bare_call_of_an_undeclared_tool_stays_a_truncation() {
+        let mut acc = ToolJsonAccumulator::new();
+        push_bare_call(&mut acc, "t1", "server_side_tool");
+
+        assert!(acc.finish(&HashMap::new(), true).is_err());
+    }
+
+    /// 截断优先于无参收口：同一个流里既有真截断又有无参调用时，整体仍报错。
+    #[test]
+    fn real_truncation_wins_over_a_bare_call() {
+        let mut acc = ToolJsonAccumulator::with_declared_tools(declared(&[("list_todos", false)]));
+        push_bare_call(&mut acc, "t1", "list_todos");
+        acc.push(&tool_evt("t2", "write_file", "{\"path\":\"/a", false), &HashMap::new())
+            .unwrap();
+
+        let err = acc.finish(&HashMap::new(), true).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolJsonAccumulatorError::IncompleteJson { ref tool_use_id, .. } if tool_use_id == "t2"
+        ));
+    }
+
+    /// 上游对超长工具名用短名，声明按客户端原名登记：收尾时必须先还原再查声明，
+    /// 并且发给客户端的是原名。
+    #[test]
+    fn bare_call_resolves_shortened_names_back_to_the_declared_tool() {
+        let mut map = HashMap::new();
+        map.insert("short_abc123".to_string(), "a_very_long_client_tool_name".to_string());
+        let mut acc =
+            ToolJsonAccumulator::with_declared_tools(declared(&[("a_very_long_client_tool_name", false)]));
+        assert!(acc.push(&tool_evt("t1", "short_abc123", "", false), &map).unwrap().is_none());
+
+        let completed = acc.finish(&map, true).unwrap();
+        assert_eq!(completed[0].name, "a_very_long_client_tool_name");
+    }
+
+    /// 已 stop 的调用不会因为后来冒出的同 id 空分片，被重复当成新的无参调用发出。
+    #[test]
+    fn empty_fragment_after_stop_is_not_emitted_as_a_second_call() {
+        let mut acc = ToolJsonAccumulator::with_declared_tools(declared(&[("list_todos", false)]));
+        let done = acc.push(&tool_evt("t1", "list_todos", "", true), &HashMap::new()).unwrap();
+        assert!(done.is_some());
+        push_bare_call(&mut acc, "t1", "list_todos");
+
+        assert!(acc.finish(&HashMap::new(), true).unwrap().is_empty());
+    }
+
+    /// 端到端（流）：无参工具照常发出 tool_use，stop_reason 是 tool_use，没有 error 事件。
+    #[test]
+    fn stream_with_bare_tool_call_ends_with_tool_use_not_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new())
+            .with_declared_tools(declared(&[("list_todos", false)]));
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_todos", "", false))));
+        events.extend(ctx.generate_final_events());
+
+        assert!(events.iter().all(|e| e.event != "error"), "{:?}", events.iter().map(|e| &e.event).collect::<Vec<_>>());
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            .expect("无参工具必须被发出");
+        assert_eq!(start.data["content_block"]["name"], "list_todos");
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("干净结束必须有 message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+        assert!(ctx.tool_json_error_message().is_none());
+    }
+
+    #[test]
+    fn declared_tool_requirements_reads_required_and_is_conservative_otherwise() {
+        let tools: Vec<super::super::types::Tool> = serde_json::from_value(serde_json::json!([
+            {"name": "no_args", "description": "d", "input_schema": {"type": "object", "properties": {}}},
+            {"name": "empty_required", "description": "d", "input_schema": {"type": "object", "required": []}},
+            {"name": "needs_args", "description": "d", "input_schema": {"type": "object", "required": ["path"]}},
+            {"name": "union_shape", "description": "d", "input_schema": {"anyOf": [{"type": "object"}]}},
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+        ]))
+        .unwrap();
+
+        let map = declared_tool_requirements(Some(&tools));
+        assert_eq!(map["no_args"], false);
+        assert_eq!(map["empty_required"], false);
+        assert_eq!(map["needs_args"], true);
+        assert_eq!(map["union_shape"], true, "读不出来的形状按要求参数处理");
+        assert_eq!(map["web_search"], true, "服务端工具不按无参处理");
+        assert!(declared_tool_requirements(None).is_empty());
     }
 
     #[test]
@@ -1988,6 +2288,41 @@ mod tests {
                 e.event == "content_block_stop" && e.data["index"].as_i64() == Some(index)
             })
             .unwrap_or_else(|| panic!("block {index} should stop"))
+    }
+
+    /// 回归锁：上游中途断流时，客户端必须看到 `error`，而不是 `end_turn` + `message_stop`。
+    ///
+    /// 此前读流失败也走 `generate_final_events`，客户端收到一条「正常结束」的半截回答，
+    /// 把它当成答完而停止推进；只有后台日志记了 error。
+    #[test]
+    fn interrupted_stream_ends_with_error_and_never_claims_completion() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("半截回答"));
+
+        events.extend(
+            ctx.generate_error_events("overloaded_error", "Upstream connection was interrupted"),
+        );
+
+        let names: Vec<&str> = events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(names.last(), Some(&"error"), "必须以 error 收尾: {names:?}");
+        assert!(!names.contains(&"message_delta"), "不得声称正常结束: {names:?}");
+        assert!(!names.contains(&"message_stop"), "不得声称正常结束: {names:?}");
+        let text_start = names.iter().position(|n| *n == "content_block_start").unwrap();
+        let text_stop = names.iter().position(|n| *n == "content_block_stop").unwrap();
+        assert!(text_start < text_stop, "开着的文本块必须先关闭再报错: {names:?}");
+        assert_eq!(events.last().unwrap().data["error"]["type"], "overloaded_error");
+
+        // 即使调用方误调了正常收尾，也不能再补出完成信号。
+        let late: Vec<String> = ctx
+            .generate_final_events()
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        assert!(
+            !late.iter().any(|n| n == "message_delta" || n == "message_stop"),
+            "{late:?}"
+        );
     }
 
     /// 回归锁：上游只发 reasoning、没发正文时，不许伪造「被截断」也不许补空正文。

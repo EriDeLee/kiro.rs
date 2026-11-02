@@ -196,9 +196,35 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 ///
 /// 与普通 429（high traffic / rate limit exceeded）的关键差异是
 /// 提到 "suspicious activity" 与具体账号 ID。
+///
+/// 判定顺序与封禁、额度判据同构：**结构化 `reason` 优先**，文案兜底。散文文案会被上游
+/// 悄悄改写（封禁判据 2026-08-13 就因此失效，见 [`default_is_account_suspended`]），
+/// 失效时判据静默返回 false，账号级限流被当成普通 429，不冷却、不换号。
+///
+/// 账号级限流的 `reason` 取值（顶层或 `error.reason`）：
+/// `USER_REQUEST_RATE_EXCEEDED`（ZyphrZero/kiro.rs 与 minpeter/kiro-lb 都观察到）、
+/// `CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED`（仅 ZyphrZero/kiro.rs
+/// 观察到）。后两个**尚未在本仓的 trace 里抓到过**，按账号级处理只会触发一次短冷却加换号，
+/// 受 `accountThrottleFailover` 开关控制。容量类 `INSUFFICIENT_MODEL_CAPACITY`、
+/// `MODEL_TEMPORARILY_UNAVAILABLE` 与月度额度 `MONTHLY_REQUEST_COUNT` 都不是账号级限流，不命中。
 pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
+    const ACCOUNT_RATE_LIMIT_REASONS: &[&str] = &[
+        "USER_REQUEST_RATE_EXCEEDED",
+        "CREDIT_CONSUMPTION_RATE_EXCEEDED",
+        "SERVICE_REQUEST_RATE_EXCEEDED",
+    ];
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let top = value.get("reason").and_then(|v| v.as_str());
+        let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+        if [top, nested]
+            .into_iter()
+            .flatten()
+            .any(|reason| ACCOUNT_RATE_LIMIT_REASONS.contains(&reason))
+        {
+            return true;
+        }
+    }
+    body.contains("suspicious activity") && body.contains("temporary limits")
 }
 
 /// 默认的"账号被封禁/停用"判断逻辑
@@ -560,6 +586,35 @@ mod tests {
         ));
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled("suspicious activity detected"));
+    }
+
+    /// 回归锁：账号级限流认结构化 `reason`，上游改文案也不会静默失效。
+    #[test]
+    fn account_throttled_matches_structured_reason_without_known_wording() {
+        for reason in [
+            "USER_REQUEST_RATE_EXCEEDED",
+            "CREDIT_CONSUMPTION_RATE_EXCEEDED",
+            "SERVICE_REQUEST_RATE_EXCEEDED",
+        ] {
+            let top = format!(r#"{{"message":"some brand new wording","reason":"{reason}"}}"#);
+            assert!(default_is_account_throttled(&top), "{reason}（顶层）");
+            let nested = format!(r#"{{"error":{{"message":"x","reason":"{reason}"}}}}"#);
+            assert!(default_is_account_throttled(&nested), "{reason}（嵌套）");
+        }
+    }
+
+    /// 容量类、月度额度、无关字段里碰巧出现的关键词都不是账号级限流。
+    #[test]
+    fn account_throttled_ignores_capacity_quota_and_unrelated_fields() {
+        for body in [
+            r#"{"message":"high load","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+            r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+            r#"{"message":"quota","reason":"MONTHLY_REQUEST_COUNT"}"#,
+            r#"{"message":"slow down","reason":null}"#,
+            r#"{"message":"mentions USER_REQUEST_RATE_EXCEEDED only in prose"}"#,
+        ] {
+            assert!(!default_is_account_throttled(body), "{body}");
+        }
     }
 
     #[test]

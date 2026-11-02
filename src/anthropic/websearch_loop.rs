@@ -257,6 +257,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    declared_tools: std::collections::HashMap<String, bool>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
@@ -267,7 +268,7 @@ async fn decode_round(
     // 与 /v1/messages 主路径同款的 tool JSON 累积器：只有整段 JSON 完整可解析才
     // 产出 tool_use。此前这里是「解析失败就降级成 {}」，会让客户端拿着空参数去
     // 执行工具（混合工具集场景会命中），属于静默数据损坏。
-    let mut tool_accumulator = ToolJsonAccumulator::new();
+    let mut tool_accumulator = ToolJsonAccumulator::with_declared_tools(declared_tools);
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut tool_json_error: Option<ToolJsonAccumulatorError> = None;
     let mut context_input_tokens: Option<i32> = None;
@@ -354,12 +355,22 @@ async fn decode_round(
         }
     }
 
+    // 流正常结束但最后一帧只到了一半：同样是没说完就断了，按读流失败处理。
+    if !stream_error && decoder.has_pending_data() {
+        tracing::error!("web_search loop: upstream ended with an incomplete event frame");
+        stream_error = true;
+    }
+
     // 收尾：仍在缓冲、始终没收到 stop 的半截 tool JSON 视为错误，不静默丢弃。
-    if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    if tool_json_error.is_none() {
+        // 无参工具：0 字节且无 stop 的缓冲，在「干净结束 + 该工具没有必填参数」时按 `{}` 收口。
+        match tool_accumulator.finish(tool_name_map, !stream_error) {
+            Ok(completed) => tool_uses.extend(completed),
+            Err(e) => {
+                tracing::error!("{}", e);
+                tool_json_error = Some(e);
+            }
+        }
     }
 
     // 字面 <tool_use 标签只告警、不删除（与流式 / 非流式同口径）。
@@ -462,10 +473,12 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
+    tracer.mark_upstream_headers_received();
     let mut outcome = decode_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
+        super::stream::declared_tool_requirements(payload.tools.as_ref()),
         tracer,
     )
     .await;
@@ -1094,6 +1107,7 @@ pub(crate) fn render_sse(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap()
 }

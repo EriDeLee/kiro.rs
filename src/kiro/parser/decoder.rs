@@ -108,6 +108,11 @@ impl Default for EventStreamDecoder {
 }
 
 impl EventStreamDecoder {
+    /// 流结束时缓冲区里还有残余字节，说明最后一帧被截断（或数据已损坏）。
+    pub fn has_pending_data(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// 创建新的解码器
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BUFFER_CAPACITY)
@@ -333,5 +338,44 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// 无头部、给定 payload 的最小合法帧（含 prelude CRC 与 message CRC）。
+    fn minimal_frame(payload: &[u8]) -> Vec<u8> {
+        use super::super::crc::crc32;
+        let total = (PRELUDE_SIZE + payload.len() + 4) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        let prelude_crc = crc32(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn has_pending_data_is_false_for_an_empty_or_fully_consumed_stream() {
+        let mut decoder = EventStreamDecoder::new();
+        assert!(!decoder.has_pending_data(), "没收到任何字节");
+
+        decoder.feed(&minimal_frame(b"{}")).unwrap();
+        assert_eq!(decoder.decode_iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(!decoder.has_pending_data(), "整帧已被消费，不应有残余");
+    }
+
+    #[test]
+    fn has_pending_data_detects_a_truncated_last_frame() {
+        let frame = minimal_frame(b"{\"k\":\"v\"}");
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&frame).unwrap();
+        decoder.feed(&frame[..frame.len() - 3]).unwrap();
+
+        assert_eq!(decoder.decode_iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(
+            decoder.has_pending_data(),
+            "第二帧只到了一部分，流结束时必须能认出被截断"
+        );
     }
 }

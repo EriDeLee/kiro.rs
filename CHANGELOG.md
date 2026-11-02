@@ -46,6 +46,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+> 以下七条吸收自 ZyphrZero/kiro.rs（zyphr）、KiroStudio、kiro2cc-proxy、kiro-lb 在 2026-08-13 之后的修复，逐条对照本仓库代码后再改。**只用 `--no-default-features`（rustls）在 gnu 工具链上验证过**；默认特性（vendored OpenSSL）的构建、以及对真实上游的端到端回归（AGENTS.md §3.11）**尚未做**。
+
+- **上游中途断流不再伪装成「正常结束」。** 读上游流失败（网络、超时、对端重置）时，流式路径此前照样发 `message_delta{end_turn}` + `message_stop`，客户端把半截回答当成答完，agent 循环就此停住，只有后台日志记了 error。现在：补一个 `overloaded_error`（Anthropic 约定的「可重试」类型，message 带已持续秒数）并**不发** `message_delta` / `message_stop`；上游干净关闭连接但一个字节都没给（空流）、或最后一帧只到一半（残帧），同样按中断处理，非流式路径回 502。`overloaded_error` 是有意选的：opencode 靠报错文字里的 `overloaded` 决定是否自动重试，`api_error` 不命中，一次断流就会停掉整个循环（读 opencode 1.18.33 源码得出，**未用真实断流实测**）。代价：重试会让模型重新生成整段，断流前那一段上游已计费。解码器新增 `has_pending_data()` 识别残帧。
+- **客户端取消的请求不再在日志里消失。** 取消（ESC、断线、前置网关超时）时 axum 丢弃响应体，此前没有任何收尾：上游已在生成并计费，用量统计与请求日志里却没有这条。现在 `StreamSettlement` 的 `Drop` 用最近一次快照补记用量并落 trace（「恰好记一次」，显式收尾后 Drop 是空操作）；`RequestTracer` 的 `Drop` 兜底补一行 `interrupted`，上游响应头到达之前取消记 `abandoned_before_headers`（管理页标签「头前取消」），之后记 `stream_interrupted`。`finalize` 改为幂等。管理页前端只改了源码标签，`admin-ui/dist` 需要重新构建。
+- **上游 API 请求不再设任何超时。** 原来整体超时 720 秒写死：reqwest 的整体超时包含读响应体、活跃的流续不了期，所以它其实是回答长度的硬上限，超时那一刻还在输出的回答被切断、已生成的 token 照样计费。现在上游 API 与 MCP 用 `build_stream_client`，连接超时、静默超时、总时限都不设（维护者的决定，不加配置项）；刷新 token、查余额等短请求仍用带超时的 `build_client`。**代价**：上游接通后卡死时，这个请求不会自己结束，而 `ping` 每 25 秒照发，客户端看不出异常，只能靠客户端取消。可选的缓解（未做）：TCP keepalive，不切断活的慢响应。
+- **无参工具的调用不再被判成「半截 JSON」。** 工具没有参数时，上游（据 zyphr 93459b5 与 KiroStudio e3fbccc 的提交说明，**未在本仓上游实测**）只发一条 input 为空、`stop` 缺省为 false 的事件，之后不再补 `stop`。此前流结束时 `finish()` 对 0 字节缓冲也报错：流式补 error、非流式 502、web_search 回灌 502。现在 0 字节且无 `stop` 的缓冲，只有同时满足「流干净结束」和「客户端声明的这个工具没有必填参数」才按 `{}` 收口；其余（有必填参数、未声明的工具、带 `type` 的服务端工具、顶层 `anyOf`/`oneOf`/`allOf`/`$ref`、传输层断流）仍按截断报错，防止上游刚写到「调用 write_file，参数：」就断线时，给有必填参数的工具放行空参数调用（§2.3 第 1 条）。非空缓冲无 `stop` 仍是截断，且优先于无参收口。验证办法：查 trace 里错误信息含 `buffered 0 bytes` 的行。
+- **账号级 429 的判据认结构化 `reason`。** 此前只认两句英文文案（`suspicious activity` + `temporary limits`），上游一改文案就静默失效（封禁判据 2026-08-13 就是这样坏的，见 §5），账号级限流被当成普通 429，不冷却、不换号。现在先认顶层或 `error.reason` 里的 `USER_REQUEST_RATE_EXCEEDED`（zyphr 与 kiro-lb 都观察到）、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED`（后两个仅 zyphr 观察到，**本仓 trace 里尚未抓到过**），文案兜底保留；容量类与月度额度的 `reason` 不命中。
+- **API 区域跟随真实 profileArn 的区域。** Enterprise / IdC 账号的 profile 不在默认区域时，请求此前发往全局配置的区域。现在优先级是 `apiRegion` > 真实 profileArn 的区域 > `config.apiRegion` > `config.region`；BuilderID 占位符与格式异常的 ARN 不参与。**有意不采纳** zyphr 的另一半（把凭据自己的 `region` 也当 API 区域回退）：本仓的 `region` 只管认证，认证区域与 API 区域可以不同，当回退会把这类账号的请求发到不存在的 API 主机；`test_effective_api_region_ignores_credential_region` 继续锁住这一点。
+- **所有 SSE 响应带 `X-Accel-Buffering: no`。** 前面有 nginx 时默认 `proxy_buffering on`，流式分片会被先攒着再转发，文字成块到达；这个头只作用于当前响应。源码扫描测试防止新增 SSE 端点漏带。`/v1/responses` 的 `stream:true` 本身仍是先收完整个回答再一次性合成 SSE，这个头对它没有实际效果。
 - **附件与 server tool 历史不再静默丢失。** 之前 5 类内容块被 `_ => {}` 吞掉，模型完全看不到、用户也无从察觉。现在：
   - `document` 的 `source.type == "text"`（opencode 的 .txt 附件）直接内联成正文；PDF 当前轮 400「上游不接受 PDF 文档」，历史里换占位符 —— 历史 400 会让整个会话永久打不开。
   - 图片只接受 jpeg/png/gif/webp；HEIC 等当前轮 400，历史里换占位符。
