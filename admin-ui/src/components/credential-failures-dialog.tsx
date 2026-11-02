@@ -30,6 +30,8 @@ function outcomeStyle(outcome: string | null): {
       return { label: "鉴权失败", variant: "destructive" };
     case "transient":
       return { label: "瞬态错误", variant: "outline" };
+    case "local_rate_limited":
+      return { label: "本地限流", variant: "warning" };
     case "network_error":
       return { label: "网络错误", variant: "destructive" };
     case "bad_request":

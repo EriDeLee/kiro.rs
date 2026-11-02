@@ -541,8 +541,15 @@ impl KiroProvider {
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
+                    // 选号阶段的限流：本地 RPM 打满时请求没有发到上游，单独归类；
+                    // 其余错误维持 UNKNOWN。
+                    let kind = if is_local_rate_limit(&e) {
+                        outcome::LOCAL_RATE_LIMITED
+                    } else {
+                        outcome::UNKNOWN
+                    };
                     Self::emit_attempt(
-                        sink, network_attempt, 0, "", None, outcome::UNKNOWN,
+                        sink, network_attempt, 0, "", None, kind,
                         Some(&e.to_string()), attempt_start,
                     );
                     if is_rate_limit_error(&e) {
@@ -1167,6 +1174,12 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+fn is_local_rate_limit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UpstreamRateLimitError>()
+        .is_some_and(UpstreamRateLimitError::is_local)
 }
 
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
