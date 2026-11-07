@@ -78,18 +78,7 @@ async fn main() {
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if kiro_api_key.is_empty() {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-        } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
-            let api_key_cred = KiroCredentials {
-                kiro_api_key: Some(kiro_api_key),
-                auth_method: Some("api_key".to_string()),
-                priority: 0,
-                ..Default::default()
-            };
-            credentials_list.insert(0, api_key_cred);
-        }
+        merge_environment_api_key(&mut credentials_list, kiro_api_key);
     }
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
@@ -405,6 +394,39 @@ async fn shutdown_signal() {
     }
 }
 
+/// 把 `KIRO_API_KEY` 环境变量并入凭据列表。
+///
+/// 文件里已有同一个完整 Key 就沿用原记录，不改它的 ID、分组、代理、优先级、禁用状态；
+/// 只有文件里没有时才新增（优先级 0，记录添加时间）。
+///
+/// 此前每次启动都无条件插入一条没有 ID 的凭据，`MultiTokenManager::new` 给它分配新 ID 并回写
+/// 凭据文件，下次启动再来一条 —— 同一个 Key 的副本随重启无限增长。已经产生的重复项不会被
+/// 自动删除。上游 ZyphrZero/kiro.rs dbc2b05。
+fn merge_environment_api_key(credentials: &mut Vec<KiroCredentials>, api_key: String) {
+    if api_key.trim().is_empty() {
+        tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        return;
+    }
+    if credentials
+        .iter()
+        .any(|credential| credential.kiro_api_key.as_deref() == Some(&api_key))
+    {
+        tracing::info!("KIRO_API_KEY 已存在于凭据文件，沿用原记录及其配置");
+        return;
+    }
+    tracing::info!("检测到新的 KIRO_API_KEY，添加 API Key 凭据（最高优先级）");
+    credentials.insert(
+        0,
+        KiroCredentials {
+            kiro_api_key: Some(api_key),
+            auth_method: Some("api_key".to_string()),
+            priority: 0,
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        },
+    );
+}
+
 /// 文件不存在时初始化配置/凭证文件
 ///
 /// - `config.json`：写入带随机 `apiKey`（每次启动同步为系统 Key）/ `adminApiKey`（管理面板登录密钥）
@@ -486,4 +508,92 @@ fn random_token(len: usize) -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_API_KEY: &str = "fixture-env-api-key";
+
+    /// 空串与纯空白都视为未配置，不得生成凭据。
+    #[test]
+    fn empty_env_api_key_creates_no_record() {
+        for key in ["", " \t\n"] {
+            let mut credentials = Vec::new();
+            merge_environment_api_key(&mut credentials, key.into());
+            assert!(credentials.is_empty(), "{key:?} 不应生成凭据");
+        }
+    }
+
+    /// 文件里已有同一个完整 Key：沿用原记录，ID、分组、代理、优先级、禁用状态一个字段都不改。
+    #[test]
+    fn env_api_key_reuses_existing_record_without_overriding_metadata() {
+        let original: KiroCredentials = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "kiroApiKey": TEST_API_KEY,
+            "createdAt": "2026-10-15T00:00:00Z",
+            "priority": 5,
+            "groups": ["restricted"],
+            "disabled": true,
+            "proxyUrl": "http://127.0.0.1:1"
+        }))
+        .unwrap();
+        let expected = serde_json::to_value(&original).unwrap();
+
+        let mut credentials = vec![original];
+        merge_environment_api_key(&mut credentials, TEST_API_KEY.into());
+
+        assert_eq!(credentials.len(), 1, "已有同 Key 记录时不得再追加");
+        assert_eq!(serde_json::to_value(&credentials[0]).unwrap(), expected);
+    }
+
+    /// 回归锁：设了 `KIRO_API_KEY` 时，反复重启不得让凭据文件越长越多。
+    ///
+    /// 此前每次启动都插入一条没有 ID 的凭据，`MultiTokenManager::new` 给它分配新 ID 并回写文件，
+    /// 下次启动再来一条 —— 同一个 Key 的副本无限增长。
+    #[test]
+    fn env_api_key_restart_does_not_grow_credentials_file() {
+        let directory =
+            std::env::temp_dir().join(format!("kiro-env-api-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("credentials.json");
+        std::fs::write(&path, "[]").unwrap();
+
+        let mut counts = Vec::new();
+        for _ in 0..5 {
+            let config = CredentialsConfig::load(&path).unwrap();
+            let mut credentials = config.into_sorted_credentials();
+            merge_environment_api_key(&mut credentials, TEST_API_KEY.into());
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(path.clone()),
+                true,
+            )
+            .unwrap();
+            counts.push(manager.snapshot().entries.len());
+            drop(manager);
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(&directory);
+        assert_eq!(counts, vec![1, 1, 1, 1, 1], "每次重启后的凭据条数");
+    }
+
+    /// 真正新增的环境 Key 记录添加时间；沿用的旧记录不动（见上一条）。
+    #[test]
+    fn new_env_api_key_records_created_at() {
+        let mut credentials = Vec::new();
+        merge_environment_api_key(&mut credentials, TEST_API_KEY.into());
+
+        assert_eq!(credentials.len(), 1);
+        assert!(
+            credentials[0]
+                .created_at
+                .as_deref()
+                .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        );
+    }
 }
