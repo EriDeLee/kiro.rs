@@ -109,6 +109,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   - 遮罩**不是**安全边界：`-webkit-text-security` 在 Firefox 132 之前不支持，那些浏览器上会明文显示。真正的保护仍在后端 —— 凭据列表接口从不回传这些值，只给哈希与掩码。
 - **Admin 面板的排序字段与升降序现在会持久化。** 展示形态（`credentialView`）与每页数量（`credentialPageSize`）一直存在 localStorage，排序却只活在组件 state 里，刷新或重新登录就悄悄回到「手动顺序」—— 用户以为自己选的排序还在，看到的其实是服务端顺序。现在写 `credentialSortField` / `credentialSortDir` 两个键，读回时按白名单校验、认不出的值回落 `manual`（否则一个比较器不认识的字段会让排序静默失效）；`SortField` / `SortDir` 的取值域随之移到 `storage.ts`，与那份白名单同源，避免两处各写一遍走岔。`applySort` 改为先算出下一组字段/方向再一次落盘 —— 用函数式 `setState` 取不到新值，落盘会滞后一次点击。
 
+> 2026-11-07 再追加四条：从上游 `master..upstream/master` 的 20 个新提交（v0.9.5 ~ v0.9.7，到 `fbd037c`）里挑出的修复，仍只搬实现，不合并分支。每条都先写回归锁、看它在旧代码上变红，再装修复、看它变绿；新增 10 条测试，551 → 561。
+
+- **默认 Key（id=0）的 token 用量不再恒为 0。** `UsageRecordHook::record` 里写死了 `key_id != 0`：由 `config.apiKey` 同步出来的系统 Key，鉴权时 `total_calls` 照常累加，成功请求的输入 / 输出 token 却一次都没记进 Key 统计，「客户端 Key」页里它那两列永远是 0。现在系统 Key 与普通 Key 一样累加成功请求的用量，失败请求仍不计。修复前回归锁实测 `(0, 0)`，期望 `(7, 3)`。不回填此前漏记的累计（用量日志是全的，缺的只是 Key 页的累计）。上游 `cba46ea`；它附带的 109 行网关测试依赖本仓已删的 `/cc`、`/v1/chat/completions` 与 cache 字段，未搬。
+- **单独配置的代理用户名 / 密码里的 `%` 不再被多解码一次。** reqwest 0.12 的 `Proxy::basic_auth` 把凭据写进代理 URL 的 userinfo，`url` 不转义 `%`，连接时 hyper-util 再按 URL 规则解码一次（0.1.19 的 `matcher.rs:367-368`），于是密码 `p%40ss` 以 `p@ss` 发给代理，HTTP 与 SOCKS5 都受影响。现在 `basic_auth` 之前先把 `%` 转成 `%25`；本仓只有 `http_client.rs` 一处调用 `basic_auth`，全局代理、凭据级代理、代理池都经过它。写在代理 URL 里的凭据本来就是 URL 编码形式，仍解码一次。修复前回归锁实测 HTTP 发出 `u:ser:p@ss%`（期望 `u%3Aser:p%40ss%25`）、SOCKS5 用户名字节 `s@user`（期望 `s%40user`）。上游 `aa5398e`（cyx0215）。
+- **设了 `KIRO_API_KEY` 时，重启不再让凭据文件越长越多。** `main.rs` 每次启动都无条件把该环境变量作为新凭据插入列表头部；它没有 ID，`MultiTokenManager::new` 给它分配新 ID 并回写凭据文件，下次启动再来一条。现在文件里已有同一个完整 Key 就沿用原记录（ID、分组、代理、优先级、禁用状态一个字段都不改），没有才新增（优先级 0，记录添加时间）；纯空白与空串一样视为未配置。修复前回归锁实测连续 5 次重启后凭据条数为 `[1, 2, 3, 4, 5]`（期望全 1）。**已经产生的重复项不会被自动删除**，需要手工清理 `credentials.json`。上游 `dbc2b05` 同一提交里的离线去重命令行（`--deduplicate-credentials`）与 `.id-watermark` 侧车文件本次没有搬。
+- **429 冷却后的「剩余候选」不再把已确认不支持该模型的凭据算进去。** `report_account_throttled_for_request` 冷却一个凭据后返回作用域内还剩几个候选，provider 在返回值 > 0 时换号重试；这里的统计只看分组，没排除 `cached_model_support` 为 `Unsupported` 的凭据。池里有凭据对该模型已确认不支持时，换号后 `acquire_context` 找不到候选，客户端看到的就不再是这次的 429。修复前回归锁实测剩余数为 2（期望 1）。上游 `59b6d48` 的主体（移除 `supports_opus()` 订阅名门槛）本仓早已完成，这里只搬它唯一缺的一行。
+
 ## [0.7.5] - 2026-08-05
 
 主题：**为多账号调度加入单账号 RPM 主动限流，并集中增强管理端的凭据筛选、批量操作、创建时间、请求计费与移动端可用性**。本版同时加固 WebSearch MCP 的查询参数兼容和 Enterprise / IdC 路由；新增配置默认关闭或带有 `serde(default)`，旧 `config.json` 与 `credentials.json` 无需迁移。
