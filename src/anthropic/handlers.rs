@@ -100,7 +100,7 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
+        if status == "success" {
             if let Some(m) = &self.client_keys {
                 m.record_usage(self.key_id, rec.input_tokens, rec.output_tokens);
             }
@@ -1903,6 +1903,37 @@ mod tests {
         let rows = rows_for(&store, "finished-stream");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].final_status, "success", "Drop 不得把已完成的请求改成中断");
+    }
+
+    /// 回归锁：系统 Key（id=0，由 `config.apiKey` 同步）的成功用量必须累加到 Key 统计。
+    ///
+    /// `record` 里曾写死 `key_id != 0`：默认 Key 的调用次数（鉴权时累加）照常增长，
+    /// 「客户端 Key」页里它的输入 / 输出 token 却永远是 0。失败请求仍不计入。
+    /// 上游 ZyphrZero/kiro.rs cba46ea。
+    #[test]
+    fn system_key_usage_is_accumulated_on_success_only() {
+        use crate::admin::client_keys::ClientKeyManager;
+
+        let manager = std::sync::Arc::new(ClientKeyManager::new());
+        manager.sync_system_key("默认密钥".to_string(), None, "system-key".to_string());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: Some(manager.clone()),
+            key_id: 0,
+            model: "claude-opus-5.5".to_string(),
+            started_at: Instant::now(),
+        };
+
+        hook.record(1, 10, 20, 0.5, "error");
+        hook.record(1, 7, 3, 0.1, "success");
+
+        let entry = manager.list().into_iter().find(|key| key.id == 0).unwrap();
+        assert_eq!(
+            (entry.total_input_tokens, entry.total_output_tokens),
+            (7, 3),
+            "系统 Key 只累加成功请求的用量"
+        );
     }
 
     /// 上游断流：客户端收到 `overloaded_error`（可重试），没有 message_stop；用量记 error，
