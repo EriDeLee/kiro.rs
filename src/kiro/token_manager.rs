@@ -3331,6 +3331,7 @@ impl MultiTokenManager {
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
                         && credential_matches_request(&e.credentials, model, group)
+                        && self.cached_model_support(e.id, model) != CachedModelSupport::Unsupported
                 })
                 .count()
         }
@@ -7176,6 +7177,42 @@ mod tests {
             Some(2)
         );
         assert_eq!(manager.snapshot().available, 1);
+    }
+
+    /// 回归锁：429 冷却后返回的「剩余候选数」不得把缓存明确不支持该模型的凭据算进去。
+    ///
+    /// provider 在剩余数 > 0 时换号重试。若把拿不到这个模型的凭据也数进去，换号后
+    /// `acquire_context` 找不到候选，客户端看到的就不再是这次的 429。
+    /// 上游 ZyphrZero/kiro.rs 59b6d48 里本仓唯一没有的部分。
+    #[test]
+    fn account_throttle_remaining_excludes_credentials_known_to_lack_the_model() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &[]),
+                grouped_cred("b", &[]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #1、#3 的清单里有 opus；#2 只有 sonnet，对 opus 是 Unsupported。
+        seed_model_cache(&manager, 1, &["claude-opus-5.5"]);
+        seed_model_cache(&manager, 2, &["claude-sonnet-5.5"]);
+        seed_model_cache(&manager, 3, &["claude-opus-5.5"]);
+
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                Some("claude-opus-5.5"),
+                None,
+            ),
+            1,
+            "冷却 #1 后只剩 #3 能服务 opus；#2 已确认不支持，不能算候选"
+        );
     }
 
     #[test]
