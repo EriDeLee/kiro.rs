@@ -14,7 +14,6 @@ use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::model::policy::ApiEndpoint;
 use crate::token;
 use anyhow::Error;
@@ -588,34 +587,22 @@ pub async fn get_models(
             .into_response();
     };
 
-    let upstream = match provider
+    // GET /v1/models 返回当前分组的**全部凭据**的模型并集（含禁用/冷却/额度耗尽的）。
+    // 模型目录是展示用，不是路由：额度耗尽的 PRO 账号所支持的模型也应出现在列表里。
+    let upstream = provider
         .token_manager()
-        .discover_models_for_group(key_ctx.group.as_deref())
-        .await
-    {
-        Ok(models) => models,
-        Err(ModelDiscoveryError::NoAvailableCredentials) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "No available credentials for this API key",
-                )),
-            )
-                .into_response();
-        }
-        Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
-            tracing::warn!("动态模型列表加载失败: {}", error);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Unable to load available models from upstream",
-                )),
-            )
-                .into_response();
-        }
-    };
+        .all_model_ids_from_cache(key_ctx.group.as_deref());
+
+    if upstream.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "No models discovered yet. Try again after the credential cache warms up.",
+            )),
+        )
+            .into_response();
+    }
 
     let models = aggregate_available_models(upstream);
 

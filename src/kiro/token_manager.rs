@@ -1867,7 +1867,7 @@ impl MultiTokenManager {
             .collect()
     }
 
-    /// 返回当前客户端分组可访问凭据的动态模型并集原始项。
+    /// 返回当前客户端分组**可调度凭据**的动态模型并集（数据面用，排除禁用/冷却/额度耗尽）。
     pub async fn discover_models_for_group(
         &self,
         group: Option<&str>,
@@ -1905,6 +1905,29 @@ impl MultiTokenManager {
         } else {
             Ok(models)
         }
+    }
+
+    /// 返回**所有**凭据（含禁用/冷却/额度耗尽）的模型并集，供 `GET /v1/models` 使用。
+    ///
+    /// 模型目录应反映账号订阅可访问的全部模型，而不是当前调度状态下可发请求的凭据子集：
+    /// 一个因额度耗尽而暂时禁用的 PRO 账号，它所支持的模型仍应出现在列表里，
+    /// 否则客户端无从得知该模型是否可用——等额度重置后选它又会收到 400。
+    ///
+    /// 只取缓存（不强制发网络请求）：禁用/冷却的凭据已有上次成功的清单。
+    /// 完全没有缓存的凭据（冷启动或刚被添加还没探过）不计入；这和调度路径的处理一致。
+    pub fn all_model_ids_from_cache(&self, group: Option<&str>) -> Vec<UpstreamModel> {
+        let entries = self.entries.lock();
+        let cache = self.model_cache.lock();
+        let mut models: Vec<UpstreamModel> = Vec::new();
+        for entry in entries.iter() {
+            if !group_matches(&entry.credentials.groups, group) {
+                continue;
+            }
+            if let Some(cached) = cache.get(&entry.id) {
+                models.extend(cached.response.models.iter().cloned());
+            }
+        }
+        models
     }
 
     /// 服务启动后异步预热所有当前启用凭据的模型缓存。
