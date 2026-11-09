@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, matching Cargo.toml (e.g. 0.1.0 or v0.1.0)'
+        description: 'Release version in Beijing time: vYYYYMMDDHHMM (e.g. v202611082338)'
         required: true
         type: string
       prerelease:
@@ -55,23 +55,27 @@ jobs:
             PRERELEASE="false"
           fi
 
+          # 统一版本格式：v + 北京时间 YYYYMMDDHHMM（如 v202611082338）
           VERSION="${RAW_VERSION#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "::error::Version must look like 0.1.0, optionally prefixed with v"
+          if ! [[ "$VERSION" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::Version must match vYYYYMMDDHHMM (Beijing time), e.g. v202611082338"
             exit 1
           fi
-          if [[ "$VERSION" =~ ^20[0-9]{2}\. ]]; then
-            echo "::error::Date-based versions are not allowed; use semantic versions like 0.1.0"
-            exit 1
-          fi
+          VERSION="v${VERSION}"
 
+          # Cargo / npm 映射为 semver build metadata：YYYY.M.D+HHMM
+          YEAR="${VERSION:1:4}"
+          MONTH=$((10#${VERSION:5:2}))
+          DAY=$((10#${VERSION:7:2}))
+          HOUR_MIN="${VERSION:9:4}"
+          CARGO_EXPECTED="${YEAR}.${MONTH}.${DAY}+${HOUR_MIN}"
           CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match requested release version ($VERSION)"
+          if [ "$CARGO_VERSION" != "$CARGO_EXPECTED" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match $CARGO_EXPECTED derived from $VERSION"
             exit 1
           fi
 
-          TAG="v${VERSION}"
+          TAG="${VERSION}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "::error::Tag ${TAG} already exists"
             exit 1

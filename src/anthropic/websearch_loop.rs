@@ -1251,7 +1251,7 @@ mod tests {
     use crate::anthropic::handlers::RequestTraceOptions;
     use crate::anthropic::middleware::{AppState, KeyContext};
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
-    use crate::model::allowlist::ApiEndpoint;
+    use crate::model::policy::ApiEndpoint;
 
     /// 回归锁：web_search loop 的失败路径必须落一条 trace 行，且带上模型名与
     /// 已知用量。

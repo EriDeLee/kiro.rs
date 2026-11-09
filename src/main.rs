@@ -168,14 +168,13 @@ async fn main() {
     // 否则该凭据退回「没探过」，在均衡负载模式下会被已探过的凭据永久挡住。
     token_manager.install_self_ref();
     token_manager.start_model_cache_warmer();
+    token_manager.start_model_cache_refresher();
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
     ));
-
-    // 初始化自定义模型注册表（启动时装载一次，运行期只读）
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -324,11 +323,11 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("监听地址: {}", addr);
-    tracing::info!("可用 API（Messages 接受全部白名单模型；Responses 仅接受 GPT）:");
-    tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages              [全部 6 个白名单模型]");
+    tracing::info!("可用 API（模型池动态获取；Messages 全收；Responses 拒 Claude）:");
+    tracing::info!("  GET  /v1/models                [当前可用凭据的动态并集]");
+    tracing::info!("  POST /v1/messages              [动态池全部模型]");
     tracing::info!("  POST /v1/messages/count_tokens");
-    tracing::info!("  POST /v1/responses             [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]");
+    tracing::info!("  POST /v1/responses             [动态池中除 Claude 外的全部模型]");
     tracing::info!("Admin: /api/admin/* + UI /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

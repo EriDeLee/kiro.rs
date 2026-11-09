@@ -542,9 +542,11 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     // 选号阶段的限流：本地 RPM 打满时请求没有发到上游，单独归类；
-                    // 其余错误维持 UNKNOWN。
+                    // 池外模型同样是本地拒绝，标成 bad_request；其余错误维持 UNKNOWN。
                     let kind = if is_local_rate_limit(&e) {
                         outcome::LOCAL_RATE_LIMITED
+                    } else if is_model_not_in_pool(&e) {
+                        outcome::BAD_REQUEST
                     } else {
                         outcome::UNKNOWN
                     };
@@ -552,7 +554,7 @@ impl KiroProvider {
                         sink, network_attempt, 0, "", None, kind,
                         Some(&e.to_string()), attempt_start,
                     );
-                    if is_rate_limit_error(&e) {
+                    if is_rate_limit_error(&e) || is_model_not_in_pool(&e) {
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
@@ -1174,6 +1176,13 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+/// 池外模型是本地拒绝：客户端选错了模型，重试同一个请求也不会变好。
+fn is_model_not_in_pool(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::kiro::error::ModelNotInPoolError>()
+        .is_some()
 }
 
 fn is_local_rate_limit(error: &anyhow::Error) -> bool {

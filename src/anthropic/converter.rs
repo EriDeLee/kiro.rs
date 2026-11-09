@@ -13,12 +13,10 @@ use crate::kiro::model::requests::conversation::{
     HistoryUserMessage, KiroImage, Message, ReasoningContent, UserInputMessage,
     UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{
-    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
-};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::catalog::{EffortCapability, SchemaState, ThinkingCapability};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
 
@@ -223,51 +221,38 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
 
 /// 把客户端模型名映射到上游 Kiro modelId。
 ///
-/// 只认白名单内的模型（含别名后缀），其余一律 `None`（由调用方回 400）。不做
-/// 家族/版本号的模糊推断，也不再透传未知模型——透传等于把不受支持的 id 直接甩给
-/// 上游，换来一个语义不明的 400。
+/// 动态池里的模型名会先按上游清单规范化（精确 → 后缀 → 点横线版本变体）。
+/// 池校验不在这里做：选号阶段按真实 `ListAvailableModels` 清单判定，池外模型
+/// 本地 400；只有冷启动还没有任何清单时才按原 ID 放行。converter 只拒绝空串、
+/// 超长、控制字符这类格式错误。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
         return None;
     }
-    // 白名单是唯一权威：只认 Claude 组（claude-opus-5.5 / claude-sonnet-5.5）与
-    // GPT 组（gpt-5.6-sol / -terra / -luna），其余一律 None。API 入口策略由
-    // handlers / responses 校验；converter 只按上游模型族分流。
-    crate::model::allowlist::normalize(model).map(str::to_string)
+    let trimmed = model.trim();
+    Some(
+        crate::model::catalog::canonical_id(trimmed)
+            .unwrap_or_else(|| trimmed.to_string()),
+    )
 }
 
 /// 根据模型名称返回对应的上下文窗口大小（`maxInputTokens`）。
 ///
-/// 取自实测 `ListAvailableModels` 的 `tokenLimits.maxInputTokens`：
-///
-/// - Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）：1,000,000
-/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：986,000
+/// 优先取动态能力表里该模型自己的 `tokenLimits.maxInputTokens`；能力表还没
+/// 收到这个模型时，按已知模型族回退（Claude 1M / GPT 986k / 其它 200k）。
 ///
 /// 这个值参与 contextUsageEvent 的百分比 → 绝对 token 数换算，取错会让上报的
 /// input_tokens 系统性偏差，进而误导客户端的上下文压缩时机。
-///
-/// 注：输出上限（三个 Claude 5.5 实测均为 64k / GPT 族 128k）不在此函数职责内 ——
-/// `/v1/models` 的 `max_tokens` 直接取上游 `maxOutputTokens`，本函数只管输入窗口。
 pub fn get_context_window_size(model: &str) -> i32 {
-    use crate::model::allowlist::{ModelFamily, family_for_model};
-    match map_model(model).as_deref().and_then(family_for_model) {
+    use crate::model::policy::{ModelFamily, family_for_model};
+    if let Some(window) = crate::model::catalog::context_window(model) {
+        return window;
+    }
+    match family_for_model(model) {
         Some(ModelFamily::Claude) => 1_000_000,
         Some(ModelFamily::Gpt) => 986_000,
-        // 白名单之外的模型走不到这里（map_model 已返回 None），保留保守默认值。
         None => 200_000,
     }
-}
-
-/// 是否向该模型下发 `additionalModelRequestFields.output_config` + `thinking`。
-///
-/// 实测 Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）的 schema 接受
-/// `output_config.effort ∈ {low,medium,high,xhigh,max}` 与 `thinking.{type,display}`；
-/// GPT 族只接受 `reasoning`，走另一条分支。
-fn model_supports_native_reasoning(model_id: &str) -> bool {
-    matches!(
-        crate::model::allowlist::family_for_model(model_id),
-        Some(crate::model::allowlist::ModelFamily::Claude)
-    )
 }
 
 /// 取出一条消息里的可见文本（拼接所有 text 块）。
@@ -289,7 +274,7 @@ fn collect_message_text(content: &serde_json::Value) -> String {
 
 /// 客户端是否请求了原生 reasoning。
 ///
-/// 三处信号任一成立即算，必须与 [`select_native_reasoning_effort`] 的取值链一致：
+/// 三处信号任一成立即算，必须与 [`select_effort`] 的取值链一致：
 ///   - `thinking` 启用（adaptive / enabled）
 ///   - `req.effort` —— `/v1/responses` 的内部通路（那条路径 thinking /
 ///     output_config 恒为 None，见 `MessagesRequest::effort`）
@@ -320,132 +305,157 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
     }
 }
 
-/// 选定最终下发的 effort：优先显式 `output_config.effort`；否则据 `budget_tokens`
-/// 推导；再统一过 [`normalize_effort_for_model`]（按模型把 xhigh 安全降级等）。
 /// 选定最终下发的 effort 档位。
 ///
-/// 优先级：`req.effort`（`/v1/responses` 内部通路）> `output_config.effort`（Anthropic
-/// 官方规范，也是 `@ai-sdk/anthropic` 的实际线格式）
-/// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 默认 `high`（与上游 default 一致）。
-/// 随后按该模型实测枚举裁剪。
-fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Result<String, String> {
-    let raw = req
+/// 优先级：`req.effort`（`/v1/responses` 内部通路）> `output_config.effort`
+/// > `thinking.budget_tokens` 推导（旧式客户端兜底）> 该模型 schema 的 default
+/// > `high`。
+///
+/// 显式档位不在 schema 枚举里时**报错**，不静默改写；由 budget_tokens 推导的
+/// 档位属于代理内部推断，若不在枚举里则回落到 schema default/最低档，避免把
+/// 一个客户端没写过的非法值甩给上游。
+fn select_effort(req: &MessagesRequest, model_id: &str, capability: &EffortCapability) -> Result<String, String> {
+    let explicit = req
         .effort
         .as_deref()
-        .map(|e| e.trim().to_string())
-        .filter(|e| !e.is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .or_else(|| {
             req.output_config
                 .as_ref()
-                .map(|oc| oc.effort.trim().to_string())
-                .filter(|e| !e.is_empty())
-        })
+                .map(|config| config.effort.trim())
+                .filter(|value| !value.is_empty())
+        });
+
+    let raw = explicit
+        .map(str::to_string)
         .or_else(|| {
             req.thinking
                 .as_ref()
-                .filter(|t| t.is_enabled())
-                .map(|t| effort_from_budget_tokens(t.budget_tokens).to_string())
+                .filter(|thinking| thinking.is_enabled())
+                .map(|thinking| effort_from_budget_tokens(thinking.budget_tokens).to_string())
         })
+        .or_else(|| capability.default.clone())
         .unwrap_or_else(|| "high".to_string());
-    // 客户端未指定时才用 default high；显式指定但不被支持则上抛，不静默改写。
-    Ok(normalize_effort_for_model(model_id, &raw)?.unwrap_or_else(|| "high".to_string()))
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffortTier {
-    /// 仅 GPT 族（gpt-5.6-sol / -terra / -luna）支持；Claude 族的枚举里没有这一档。
-    None,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
-}
+    // 自由字符串（上游声明了 effort 但没有 enum）：不改写，原样下发。
+    let Some(levels) = &capability.levels else {
+        return Ok(raw.trim().to_string());
+    };
 
-impl EffortTier {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "none" => Some(Self::None),
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
-            "max" => Some(Self::Max),
-            _ => None,
-        }
+    // 先做大小写不敏感的原样匹配，这样上游未来新增的自定义档位不需要改代码。
+    if let Some(level) = levels
+        .iter()
+        .find(|level| level.eq_ignore_ascii_case(raw.trim()))
+    {
+        return Ok(level.clone());
+    }
+    if let Some(level) = canonical_effort(&raw)
+        .and_then(|canonical| levels.iter().find(|level| level.eq_ignore_ascii_case(canonical)))
+    {
+        return Ok(level.clone());
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-}
-
-/// 该模型实测支持的 effort 枚举（来自 `ListAvailableModels` 的 schema），按模型族分组。
-///
-/// - Claude 族（`claude-opus-5.5`、`claude-sonnet-5.5`）：low / medium / high / xhigh / max
-///   （**无 none**）
-/// - GPT 族（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：
-///   none / low / medium / high / xhigh / max
-fn model_effort_tiers(model_id: &str) -> &'static [EffortTier] {
-    use crate::model::allowlist::{ModelFamily, family_for_model};
-    use EffortTier::*;
-    match family_for_model(model_id) {
-        Some(ModelFamily::Gpt) => &[None, Low, Medium, High, XHigh, Max],
-        // Claude 族与白名单外的兜底都用不含 none 的五档：白名单外的模型走不到这里
-        // （map_model 已 None），保守取更严格的枚举。
-        _ => &[Low, Medium, High, XHigh, Max],
-    }
-}
-
-/// 校验并归一 effort：命中该模型支持的枚举则原样下发，否则**报错**。
-///
-/// 不回落也不拉高 —— 静默改写档位等于篡改客户端请求的推理强度，调用方会拿到
-/// 200 却以为自己设的档位生效了。错误消息里列出该模型支持的全部档位。
-fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Result<Option<String>, String> {
-    let trimmed = raw_effort.trim();
-    if trimmed.is_empty() {
-        return Ok(Option::None);
-    }
-
-    let tiers = model_effort_tiers(model_id);
-    match EffortTier::parse(trimmed) {
-        Some(tier) if tiers.contains(&tier) => Ok(Some(tier.as_str().to_string())),
-        // 不回落：静默把档位改成 high 等于篡改客户端请求的推理强度，调用方拿到
-        // 200 却以为自己设的档位生效了。直接拒绝，让它知道这个模型不支持。
-        Some(tier) => Err(format!(
+    if explicit.is_some() {
+        return Err(format!(
             "effort `{}` is not supported by model `{}`; supported tiers: {}",
-            tier.as_str(),
+            raw,
             model_id,
-            tiers
-                .iter()
-                .map(|t| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        Option::None => Err(format!(
-            "unrecognized effort value `{}`; supported tiers for `{}`: {}",
-            trimmed,
-            model_id,
-            tiers
-                .iter()
-                .map(|t| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+            levels.join(", ")
+        ));
+    }
+
+    // 内部推断值不在枚举内：用 schema default，其次最低档；不把推断错误甩给客户端。
+    if let Some(default) = &capability.default {
+        return Ok(default.clone());
+    }
+    levels
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("model `{model_id}` 的 effort 枚举为空"))
+}
+
+fn canonical_effort(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Some("none"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "x-high" | "x_high" => Some("xhigh"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ResolvedControls {
+    effort: Option<EffortCapability>,
+    thinking: Option<ThinkingCapability>,
+}
+
+/// 解析该模型实际允许下发的控制字段。
+///
+/// - schema 声明了对象：按对象里的 properties 使用（未来新路径也无需改代码）
+/// - schema 显式 null / 非对象：上游明确拒绝，不猜
+/// - schema 键缺失或能力表还没收到该模型：按已知模型族兜底
+/// - 未知族：不下发任何附加字段，普通请求照常可用
+fn resolve_controls(model_id: &str) -> ResolvedControls {
+    match crate::model::catalog::lookup(model_id) {
+        Some(capability) => match capability.schema {
+            SchemaState::Declared => ResolvedControls {
+                effort: capability.effort,
+                thinking: capability.thinking,
+            },
+            SchemaState::Denied => ResolvedControls::default(),
+            SchemaState::Silent => fallback_controls(model_id),
+        },
+        None => fallback_controls(model_id),
+    }
+}
+
+fn fallback_controls(model_id: &str) -> ResolvedControls {
+    use crate::model::policy::{ModelFamily, family_for_model};
+    match family_for_model(model_id) {
+        Some(ModelFamily::Claude) => ResolvedControls {
+            effort: Some(EffortCapability {
+                path: "output_config".to_string(),
+                levels: Some(vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                    "max".to_string(),
+                ]),
+                default: Some("high".to_string()),
+            }),
+            thinking: Some(ThinkingCapability {
+                types: vec!["adaptive".to_string(), "disabled".to_string()],
+                displays: vec!["summarized".to_string(), "omitted".to_string()],
+            }),
+        },
+        Some(ModelFamily::Gpt) => ResolvedControls {
+            effort: Some(EffortCapability {
+                path: "reasoning".to_string(),
+                levels: Some(vec![
+                    "none".to_string(),
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                    "max".to_string(),
+                ]),
+                default: Some("high".to_string()),
+            }),
+            thinking: None,
+        },
+        None => ResolvedControls::default(),
     }
 }
 
 fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
-) -> Result<Option<AdditionalModelRequestFields>, String> {
+) -> Result<Option<serde_json::Value>, String> {
     // 显式关闭 thinking：不下发任何 reasoning 字段。
     if req
         .thinking
@@ -460,72 +470,96 @@ fn build_additional_model_request_fields(
         return Ok(None);
     }
 
-    let effort = select_native_reasoning_effort(req, model_id)?;
-
-    // 两个模型族的推理字段路径完全不同（GPT 族只认 `reasoning`，Claude 族只认
-    // `output_config` + `thinking`），按实测 schema 分流，不做任何互相兼容。
-    // 族内所有模型的字段路径一致，因此按族判断而非逐个模型 id。
-    if matches!(
-        crate::model::allowlist::family_for_model(model_id),
-        Some(crate::model::allowlist::ModelFamily::Gpt)
-    ) {
-        return Ok(Some(AdditionalModelRequestFields {
-            thinking: None,
-            output_config: None,
-            reasoning: Some(KiroReasoningConfig { effort }),
-        }));
+    let controls = resolve_controls(model_id);
+    if controls.effort.is_none() && controls.thinking.is_none() {
+        // 上游没有声明这个模型的附加字段。普通请求仍然可用；只是没有推理档位可下发。
+        // 这是该模型的真实能力边界，不是本代理静默丢弃。
+        tracing::debug!(
+            model = model_id,
+            "模型未声明 additionalModelRequestFields，跳过 reasoning 控制"
+        );
+        return Ok(None);
     }
 
-    if model_supports_native_reasoning(model_id) {
-        return Ok(Some(AdditionalModelRequestFields {
-            thinking: build_kiro_thinking(req, &effort),
-            output_config: Some(KiroOutputConfig { effort }),
-            reasoning: None,
-        }));
+    let mut fields = serde_json::Map::new();
+
+    if let Some(capability) = &controls.effort {
+        let effort = select_effort(req, model_id, capability)?;
+        fields.insert(
+            capability.path.clone(),
+            serde_json::json!({ "effort": effort }),
+        );
+    } else if req.effort.is_some()
+        || req
+            .output_config
+            .as_ref()
+            .is_some_and(|config| !config.effort.trim().is_empty())
+    {
+        tracing::debug!(
+            model = model_id,
+            "模型未声明 effort 档位，客户端档位不下发"
+        );
     }
 
-    Ok(None)
+    if let Some(thinking) = build_thinking(req, controls.thinking.as_ref()) {
+        fields.insert("thinking".to_string(), thinking);
+    }
+
+    if fields.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(fields)))
+    }
 }
 
-/// 构造 `additionalModelRequestFields.thinking`（仅 Claude 族：opus-5 / sonnet-5）。
+/// 按 schema 声明的 `thinking.type` / `thinking.display` 构造 thinking 对象。
 ///
-/// 上游只接受 `type ∈ {adaptive, disabled}`，发 `enabled` 会 400；且 effort 为
-/// `xhigh`/`max` 时连 `disabled` 也被拒。冲突时**整体不下发 thinking 字段**，让上游
-/// 走默认行为 —— 绝不改写 effort（改 effort 等于篡改客户端请求的推理强度）。
-///
-/// `display` 原样透传：上游缺省 `omitted` 会吞掉思考文本，客户端 SDK 会主动发
-/// `summarized` 要回来。
-fn build_kiro_thinking(req: &MessagesRequest, effort: &str) -> Option<KiroThinkingConfig> {
+/// 客户端发 `enabled` 时优先归一为上游声明的 `adaptive`；schema 没声明
+/// `thinking` 属性时整个字段不下发，只保留 effort。
+fn build_thinking(
+    req: &MessagesRequest,
+    capability: Option<&ThinkingCapability>,
+) -> Option<serde_json::Value> {
     let thinking = req.thinking.as_ref()?;
-
-    if thinking.thinking_type == "disabled" {
-        if matches!(effort, "xhigh" | "max") {
-            tracing::debug!(
-                effort = %effort,
-                "thinking=disabled 与 effort=xhigh/max 冲突，跳过下发 thinking 字段"
-            );
-            return None;
-        }
-        return Some(KiroThinkingConfig {
-            thinking_type: "disabled".to_string(),
-            display: None,
-        });
-    }
-
     if !thinking.is_enabled() {
         return None;
     }
-    // enabled / adaptive 一律归一为上游唯一接受的 adaptive
-    // （Anthropic 官方迁移路径：enabled+budget_tokens → adaptive+output_config.effort）。
-    Some(KiroThinkingConfig {
-        thinking_type: "adaptive".to_string(),
-        display: thinking
-            .display
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .map(str::to_string),
-    })
+    let capability = capability?;
+
+    let allowed_type = capability
+        .types
+        .iter()
+        .find(|value| value.eq_ignore_ascii_case("adaptive"))
+        .or_else(|| {
+            capability
+                .types
+                .iter()
+                .find(|value| value.eq_ignore_ascii_case("enabled"))
+        })?;
+
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "type".to_string(),
+        serde_json::Value::String(allowed_type.clone()),
+    );
+
+    if let Some(display) = thinking
+        .display
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && let Some(allowed) = capability
+            .displays
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(display))
+    {
+        fields.insert(
+            "display".to_string(),
+            serde_json::Value::String(allowed.clone()),
+        );
+    }
+
+    Some(serde_json::Value::Object(fields))
 }
 
 /// 转换结果
@@ -536,9 +570,9 @@ pub struct ConversionResult {
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
 
-    /// Additional model request fields (including `output_config.effort`), translated from the
-    /// `output_config` field of the client's Anthropic request. Not sent when empty.
-    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// `additionalModelRequestFields`，形状由该模型自己的上游 schema 决定。
+    /// 空对象/无字段时不下发。
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -853,12 +887,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
-    // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
+    // 14. 按该模型自己的 `additionalModelRequestFieldsSchema` 构造附加字段。
     //
-    // The system-prompt thinking prefix remains available for every thinking mode. The real
-    // wire field is narrower: newer/non-adaptive models reject it with
-    // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
-    // by upstream model capability rather than by the mere presence of client output_config.
+    // 上游对不支持的模型直接 400 `additionalModelRequestFields is not supported
+    // for this model`，所以字段是否下发、走哪条路径、允许哪些档位，全部由动态
+    // 能力表决定，而不是由客户端是否带了 output_config 决定。
     let additional_model_request_fields = build_additional_model_request_fields(req, &model_id)
         .map_err(ConversionError::UnsupportedRequest)?;
 
@@ -1386,8 +1419,8 @@ fn build_history(
     let mut server_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 生成thinking前缀（如果需要）
-    // 白名单内的模型（Claude 组 / GPT 组）都走 Kiro 原生 reasoning 字段
-    // （output_config.effort / reasoning.effort），因此不再注入 `<thinking_mode>`
+    // 动态池里的模型都优先走 Kiro 原生 reasoning 字段（字段路径由各自 schema 决定），
+    // 因此不再注入 `<thinking_mode>`
     // prompt 标签 —— 上游版本对该注入**无模型门控**，会与原生 effort 同时下发：
     // 既污染历史上下文，又把推理强度变成「写在提示词里的字面量」而非上游真实档位。
 
@@ -2010,10 +2043,9 @@ mod tests {
 
         let fields = result
             .additional_model_request_fields
-            .expect("opus 4.6 adaptive thinking should keep output_config");
+            .expect("adaptive thinking should keep output_config");
         assert_eq!(
-            fields.output_config.unwrap().effort,
-            "max",
+            fields["output_config"]["effort"], "max",
             "effort should be normalized before being sent to upstream"
         );
     }
@@ -2028,7 +2060,10 @@ mod tests {
         let req = minimal_adaptive_thinking_request_with_effort("claude-opus-5.5", "extreme");
         let err = convert_request(&req).expect_err("非法 effort 必须被拒绝");
         let msg = format!("{err:?}");
-        assert!(msg.contains("unrecognized effort"), "got: {msg}");
+        assert!(
+            msg.contains("effort `extreme` is not supported"),
+            "got: {msg}"
+        );
         assert!(
             msg.contains("low, medium, high, xhigh, max"),
             "应列出支持档位: {msg}"
@@ -2045,38 +2080,28 @@ mod tests {
             .expect("合法 effort 应通过")
             .additional_model_request_fields
             .expect("应下发 output_config");
-        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+        assert_eq!(fields["output_config"]["effort"], "xhigh");
     }
 
-    /// 白名单扩到 6 个模型后，档位枚举必须按**模型族**分组，而不是只认
-    /// 当初那一个 id。漏改的后果是新模型拿到错误的枚举：sonnet-5.5 会被误允许 `none`
-    /// （上游 400），terra/luna 会被误拒 `none`（客户端合法请求被拒）。
+    /// schema 缺失时按模型族兜底；Claude 无 `none`，GPT 有 `none`。
     #[test]
-    fn effort_tiers_are_grouped_by_model_family() {
-        use crate::model::allowlist::{
-            MODEL_GPT_56_LUNA, MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_HAIKU_5_5,
-            MODEL_OPUS_5_5, MODEL_SONNET_5_5,
-        };
+    fn fallback_effort_levels_are_grouped_by_model_family() {
+        let claude = fallback_controls("claude-opus-5.5").effort.unwrap();
+        let claude_levels = claude.levels.as_ref().unwrap();
+        assert!(!claude_levels.iter().any(|level| level == "none"));
+        assert_eq!(claude_levels.len(), 5);
+        assert_eq!(claude.path, "output_config");
 
-        for model in [MODEL_OPUS_5_5, MODEL_SONNET_5_5, MODEL_HAIKU_5_5] {
-            let tiers = model_effort_tiers(model);
-            assert!(
-                !tiers.contains(&EffortTier::None),
-                "{model}（Claude 族）不能有 none 档"
-            );
-            assert_eq!(tiers.len(), 5, "{model} 应为五档");
-        }
-        for model in [MODEL_GPT_56_SOL, MODEL_GPT_56_TERRA, MODEL_GPT_56_LUNA] {
-            let tiers = model_effort_tiers(model);
-            assert!(
-                tiers.contains(&EffortTier::None),
-                "{model}（GPT 族）必须有 none 档"
-            );
-            assert_eq!(tiers.len(), 6, "{model} 应为六档");
-        }
+        let gpt = fallback_controls("gpt-5.6-sol").effort.unwrap();
+        let gpt_levels = gpt.levels.as_ref().unwrap();
+        assert!(gpt_levels.iter().any(|level| level == "none"));
+        assert_eq!(gpt_levels.len(), 6);
+        assert_eq!(gpt.path, "reasoning");
+
+        assert!(fallback_controls("glm-5").effort.is_none());
     }
 
-    /// 每个白名单模型的 effort 必须真的按族落到正确的字段路径。
+    /// 已知族的 fallback effort 必须真的按族落到正确的字段路径。
     ///
     /// Claude 族 → `output_config` + `thinking`（`reasoning` 必须 absent）；
     /// GPT 族 → 只有 `reasoning`（`output_config` / `thinking` 必须 absent，
@@ -2090,15 +2115,11 @@ mod tests {
                 .additional_model_request_fields
                 .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
             assert_eq!(
-                fields
-                    .output_config
-                    .expect("Claude 族应有 output_config")
-                    .effort,
-                "max",
+                fields["output_config"]["effort"], "max",
                 "{model}"
             );
             assert!(
-                fields.reasoning.is_none(),
+                fields.get("reasoning").is_none(),
                 "{model}（Claude 族）不能下发 reasoning"
             );
         }
@@ -2113,16 +2134,15 @@ mod tests {
                 .additional_model_request_fields
                 .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
             assert_eq!(
-                fields.reasoning.expect("GPT 族应有 reasoning").effort,
-                "none",
+                fields["reasoning"]["effort"], "none",
                 "{model} 的 none 档必须被接受"
             );
             assert!(
-                fields.output_config.is_none(),
+                fields.get("output_config").is_none(),
                 "{model}（GPT 族）不能下发 output_config"
             );
             assert!(
-                fields.thinking.is_none(),
+                fields.get("thinking").is_none(),
                 "{model}（GPT 族）不能下发 thinking"
             );
         }
@@ -2139,13 +2159,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{model} Messages 请求应转换成功: {e:?}"))
                 .additional_model_request_fields
                 .unwrap_or_else(|| panic!("{model} 应下发 additionalModelRequestFields"));
-            assert_eq!(
-                fields.reasoning.expect("GPT 族应下发 reasoning").effort,
-                "none",
-                "{model}"
-            );
-            assert!(fields.output_config.is_none(), "{model}");
-            assert!(fields.thinking.is_none(), "{model}");
+            assert_eq!(fields["reasoning"]["effort"], "none", "{model}");
+            assert!(fields.get("output_config").is_none(), "{model}");
+            assert!(fields.get("thinking").is_none(), "{model}");
         }
     }
 
@@ -2166,9 +2182,122 @@ mod tests {
         assert_eq!(get_context_window_size("gpt-5.6-terra"), 986_000);
         assert_eq!(get_context_window_size("gpt-5-6-terra"), 986_000);
         assert_eq!(get_context_window_size("gpt-5.6-luna"), 986_000);
-        // 白名单外 → 保守默认值（这条路径实际走不到，端点层已 400）
-        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 200_000);
+        // 已知族但能力表还没收到该模型时按族兜底；未知族用保守默认值。
+        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 1_000_000);
         assert_eq!(get_context_window_size("glm-5"), 200_000);
+    }
+
+    /// 动态能力表是进程级全局状态，两个会替换/清空它的测试必须串行。
+    fn catalog_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 动态能力表优先于按族兜底：窗口与 effort 枚举都取上游 schema。
+    #[test]
+    fn dynamic_catalog_drives_window_and_effort_enum() {
+        use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
+        let _guard = catalog_test_lock();
+
+        crate::model::catalog::replace_from_models(&[UpstreamModel {
+            model_id: "vendor-model-x".to_string(),
+            model_name: None,
+            description: None,
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(123_456),
+                max_output_tokens: None,
+            }),
+            additional_model_request_fields_schema: Some(Some(serde_json::json!({
+                "properties": {
+                    "future_config": {
+                        "properties": {
+                            "effort": { "enum": ["low", "high"], "default": "low" }
+                        }
+                    }
+                }
+            }))),
+        }]);
+
+        let mut req = minimal_request_with_effort("vendor-model-x", "high");
+        req.output_config = None;
+        req.effort = Some("high".to_string());
+        let fields = convert_request(&req)
+            .expect("schema 声明的路径应可用")
+            .additional_model_request_fields
+            .expect("应下发 schema 声明的字段");
+        assert_eq!(fields["future_config"]["effort"], "high");
+        assert_eq!(get_context_window_size("vendor-model-x"), 123_456);
+
+        // schema 声明的枚举也要成为硬边界。
+        let req = minimal_request_with_effort("vendor-model-x", "max");
+        let err = convert_request(&req).expect_err("schema 未声明的档位必须被拒绝");
+        assert!(format!("{err:?}").contains("low, high"), "got: {err:?}");
+
+        crate::model::catalog::clear();
+    }
+
+    /// schema 声明了 `effort` 但没有 `enum`：客户端显式档位必须原样下发，
+    /// 不能被当成「该模型没有 effort」静默丢掉。
+    #[test]
+    fn free_form_effort_schema_passes_client_value_through() {
+        use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
+        let _guard = catalog_test_lock();
+
+        crate::model::catalog::replace_from_models(&[UpstreamModel {
+            model_id: "free-form-model".to_string(),
+            model_name: None,
+            description: None,
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(100_000),
+                max_output_tokens: None,
+            }),
+            additional_model_request_fields_schema: Some(Some(serde_json::json!({
+                "properties": {
+                    "output_config": {
+                        "properties": {
+                            "effort": { "type": "string", "default": "high" }
+                        }
+                    }
+                }
+            }))),
+        }]);
+
+        let req = minimal_request_with_effort("free-form-model", "custom-tier");
+        let fields = convert_request(&req)
+            .expect("自由字符串声明应接受客户端值")
+            .additional_model_request_fields
+            .expect("应下发 schema 声明的字段");
+        assert_eq!(fields["output_config"]["effort"], "custom-tier");
+
+        crate::model::catalog::clear();
+    }
+
+    /// 上游显式 null 是「不接受附加字段」，不是「没提供信息」：不得再按族兜底。
+    #[test]
+    fn denied_schema_emits_no_additional_fields() {
+        use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
+        let _guard = catalog_test_lock();
+
+        crate::model::catalog::replace_from_models(&[UpstreamModel {
+            model_id: "claude-denied-test".to_string(),
+            model_name: None,
+            description: None,
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(500_000),
+                max_output_tokens: None,
+            }),
+            additional_model_request_fields_schema: Some(None),
+        }]);
+
+        let req = minimal_adaptive_thinking_request_with_effort("claude-denied-test", "max");
+        let fields = convert_request(&req).expect("普通请求仍应成功");
+        assert!(
+            fields.additional_model_request_fields.is_none(),
+            "显式 null 时不得按 claude- 前缀猜字段"
+        );
+        assert_eq!(get_context_window_size("claude-denied-test"), 500_000);
+
+        crate::model::catalog::clear();
     }
 
     // ---- Fix 3: 原生 thinking effort 下发拓宽 + budget 推导 ----

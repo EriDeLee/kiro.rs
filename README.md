@@ -6,17 +6,31 @@
 
 本分支的 schema 严格对齐 **[Vercel AI SDK](https://ai-sdk.dev)**（`@ai-sdk/anthropic` / `@ai-sdk/openai`）的实际线格式 —— 该 SDK 是当前 agent 客户端的事实标准，其线格式与官方 REST 规范存在差异之处一律以 SDK 抓包为准。
 
-本分支只服务 6 个白名单模型。`/v1/messages` 是通用入口，接受全部 6 个模型；`/v1/responses` 是 OpenAI 线格式适配器，只接受 GPT 族。客户端入口与上游模型族彼此独立。
+本分支的模型池**永远从上游动态获取**：每个凭据的 `ListAvailableModels` 返回什么，
+就并入该凭据所属分组的池子；`GET /v1/models` 返回当前可用凭据的并集，不维护静态白名单。
+`/v1/messages` 是通用入口，接受池内全部模型；`/v1/responses` 是 OpenAI 线格式适配器，
+接受除 Claude 外的全部模型（Claude 的 Responses 输出语义未实测）。
 
 | 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | `claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `output_config.effort` |
-| `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
+| `POST /v1/messages` | 动态池全部模型 | `output_config.effort` |
+| `POST /v1/responses` | 动态池中除 Claude 外的全部模型 | `reasoning.effort` |
 
-上游推理字段仍按模型族严格分流：Messages 入口收到 GPT 的 `output_config.effort` 后会转换为
-Kiro 的 `reasoning.effort`；不会把 `output_config` / `thinking` 原样下发给 GPT，否则上游会 400。
-白名单是穷举的：上游账号里的 `claude-sonnet-4.6`、
-`claude-opus-4.8`、`glm-5`、`auto` 等一律 400，不做家族/版本号模糊推断。
+推理字段路径、effort 枚举、`thinking` 枚举都取自该模型自己的
+`additionalModelRequestFieldsSchema`：Messages 入口收到非 Claude 模型的
+`output_config.effort` 后，会按 schema 落到 `reasoning.effort` 或其它声明路径；
+不会把模型没声明的字段硬塞给上游。schema 键缺失时才按 `claude-` / `gpt-` 前缀兜底；
+schema 显式 `null` 表示上游明确拒绝附加字段。
+
+**free 优先**：凭据按订阅标题分为 free / paid / unknown。同一个模型同时存在于
+free 和 paid 池时，只要 free 还有可用候选（未禁用、未冷却、额度未耗尽、RPM 未满）
+就绝不使用 paid；free 额度耗尽后才落到 paid。free 额度到 `nextDateReset` 自动恢复，
+付费额度耗尽仍等人工处理。
+
+池内集合来自各凭据的 `ListAvailableModels`。池已探知后，池外模型返回 400，并提示
+用 `GET /v1/models` 查询当前可用模型；只有冷启动/发现失败、还没有任何清单时，格式
+合法的模型 ID 才按原样放行，由上游判定。空串、超长、控制字符一律 400。池内集合是
+上游清单的实时投影，不是本地静态白名单。
 
 工程约定见 [AGENTS.md](AGENTS.md)
 
@@ -31,7 +45,7 @@ Kiro 的 `reasoning.effort`；不会把 `output_config` / `thinking` 原样下�
 | **历史推理真实回传**<br><sub>请求侧 `assistantResponseMessage.reasoningContent`</sub> | ✅ | ❌ 拼 `<thinking>` 进 content<sup>1</sup> | ❌ | ❌ 直接丢弃 |
 | **真 signature 透传** | ✅ | ✅ | ❌ | ❌ 一律占位符 |
 | **gpt-5.6 `reasoning.effort`** | ✅ | ❌ 塞进 `output_config`<sup>2</sup> | ❌ | ✅ |
-| **模型白名单 + 入口策略** | ✅ Messages 全模型；Responses 仅 GPT | ❌ 未知模型透传 | ❌ | ❌ |
+| **动态模型池 + 入口策略** | ✅ 上游并集；Messages 全收；Responses 拒 Claude | ❌ 静态白名单 | ❌ | ❌ |
 | **prompt cache 计量** | 已移除<sup>3</sup> | 本地伪造 | 本地伪造 | 本地伪造 |
 | **静默降级** | 全部移除<sup>4</sup> | 存在 | 存在 | 存在 |
 | **不改写客户端提示词** | ✅ 零注入<sup>5</sup> | ❌ 5 类注入 | ❌ 3 类 | ❌ 2 类 |
@@ -156,10 +170,10 @@ cargo build --release
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/v1/messages` | Anthropic Messages，接受全部 5 个白名单模型 |
+| `POST` | `/v1/messages` | Anthropic Messages，接受动态池全部模型 |
 | `POST` | `/v1/messages/count_tokens` | Token 估算，覆盖 text / tool_use / tool_result / image / thinking |
-| `POST` | `/v1/responses` | OpenAI Responses，仅 `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` |
-| `GET` | `/v1/models` | 模型列表，仅列白名单内的 5 个 |
+| `POST` | `/v1/responses` | OpenAI Responses，接受动态池中除 Claude 外的全部模型 |
+| `GET` | `/v1/models` | 动态模型列表，返回当前可用凭据的并集 |
 | — | `/api/admin/*` | Admin API（57 条路由 / 70 个方法端点，需 `adminApiKey`） |
 | — | `/admin` | Admin Web UI |
 
@@ -170,7 +184,7 @@ CLI 请求日志包含 `api_endpoint=messages|responses` 与 `api_path`。Admin 
 ## 开发
 
 ```bash
-cargo test --release                      # 后端测试（506 个）
+cargo test --release                      # 后端测试（582 个）
 cargo build --release                     # release 构建
 RUST_LOG=kiro_rs=debug ./kiro-rs ...      # debug 日志
 cd admin-ui && bun run build              # 前端

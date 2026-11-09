@@ -143,16 +143,17 @@ pub async fn post_responses(
         "Received POST /v1/responses request"
     );
 
-    // 0. 模型白名单 + 入口策略校验。Responses 适配器只服务 GPT 组；Claude 模型
-    //    使用 /v1/messages。上游推理字段路径另由 converter 按模型族决定。
-    if let Err(rejected) = crate::model::allowlist::resolve(
+    // 0. 入口策略：Responses 适配器只拒绝 Claude（输出语义只实测过 GPT 族）。
+    //    其它模型（含动态池里的未知族）都放行，具体推理字段由模型自己的
+    //    additionalModelRequestFieldsSchema 决定。
+    if let Err(rejected) = crate::model::policy::reject_for_endpoint(
         &model,
-        crate::model::allowlist::ApiEndpoint::Responses,
+        crate::model::policy::ApiEndpoint::Responses,
     ) {
         return responses_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            &rejected.message(&model),
+            &rejected.message(),
         );
     }
 
@@ -169,7 +170,7 @@ pub async fn post_responses(
         State(state),
         Extension(key_ctx),
         Some(Extension(ForwardContext {
-            endpoint: crate::model::allowlist::ApiEndpoint::Responses,
+            endpoint: crate::model::policy::ApiEndpoint::Responses,
             external_stream: want_stream,
         })),
         Json(anthropic_req),
@@ -324,9 +325,10 @@ fn responses_to_anthropic(
     let tools = Some(tool_list);
     let tool_choice = req.tool_choice.as_ref().and_then(convert_tool_choice);
     // OpenAI Responses 的 `reasoning.effort` 原样带下去。放进 MessagesRequest 的顶层
-    // `effort` 字段后，converter 会依据模型把它落到 gpt-5.6-sol 的
-    // `additionalModelRequestFields.reasoning.effort`（**不是** output_config——
-    // 后者会被上游以 400 REQUEST_BODY_INVALID 拒绝）。
+    // `effort` 字段后，converter 按该模型自己的 schema 决定落到哪条路径：GPT 族是
+    // `additionalModelRequestFields.reasoning.effort`，声明了 `output_config` 的模型
+    // 则是 `output_config.effort`。入口不参与路径判断；把字段写给不声明它的模型
+    // 才会被上游以 400 REQUEST_BODY_INVALID 拒绝。
     let effort = req
         .reasoning
         .and_then(|r| r.effort)

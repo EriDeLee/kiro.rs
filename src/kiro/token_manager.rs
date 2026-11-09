@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{ModelNotInPoolError, UpstreamRateLimitError};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
@@ -30,6 +30,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::model::policy;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -870,6 +871,79 @@ pub(crate) async fn set_user_preference(
 // 多凭据 Token 管理器
 // ============================================================================
 
+/// 凭据的订阅层级。只用于调度顺序：free 优先，付费兜底，未知最后。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialTier {
+    Free,
+    Paid,
+    Unknown,
+}
+
+impl CredentialTier {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Free => 0,
+            Self::Paid => 1,
+            Self::Unknown => 2,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Paid => "paid",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// 由订阅标题推断层级。
+///
+/// 只有标题明确含 `FREE` 才算 free；有非空标题的其它值一律 paid；
+/// 标题缺失或为空 → unknown（最后才用）。
+///
+/// 与 Admin 面板的 `subscription_type_from_title` **只共享「含 FREE ⇒ free」这一条**：
+/// Admin 那侧把缺失/无法识别的标题兜底成 `Free`（展示用），这里必须兜底成
+/// `Unknown` / `Paid` —— 调度不能让未知层级抢在 free 前面用，也不能把付费账号
+/// 当成 free 优先。
+fn tier_from_title(title: Option<&str>) -> CredentialTier {
+    let Some(title) = title else {
+        return CredentialTier::Unknown;
+    };
+    let title = title.trim();
+    if title.is_empty() {
+        return CredentialTier::Unknown;
+    }
+    if title.to_uppercase().contains("FREE") {
+        CredentialTier::Free
+    } else {
+        CredentialTier::Paid
+    }
+}
+
+/// 最近一次 `getUsageLimits` 快照。用于在 free 额度耗尽时提前改走付费，
+/// 不依赖「先打一次上游拿 402」。
+#[derive(Debug, Clone)]
+struct QuotaSnapshot {
+    current_usage: f64,
+    usage_limit: f64,
+    /// 上游 nextDateReset（Unix 秒）；缺失时只能靠下一次快照或人工重置恢复。
+    next_reset_at: Option<f64>,
+}
+
+impl QuotaSnapshot {
+    /// 额度是否已耗尽。重置时间已过则视为未耗尽，等下一次快照刷新。
+    fn is_exhausted(&self, now_ts: f64) -> bool {
+        if self.usage_limit <= 0.0 || self.current_usage < self.usage_limit {
+            return false;
+        }
+        match self.next_reset_at {
+            Some(reset) if reset <= now_ts => false,
+            _ => true,
+        }
+    }
+}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -910,6 +984,9 @@ struct CredentialEntry {
     last_self_heal_at: Option<DateTime<Utc>>,
     /// 当前连续自愈轮次对应的模型；None 表示 MCP/无模型请求。
     self_heal_model: Option<String>,
+    /// 最近一次 `getUsageLimits` 的额度快照。不持久化：重启后由 Admin
+    /// 的余额刷新任务重新填充；在此之前仍有 402 兜底。
+    quota_snapshot: Option<QuotaSnapshot>,
 }
 
 impl CredentialEntry {
@@ -917,15 +994,41 @@ impl CredentialEntry {
     ///
     /// 注意 RPM 窗口一并清零：调用方（Admin 重置/启用、IdC 重登录换号）语义上都是
     /// 「这个凭据重新开始」，保留旧的分钟内计数会让刚恢复的凭据立刻又被限住。
+    /// 这是**手动**路径，累计失败数一并归零；自动恢复走 [`Self::reset_runtime_health`]。
     fn reset_health(&mut self) {
-        self.failure_count = 0;
+        self.reset_runtime_health();
         self.total_failure_count = 0;
+    }
+
+    /// 自动恢复用：清空运行态，但保留 `total_failure_count`。
+    ///
+    /// `total_failure_count` 的契约是「只增不减，仅手动重置失败计数时归零」，
+    /// 额度到点自动复活不是人工操作，不能顺手抹掉排查历史。
+    fn reset_runtime_health(&mut self) {
+        self.failure_count = 0;
         self.refresh_failure_count = 0;
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
         self.rpm_window.clear();
+        self.quota_snapshot = None;
         self.clear_self_heal_streak();
+    }
+
+    fn tier(&self) -> CredentialTier {
+        tier_from_title(self.credentials.subscription_title.as_deref())
+    }
+
+    /// 主动快照判定额度是否耗尽。只对 free 生效：
+    /// paid 账号可能开启了超额（overage），`currentUsage >= usageLimit` 不代表不可用；
+    /// paid 的额度边界仍由上游 402 决定。
+    fn quota_exhausted(&self) -> bool {
+        if self.tier() != CredentialTier::Free {
+            return false;
+        }
+        self.quota_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.is_exhausted(Utc::now().timestamp() as f64)
+        })
     }
 }
 
@@ -1191,6 +1294,9 @@ pub struct MultiTokenManager {
     model_cache_generations: Mutex<HashMap<u64, u64>>,
     /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
     model_cache_epoch: AtomicU64,
+    /// 客户端请求了能力表里没有的模型时，后台全量重探的节流时刻。
+    /// 新模型/缓存未命中不应每个请求都打一轮 `ListAvailableModels`。
+    catalog_miss_refresh_at: Mutex<Option<Instant>>,
     /// 指向自身的弱引用，由 [`Self::install_self_ref`] 在 `Arc` 建成后装入。
     ///
     /// 唯一用途：让只持有 `&self` 的方法（`update_credential`、
@@ -1358,6 +1464,7 @@ impl MultiTokenManager {
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
                     self_heal_model: cred.self_heal_model.clone(),
+                    quota_snapshot: None,
                 }
             })
             .collect();
@@ -1437,6 +1544,7 @@ impl MultiTokenManager {
             model_cache: Mutex::new(HashMap::new()),
             model_refresh_locks: Mutex::new(HashMap::new()),
             model_refresh_semaphore: Semaphore::new(4),
+            catalog_miss_refresh_at: Mutex::new(None),
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
             self_ref: OnceLock::new(),
@@ -1533,9 +1641,27 @@ impl MultiTokenManager {
     }
 
     fn invalidate_model_cache(&self, id: u64) {
-        let mut generations = self.model_cache_generations.lock();
-        *generations.entry(id).or_insert(0) += 1;
-        self.model_cache.lock().remove(&id);
+        {
+            let mut generations = self.model_cache_generations.lock();
+            *generations.entry(id).or_insert(0) += 1;
+            self.model_cache.lock().remove(&id);
+        }
+        self.rebuild_model_capabilities();
+    }
+
+    /// 用当前所有凭据的模型缓存重建全局能力表。
+    ///
+    /// 必须整体替换而不是只追加：删除凭据或上游收缩清单后，旧模型不能继续
+    /// 留在能力表里。调用点都在 `model_cache` 锁释放之后。
+    fn rebuild_model_capabilities(&self) {
+        let models: Vec<UpstreamModel> = {
+            let cache = self.model_cache.lock();
+            cache
+                .values()
+                .flat_map(|entry| entry.response.models.iter().cloned())
+                .collect()
+        };
+        crate::model::catalog::replace_from_models(&models);
     }
 
     /// 凭据信息变了（但凭据还在）：清掉旧清单并立刻后台重探一次。
@@ -1587,6 +1713,14 @@ impl MultiTokenManager {
     fn invalidate_all_model_caches(&self) {
         self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.model_cache.lock().clear();
+        self.rebuild_model_capabilities();
+
+        // 只补探当前可用的凭据：禁用/封禁/额度耗尽的账号不该因为管理员改代理
+        // 再被上游打一轮。它们重新启用后由定时刷新补探。
+        let ids = self.available_model_credential_ids(None);
+        for id in ids {
+            self.spawn_model_cache_probe_for(id, "模型缓存整体失效后重建");
+        }
     }
 
     fn model_refresh_lock(&self, id: u64) -> Arc<TokioMutex<()>> {
@@ -1605,16 +1739,42 @@ impl MultiTokenManager {
         let Some(entry) = cache.get(&id) else {
             return CachedModelSupport::Unknown;
         };
-        if entry
-            .response
-            .models
-            .iter()
-            .any(|available| available.model_id.eq_ignore_ascii_case(model))
+        if policy::match_model_id(
+            model,
+            entry.response.models.iter().map(|item| item.model_id.as_str()),
+        )
+        .is_some()
         {
             CachedModelSupport::Confirmed
         } else {
             CachedModelSupport::Unsupported
         }
+    }
+
+    /// 当前分组的模型池是否**明确**不含该模型。
+    ///
+    /// 只认已探知的清单：只要有一份清单包含它，或某个凭据还没有清单
+    /// （`Unknown`，冷启动 / 探测失败），就不能断言「池里没有」，返回 `false`。
+    /// 这条判据用于把「池外模型」和「凭据全都不可用」分成两种错误。
+    fn pool_lacks_model(
+        &self,
+        entries: &[CredentialEntry],
+        model: &str,
+        group: Option<&str>,
+    ) -> bool {
+        let mut saw_unsupported = false;
+        for entry in entries
+            .iter()
+            .filter(|entry| group_matches(&entry.credentials.groups, group))
+        {
+            match self.cached_model_support(entry.id, Some(model)) {
+                CachedModelSupport::Confirmed => return false,
+                CachedModelSupport::Unsupported => saw_unsupported = true,
+                // 还没有清单：保持冷启动放行语义，不能据此 400。
+                CachedModelSupport::Unknown => return false,
+            }
+        }
+        saw_unsupported
     }
 
     async fn refresh_model_cache_for(
@@ -1648,19 +1808,22 @@ impl MultiTokenManager {
             get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
                 .await?;
 
-        let generations = self.model_cache_generations.lock();
-        if generation == generations.get(&id).copied().unwrap_or(0) {
-            let mut cache = self.model_cache.lock();
-            if epoch == self.model_cache_epoch.load(Ordering::Relaxed) {
-                cache.insert(
-                    id,
-                    ModelCacheEntry {
-                        response: response.clone(),
-                        refreshed_at: Instant::now(),
-                    },
-                );
+        {
+            let generations = self.model_cache_generations.lock();
+            if generation == generations.get(&id).copied().unwrap_or(0) {
+                let mut cache = self.model_cache.lock();
+                if epoch == self.model_cache_epoch.load(Ordering::Relaxed) {
+                    cache.insert(
+                        id,
+                        ModelCacheEntry {
+                            response: response.clone(),
+                            refreshed_at: Instant::now(),
+                        },
+                    );
+                }
             }
         }
+        self.rebuild_model_capabilities();
         Ok(response)
     }
 
@@ -1686,6 +1849,7 @@ impl MultiTokenManager {
     }
 
     fn available_model_credential_ids(&self, group: Option<&str>) -> Vec<u64> {
+        self.recover_expired_free_quota();
         let now = Instant::now();
         self.entries
             .lock()
@@ -1696,6 +1860,7 @@ impl MultiTokenManager {
                         .throttled_until
                         .map(|until| until > now)
                         .unwrap_or(false)
+                    && !entry.quota_exhausted()
                     && group_matches(&entry.credentials.groups, group)
             })
             .map(|entry| entry.id)
@@ -1758,6 +1923,69 @@ impl MultiTokenManager {
         });
     }
 
+    /// 按 `model_cache_ttl_secs` 周期刷新所有可用凭据的模型清单。
+    ///
+    /// 数据面选号只读缓存、不看 TTL，所以没有这个循环时，池子会停在最后一次
+    /// 刷新（启动 / `GET /v1/models` / Admin / 凭据变更）。上游后来新增或收缩的
+    /// 模型必须靠这里自动同步，否则只能重启进程才生效。
+    ///
+    /// 只刷可用凭据（`available_model_credential_ids` 已排除禁用 / 冷却 / 额度
+    /// 耗尽的账号），避免为了补清单去反复打已停用的账号。间隔下限 60 秒，
+    /// 防止把上游打成扫描器；`force = true` 才能绕过 TTL 判定真正重拉。
+    pub fn start_model_cache_refresher(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let interval = StdDuration::from_secs(manager.config.model_cache_ttl_secs.max(60));
+                tokio::time::sleep(interval).await;
+
+                let ids = manager.available_model_credential_ids(None);
+                if ids.is_empty() {
+                    tracing::debug!("模型清单定时刷新跳过：没有可用凭据");
+                    continue;
+                }
+
+                let total = ids.len();
+                let mut succeeded = 0usize;
+                for id in ids {
+                    match manager.refresh_model_cache_for(id, true).await {
+                        Ok(_) => succeeded += 1,
+                        Err(error) => {
+                            tracing::warn!("凭据 #{} 模型清单定时刷新失败: {}", id, error)
+                        }
+                    }
+                }
+                tracing::info!("模型清单定时刷新完成：成功 {}/{}", succeeded, total);
+            }
+        });
+    }
+
+    /// 客户端请求了能力表里没有的模型时，后台重探一次该分组的模型清单。
+    ///
+    /// 不改变本次请求的结论：池已探知就是 400，没有清单（冷启动）才放行。
+    /// 重探是为了让池子和 schema 尽快跟上上游，下一次请求（或客户端重试）能命中。
+    /// 全局 60 秒节流，避免未知模型请求把上游打成扫描器。
+    pub fn refresh_models_for_group_in_background(self: &Arc<Self>, group: Option<&str>) {
+        {
+            let mut last = self.catalog_miss_refresh_at.lock();
+            if last.is_some_and(|at| at.elapsed() < StdDuration::from_secs(60)) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+
+        let manager = Arc::clone(self);
+        let group = group.map(str::to_string);
+        tokio::spawn(async move {
+            let ids = manager.available_model_credential_ids(group.as_deref());
+            for id in ids {
+                if let Err(error) = manager.refresh_model_cache_for(id, true).await {
+                    tracing::debug!("能力表未命中后重探凭据 #{} 失败: {}", id, error);
+                }
+            }
+        });
+    }
+
     /// 装入指向自身的弱引用，让 `&self` 方法也能派后台重探任务。
     ///
     /// 必须在 `Arc::new(manager)` 之后调用一次（`main.rs` 与 `start_model_cache_warmer`
@@ -1799,13 +2027,66 @@ impl MultiTokenManager {
             .count()
     }
 
-    /// 获取可用凭据数量
+    /// 到重置时间后自动恢复 free 额度耗尽的凭据。
+    ///
+    /// 只处理 `QuotaExceeded` + `Free` + 快照里有 `nextDateReset` 且已到点的情况。
+    /// 付费额度耗尽仍保持禁用等人工处理。缺少重置时间时不做猜测，等 Admin 的
+    /// 余额刷新拿到新快照或人工重置。
+    fn recover_expired_free_quota(&self) -> bool {
+        let now_ts = Utc::now().timestamp() as f64;
+        let mut recovered = Vec::new();
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if entry.disabled_reason != Some(DisabledReason::QuotaExceeded)
+                    || entry.tier() != CredentialTier::Free
+                {
+                    continue;
+                }
+                let Some(reset_at) = entry
+                    .quota_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.next_reset_at)
+                else {
+                    continue;
+                };
+                if reset_at > now_ts {
+                    continue;
+                }
+                entry.reset_runtime_health();
+                recovered.push(entry.id);
+            }
+        }
+
+        if recovered.is_empty() {
+            return false;
+        }
+
+        tracing::info!(
+            recovered = ?recovered,
+            "free 额度已到重置时间，自动恢复并重新参与 free 优先调度"
+        );
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("free 额度自动恢复后持久化失败: {}", error);
+        }
+        true
+    }
+
+    /// 获取可用凭据数量。
+    ///
+    /// 这里也先做一次额度重置恢复：Admin 面板与 `/v1/models` 都读这个数，
+    /// 不能让已经到重置时间的 free 账号继续显示为不可用。
     pub fn available_count(&self) -> usize {
+        self.recover_expired_free_quota();
         let now = Instant::now();
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !e.quota_exhausted()
+            })
             .count()
     }
 
@@ -1821,6 +2102,7 @@ impl MultiTokenManager {
                 .throttled_until
                 .map(|until| until > now)
                 .unwrap_or(false)
+            && !entry.quota_exhausted()
             && !self.rpm_exceeded(entry, now)
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
@@ -1877,6 +2159,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
+                && !entry.quota_exhausted()
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
@@ -1970,13 +2253,15 @@ impl MultiTokenManager {
             .any(|entry| self.entry_available_for_request(entry, model, group, now))
     }
 
-    /// 根据负载均衡模式选择下一个凭据
+    /// 根据负载均衡模式选择下一个凭据。
     ///
+    /// 第一排序键永远是订阅层级：**只要还有 free 候选，就绝不用付费**。
+    /// 只有 free 侧因额度耗尽、禁用、冷却、RPM 打满或该模型不在其清单里而
+    /// 完全没有候选时，才落到 paid。未知层级最后用。
+    ///
+    /// 同一层级内：
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - balanced 模式：在可用凭据中均匀随机
     fn select_next_credential(
         &self,
         model: Option<&str>,
@@ -1985,7 +2270,6 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let now = Instant::now();
 
-        // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
             .filter_map(|e| {
@@ -1997,16 +2281,19 @@ impl MultiTokenManager {
             })
             .collect();
 
-        if available.is_empty() {
-            return None;
-        }
+        let best_tier = available.iter().map(|(e, _)| e.tier().rank()).min()?;
+        let available: Vec<_> = available
+            .into_iter()
+            .filter(|(e, _)| e.tier().rank() == best_tier)
+            .collect();
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
             "balanced" => {
-                // 均匀随机：候选已排除禁用、冷却、RPM 打满、分组不匹配与「缓存明确不支持」。
+                // 均匀随机：候选已排除禁用、冷却、额度耗尽、RPM 打满、分组不匹配
+                // 与「缓存明确不支持」，并且已经收敛到最小订阅层级。
                 //
                 // 不再按「清单探过的优先 + 成功次数最少」排序。那两个排序键都会饿死凭据：
                 // 清单没探到的排在已探到的后面，只要还有一个已探到的可用，它就永远轮不到；
@@ -2017,7 +2304,7 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
+                // priority 模式（默认）：同层级内选择优先级最高的
                 let (entry, _) = available.iter().min_by_key(|(e, support)| {
                     let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
                     (discovery_rank, e.credentials.priority)
@@ -2036,7 +2323,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据；同层内 free 优先
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
@@ -2059,6 +2346,7 @@ impl MultiTokenManager {
         group: Option<&str>,
         update_current: bool,
     ) -> anyhow::Result<(CallContext, bool)> {
+        self.recover_expired_free_quota();
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -2083,11 +2371,17 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     let now = Instant::now();
+
+                    // 粘性 current 只能在本层级内复用：current 是付费而 free 还有候选时，
+                    // 必须重新选 free，不能让「当前凭据」绕过 free 优先。
+                    let best_tier = entries
+                        .iter()
+                        .filter(|e| self.entry_available_for_request(e, model, group, now))
+                        .map(|e| e.tier().rank())
+                        .min();
                     let confirmed_available = entries.iter().any(|e| {
-                        !e.disabled
-                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                            && !self.rpm_exceeded(e, now)
-                            && credential_matches_request(&e.credentials, model, group)
+                        Some(e.tier().rank()) == best_tier
+                            && self.entry_available_for_request(e, model, group, now)
                             && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
                     });
@@ -2096,10 +2390,8 @@ impl MultiTokenManager {
                         .find(|e| {
                             let model_support = self.cached_model_support(e.id, model);
                             e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !self.rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
+                                && Some(e.tier().rank()) == best_tier
+                                && self.entry_available_for_request(e, model, group, now)
                                 && model_support != CachedModelSupport::Unsupported
                                 && (!confirmed_available
                                     || model_support == CachedModelSupport::Confirmed)
@@ -2132,6 +2424,13 @@ impl MultiTokenManager {
                         {
                             // 标成本地限流：trace 与日志里不能再算成上游 429。
                             return Err(UpstreamRateLimitError::local_rpm_limit(retry_after).into());
+                        }
+                        // 池已探知、且没有任何一份清单包含这个模型：这是客户端选错了
+                        // 模型，不是上游故障。本地 400 并停止重试，别报成「所有凭据均已禁用」。
+                        if let Some(requested) = model
+                            && self.pool_lacks_model(&entries, requested, group)
+                        {
+                            return Err(ModelNotInPoolError::new(requested).into());
                         }
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
@@ -2974,6 +3273,17 @@ impl MultiTokenManager {
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.clear_self_heal_streak();
+            // 402 是「这一刻已耗尽」的直接证据。保留已有的 nextDateReset，
+            // 没有就等 Admin 的余额刷新补上；free 到点会自动恢复。
+            let reset_at = entry
+                .quota_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.next_reset_at);
+            entry.quota_snapshot = Some(QuotaSnapshot {
+                current_usage: 1.0,
+                usage_limit: 1.0,
+                next_reset_at: reset_at,
+            });
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             entry.total_failure_count += 1;
@@ -2983,17 +3293,31 @@ impl MultiTokenManager {
                 id
             );
 
+            let now = Instant::now();
+            let best_tier = entries
+                .iter()
+                .filter(|entry| self.entry_available_for_request(entry, model, group, now))
+                .map(|entry| entry.tier().rank())
+                .min();
             if let Some(next) = entries
                 .iter()
-                .filter(|entry| {
-                    self.entry_available_for_request(entry, model, group, Instant::now())
+                .filter(|entry| Some(entry.tier().rank()) == best_tier)
+                .filter(|entry| self.entry_available_for_request(entry, model, group, now))
+                .min_by_key(|e| {
+                    (
+                        usize::from(
+                            self.cached_model_support(e.id, model)
+                                != CachedModelSupport::Confirmed,
+                        ),
+                        e.credentials.priority,
+                    )
                 })
-                .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}（{}，优先级 {}）",
                     next.id,
+                    next.tier().as_str(),
                     next.credentials.priority
                 );
                 true
@@ -3186,12 +3510,17 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        self.recover_expired_free_quota();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !e.quota_exhausted()
+            })
             .count();
 
         ManagerSnapshot {
@@ -3265,24 +3594,33 @@ impl MultiTokenManager {
 
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
-        {
+        let was_disabled = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let was_disabled = entry.disabled;
             entry.disabled = disabled;
             if !disabled {
-                // 启用时重置失败计数
+                // 启用时重置失败计数与旧额度快照：人工启用语义是「重新开始」，
+                // 下一次 Admin 余额刷新会用新快照重新判定。
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
+                entry.quota_snapshot = None;
                 entry.clear_self_heal_streak();
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
                 entry.clear_self_heal_streak();
             }
+            was_disabled
+        };
+        // 禁用期间清单可能已被清空（例如管理员改全局代理时会整体失效），
+        // 重新启用时立刻补探一次，避免它带着 Unknown 被选中去请求不支持的模型。
+        if !disabled && was_disabled {
+            self.spawn_model_cache_probe_for(id, "凭据重新启用");
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -3325,13 +3663,7 @@ impl MultiTokenManager {
             entries
                 .iter()
                 .filter(|e| {
-                    !e.disabled
-                        && !e
-                            .throttled_until
-                            .map(|t| t > throttled_now)
-                            .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
-                        && self.cached_model_support(e.id, model) != CachedModelSupport::Unsupported
+                    self.entry_available_for_request(e, model, group, throttled_now)
                 })
                 .count()
         }
@@ -3465,6 +3797,8 @@ impl MultiTokenManager {
             }
             entry.reset_health();
         }
+        // 禁用期间清单可能已被清空，重新启用时立刻补探一次。
+        self.spawn_model_cache_probe_for(id, "凭据重置启用");
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -3581,6 +3915,41 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+
+        // 更新额度快照。free 账号在重置时间后即使仍处于 QuotaExceeded 禁用态，
+        // 也能靠这份新快照自动恢复；Admin 的余额刷新会覆盖已禁用的
+        // QuotaExceeded 凭据，正是为了走到这里。
+        let snapshot = QuotaSnapshot {
+            current_usage: usage_limits.current_usage(),
+            usage_limit: usage_limits.usage_limit(),
+            next_reset_at: usage_limits.next_date_reset.or_else(|| {
+                usage_limits
+                    .usage_breakdown_list
+                    .first()
+                    .and_then(|breakdown| breakdown.next_date_reset)
+            }),
+        };
+        let recovered_free = {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return Ok(usage_limits);
+            };
+            let exhausted = snapshot.is_exhausted(Utc::now().timestamp() as f64);
+            let recover = entry.disabled_reason == Some(DisabledReason::QuotaExceeded)
+                && entry.tier() == CredentialTier::Free
+                && !exhausted;
+            if recover {
+                entry.reset_runtime_health();
+            }
+            entry.quota_snapshot = Some(snapshot);
+            recover
+        };
+        if recovered_free {
+            tracing::info!("凭据 #{} free 额度已重置，自动恢复调度", id);
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("free 额度恢复后持久化失败: {}", error);
+            }
+        }
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -3949,6 +4318,7 @@ impl MultiTokenManager {
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
                 self_heal_model: None,
+                quota_snapshot: None,
             });
         }
 
@@ -6019,8 +6389,10 @@ mod tests {
 
         manager.report_success(1);
         let context = manager.acquire_context(None, None).await.unwrap();
-        assert_eq!(context.id, 2);
-        assert_eq!(manager.snapshot().current_id, 2);
+        // balanced 模式是均匀随机，不能断言具体命中哪一个；这里要锁的是
+        // 「切到 priority 后必须回到优先级 0 的凭据 #1」。
+        assert!(matches!(context.id, 1 | 2));
+        assert_eq!(manager.snapshot().current_id, context.id);
 
         manager
             .set_load_balancing_mode("priority".to_string())
@@ -6712,6 +7084,7 @@ mod tests {
                     model_name: None,
                     description: None,
                     token_limits: None,
+                    additional_model_request_fields_schema: None,
                 })
                 .collect(),
         }
@@ -6922,6 +7295,30 @@ mod tests {
         assert_eq!(context.id, 1);
     }
 
+    /// 池已探知、且没有任何清单包含该模型 → 本地拒绝，不能再报成
+    /// 「所有凭据均已禁用」。调用方据此映射 400 并停止重试。
+    #[tokio::test]
+    async fn out_of_pool_model_is_a_local_rejection() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("cached", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["glm-5"]);
+
+        let error = match manager.acquire_context(Some("glm-6"), None).await {
+            Ok(_) => panic!("池外模型必须本地拒绝"),
+            Err(error) => error,
+        };
+        let rejection = error
+            .downcast_ref::<crate::kiro::error::ModelNotInPoolError>()
+            .expect("必须是 ModelNotInPoolError");
+        assert_eq!(rejection.model(), "glm-6");
+    }
+
     #[tokio::test]
     async fn test_model_discovery_respects_group_and_reports_cold_start_failure() {
         let manager = MultiTokenManager::new(
@@ -6997,14 +7394,15 @@ mod tests {
         let mut free = grouped_cred("free", &[]);
         free.subscription_title = Some("KIRO FREE".to_string());
 
-        // 白名单全部 6 个模型都不因订阅档位被拦
+        // 订阅档位不参与匹配：free 账号也不会在选号阶段被模型名拦住。
         for model in [
-            crate::model::allowlist::MODEL_OPUS_5_5,
-            crate::model::allowlist::MODEL_SONNET_5_5,
-            crate::model::allowlist::MODEL_HAIKU_5_5,
-            crate::model::allowlist::MODEL_GPT_56_SOL,
-            crate::model::allowlist::MODEL_GPT_56_TERRA,
-            crate::model::allowlist::MODEL_GPT_56_LUNA,
+            "claude-opus-5.5",
+            "claude-sonnet-5.5",
+            "claude-haiku-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "glm-5",
         ] {
             assert!(
                 credential_matches_request(&free, Some(model), None),
@@ -7016,12 +7414,12 @@ mod tests {
         let bound = grouped_cred("bound", &["g1"]);
         assert!(credential_matches_request(
             &bound,
-            Some(crate::model::allowlist::MODEL_OPUS_5_5),
+            Some("claude-opus-5.5"),
             Some("g1")
         ));
         assert!(!credential_matches_request(
             &bound,
-            Some(crate::model::allowlist::MODEL_OPUS_5_5),
+            Some("claude-opus-5.5"),
             Some("g2")
         ));
     }
@@ -7066,6 +7464,267 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    fn free_cred(token: &str, priority: u32) -> KiroCredentials {
+        let mut cred = grouped_cred(token, &[]);
+        cred.priority = priority;
+        cred.subscription_title = Some("KIRO FREE".to_string());
+        cred
+    }
+
+    fn paid_cred(token: &str, priority: u32) -> KiroCredentials {
+        let mut cred = grouped_cred(token, &[]);
+        cred.priority = priority;
+        cred.subscription_title = Some("KIRO PRO".to_string());
+        cred
+    }
+
+    fn mark_quota_exhausted(
+        manager: &MultiTokenManager,
+        id: u64,
+        current_usage: f64,
+        usage_limit: f64,
+        next_reset_at: Option<f64>,
+    ) {
+        let mut entries = manager.entries.lock();
+        let entry = entries.iter_mut().find(|e| e.id == id).unwrap();
+        entry.quota_snapshot = Some(QuotaSnapshot {
+            current_usage,
+            usage_limit,
+            next_reset_at,
+        });
+    }
+
+    /// free 优先：付费凭据即使优先级更高，也不能抢走同时存在于两边的模型。
+    #[test]
+    fn free_is_preferred_over_higher_priority_paid() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["shared-model"]);
+        seed_model_cache(&manager, 2, &["shared-model"]);
+
+        let picked = manager
+            .select_next_credential(Some("shared-model"), None)
+            .map(|(id, _)| id);
+        assert_eq!(picked, Some(2), "free 必须优先于付费");
+    }
+
+    /// free 额度耗尽 → 付费兜底；重置时间已过 → free 重新优先。
+    #[test]
+    fn exhausted_free_falls_back_to_paid_and_recovers_at_reset() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["shared-model"]);
+        seed_model_cache(&manager, 2, &["shared-model"]);
+
+        let future = Utc::now().timestamp() as f64 + 3600.0;
+        mark_quota_exhausted(&manager, 2, 10.0, 10.0, Some(future));
+        assert_eq!(
+            manager
+                .select_next_credential(Some("shared-model"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "free 额度耗尽后应落到付费"
+        );
+
+        let past = Utc::now().timestamp() as f64 - 1.0;
+        mark_quota_exhausted(&manager, 2, 10.0, 10.0, Some(past));
+        assert_eq!(
+            manager
+                .select_next_credential(Some("shared-model"), None)
+                .map(|(id, _)| id),
+            Some(2),
+            "重置时间已过，free 应重新参与路由"
+        );
+    }
+
+    /// free 因额度以外的原因不可用（禁用/冷却/RPM）也允许切付费。
+    #[test]
+    fn unavailable_free_falls_back_to_paid() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["shared-model"]);
+        seed_model_cache(&manager, 2, &["shared-model"]);
+
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 2).unwrap().disabled = true;
+        }
+        assert_eq!(
+            manager
+                .select_next_credential(Some("shared-model"), None)
+                .map(|(id, _)| id),
+            Some(1),
+            "free 被禁用时应落到付费"
+        );
+    }
+
+    /// 付费专属模型直接用付费；free 专属模型在 free 耗尽后没有被误路由到付费。
+    #[test]
+    fn model_presence_still_filters_each_tier() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["paid-only"]);
+        seed_model_cache(&manager, 2, &["free-only"]);
+
+        assert_eq!(
+            manager
+                .select_next_credential(Some("paid-only"), None)
+                .map(|(id, _)| id),
+            Some(1)
+        );
+        assert_eq!(
+            manager
+                .select_next_credential(Some("free-only"), None)
+                .map(|(id, _)| id),
+            Some(2)
+        );
+
+        mark_quota_exhausted(&manager, 2, 1.0, 1.0, Some(f64::MAX));
+        assert!(
+            manager
+                .select_next_credential(Some("free-only"), None)
+                .is_none(),
+            "付费池没有这个模型时不能硬塞给付费"
+        );
+    }
+
+    /// 未知层级最后用：付费可用时，未知层级即使优先级更高也不抢先。
+    #[test]
+    fn unknown_tier_is_used_last() {
+        let mut unknown = grouped_cred("unknown", &[]);
+        unknown.priority = 0;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 100), unknown],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1),
+            "已知付费层级优先于未知层级"
+        );
+    }
+
+    /// 自动恢复只给 free；付费的 QuotaExceeded 保持禁用等人工。
+    #[test]
+    fn quota_reset_recovery_is_free_only() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let past = Utc::now().timestamp() as f64 - 1.0;
+        {
+            let mut entries = manager.entries.lock();
+            for entry in entries.iter_mut() {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.quota_snapshot = Some(QuotaSnapshot {
+                    current_usage: 1.0,
+                    usage_limit: 1.0,
+                    next_reset_at: Some(past),
+                });
+            }
+        }
+
+        assert!(manager.recover_expired_free_quota());
+        let entries = manager.entries.lock();
+        assert!(!entries.iter().find(|e| e.id == 2).unwrap().disabled, "free 应恢复");
+        assert!(entries.iter().find(|e| e.id == 1).unwrap().disabled, "paid 不应自动恢复");
+    }
+
+    /// 自动恢复不是人工重置：`total_failure_count` 的排查历史必须保留。
+    #[test]
+    fn auto_quota_recovery_preserves_total_failure_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let past = Utc::now().timestamp() as f64 - 1.0;
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.total_failure_count = 7;
+            entry.quota_snapshot = Some(QuotaSnapshot {
+                current_usage: 1.0,
+                usage_limit: 1.0,
+                next_reset_at: Some(past),
+            });
+        }
+
+        assert!(manager.recover_expired_free_quota());
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!entry.disabled, "free 应恢复");
+        assert_eq!(
+            entry.total_failure_count, 7,
+            "自动恢复不得抹掉累计失败数"
+        );
+    }
+
+    /// current_id 是粘性的，但不能让已经退到付费的请求永远停在付费：
+    /// free 额度恢复后，下一次请求必须重新选回 free。
+    #[tokio::test]
+    async fn sticky_current_does_not_block_free_after_quota_reset() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![paid_cred("paid", 0), free_cred("free", 100)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["shared-model"]);
+        seed_model_cache(&manager, 2, &["shared-model"]);
+
+        mark_quota_exhausted(&manager, 2, 1.0, 1.0, Some(f64::MAX));
+        let paid_context = manager.acquire_context(Some("shared-model"), None).await.unwrap();
+        assert_eq!(paid_context.id, 1, "free 耗尽时应先用付费");
+
+        // 模拟重置后的新快照：不再耗尽。
+        mark_quota_exhausted(&manager, 2, 0.0, 10.0, None);
+        let free_context = manager.acquire_context(Some("shared-model"), None).await.unwrap();
+        assert_eq!(free_context.id, 2, "free 恢复后不得被粘性的付费 current 挡住");
+        assert_eq!(manager.snapshot().current_id, 2);
     }
 
     /// 回归锁：优先级最高的 current_id 不得绕过**按模型的凭据过滤**。

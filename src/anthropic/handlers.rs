@@ -15,7 +15,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::ModelDiscoveryError;
-use crate::model::allowlist::ApiEndpoint;
+use crate::model::policy::ApiEndpoint;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -373,6 +373,22 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         return response;
     }
 
+    // 池外模型：本地拒绝，凭据没有问题，重试也不会变好。
+    if let Some(not_in_pool) = err.downcast_ref::<crate::kiro::error::ModelNotInPoolError>() {
+        tracing::warn!(error = %err, "请求的模型不在当前模型池内（本地拒绝，未发往上游）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!(
+                    "model `{}` is not in the current model pool. Call GET /v1/models to see the models this API key can use.",
+                    not_in_pool.model()
+                ),
+            )),
+        )
+            .into_response();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -470,6 +486,14 @@ fn infer_model_owner(model_id: &str) -> &'static str {
         || id.starts_with("o4-")
     {
         "openai"
+    } else if id.starts_with("deepseek-") {
+        "deepseek"
+    } else if id.starts_with("glm-") {
+        "zhipu"
+    } else if id.starts_with("qwen") {
+        "alibaba"
+    } else if id.starts_with("minimax-") {
+        "minimax"
     } else {
         "kiro"
     }
@@ -532,23 +556,16 @@ fn aggregate_available_models_inner(upstream_models: Vec<UpstreamModel>) -> Vec<
         models.insert(model.id.clone(), model);
     }
 
-    // 自定义别名最后写入，同名时其展示元数据优先于动态条目。
-
     models.into_values().collect()
 }
 
 /// 汇总可用模型清单。
 ///
-/// 只保留白名单内的模型：Claude 组（`claude-opus-5.5`、`claude-sonnet-5.5`）与 GPT 组
-///（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）。全部模型可走 `/v1/messages`，
-/// GPT 组也可走 `/v1/responses`；其余一律在请求阶段 400。若这里仍列出白名单外
-/// 的模型，客户端会看到一个「能选但一用就报错」
-/// 的假选项 —— 配置与实际行为不一致，是最容易自己踩的坑。
+/// 直接返回动态池的并集：模型清单由每个凭据的 `ListAvailableModels` 决定，
+/// 本仓库不再维护静态白名单。`/v1/messages` 接受池内全部模型；`/v1/responses`
+/// 只拒绝 Claude（输出语义只实测过 GPT 族），其余模型按池放行。
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     aggregate_available_models_inner(upstream_models)
-        .into_iter()
-        .filter(|m| crate::model::allowlist::normalize(&m.id).is_some())
-        .collect()
 }
 
 /// GET /v1/models
@@ -613,10 +630,8 @@ pub async fn get_models(
 /// `/v1/responses` 翻译后直接调用本函数并显式保留原始入口和外部 stream 标记。
 ///
 /// 客户端无法伪造它：axum 的 Extension 只来自路由层显式 `.layer()` 或调用方手动
-/// 传入，HTTP 头与请求体都进不了 request extensions。这一点现在比以前更吃重 ——
-/// `endpoint` 直接决定放行哪些模型（见下面的 `allowlist::resolve` 调用）。
-/// 退一步说，即便能伪造也只会收窄白名单（Responses 的允许集是 Messages 的子集），
-/// 不构成放宽。
+/// 传入，HTTP 头与请求体都进不了 request extensions。`endpoint` 只决定入口策略：
+/// `/v1/responses` 拒绝 Claude，其它模型两个入口都放行。
 #[derive(Clone, Copy)]
 pub(super) struct ForwardContext {
     pub endpoint: ApiEndpoint,
@@ -634,7 +649,7 @@ pub async fn post_messages(
         endpoint: ApiEndpoint::Messages,
         external_stream: payload.stream,
     });
-    // 模型名首尾空白不改变语义（白名单匹配本就 trim 后比较），但用量统计、trace 与
+    // 模型名首尾空白不改变语义（动态池匹配本就 trim 后比较），但用量统计、trace 与
     // 日志按原始字符串分组时，同一模型会裂成「claude-sonnet-5.5」与「claude-sonnet-5.5 」
     // 两行。入站统一去掉首尾空白；-thinking / -latest 等有语义的后缀原样保留。
     payload.model = payload.model.trim().to_string();
@@ -656,14 +671,17 @@ pub async fn post_messages(
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
-    // Messages 接受全部白名单模型；Responses 只接受 GPT。上游字段路径由 converter
-    // 按模型族决定，不由入口决定。
-    if let Err(rejected) = crate::model::allowlist::resolve(&payload.model, context.endpoint) {
+    // 入口策略：/v1/responses 拒绝 Claude；其它模型都放行。模型是否在池内不在这里
+    // 判断 —— 选号阶段按真实 ListAvailableModels 清单决定，池外模型返回 400；
+    // 冷启动还没有任何清单时按原样放行，由上游判定。
+    if let Err(rejected) =
+        crate::model::policy::reject_for_endpoint(&payload.model, context.endpoint)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                rejected.message(&payload.model),
+                rejected.message(),
             )),
         )
             .into_response();
@@ -675,6 +693,23 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置。
+    // 必须在动态 ID 规范化之前做：规范化会剥掉 -thinking 后缀。
+    override_thinking_from_model_name(&mut payload);
+    // 动态池里的真实 ID 优先。找不到时保留原样交给选号阶段：
+    // 池已探知且没有任何清单包含它 → 400；所有凭据都还没有清单（冷启动）→ 放行。
+    let model_in_catalog = match crate::model::catalog::canonical_id(&payload.model) {
+        Some(canonical) => {
+            if !canonical.eq_ignore_ascii_case(&payload.model) {
+                tracing::debug!(requested = %payload.model, canonical = %canonical, "模型名已按动态池规范化");
+                payload.model = canonical;
+            }
+            true
+        }
+        None => false,
+    };
+
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -693,8 +728,13 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    // 模型不在当前能力表里：本次请求仍按池校验（冷启动无清单放行，池外 400），
+    // 同时后台重探一次模型清单 —— 让池子和 schema 尽快跟上上游，重试就能命中。
+    if !model_in_catalog {
+        provider
+            .token_manager()
+            .refresh_models_for_group_in_background(key_ctx.group.as_deref());
+    }
 
     // 注意：这里曾有一条「纯 WebSearch 快速路径」——当 tools 恰好只有一个原生
     // web_search 时，直接由 `handle_websearch_request` 代答。它已删除，原因：
@@ -1648,12 +1688,11 @@ fn build_non_stream_content(
 
 /// 模型名带 `-thinking` 后缀时开启思考。
 ///
-/// 白名单接受 `claude-opus-5.5-thinking` 作为 `claude-opus-5.5` 的别名（`allowlist`
-/// 只校验不改写 `payload.model`，所以后缀在此仍可见）。
+/// 动态池接受 `claude-opus-5.5-thinking` 作为 `claude-opus-5.5` 的别名；后缀在
+/// 规范化之前仍可见，所以在这里先转成 thinking 配置。
 ///
-/// 上游 Claude 族只接受 `thinking.type = adaptive`，发 `enabled` 会 400；
-/// 档位交给 `converter` 的取值链决定（顶层 effort > output_config > 默认 high），
-/// 此处不写死 `output_config`，否则会覆盖客户端显式指定的档位。
+/// 具体 `thinking.type` 与档位由上游 schema 决定；此处只标记「客户端想要思考」，
+/// 不写死 `output_config`，否则会覆盖客户端显式指定的档位。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if !payload.model.to_lowercase().contains("thinking") {
         return;
@@ -2009,6 +2048,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// 池外模型是本地拒绝：必须 400，不能落进通用 502 让客户端反复重试。
+    #[test]
+    fn model_not_in_pool_maps_to_400() {
+        let error = crate::kiro::error::ModelNotInPoolError::new("glm-6");
+        let resp = map_provider_error(error.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn upstream_rate_limit_maps_to_429_with_retry_after() {
         let err = crate::kiro::error::UpstreamRateLimitError::new(Some("1800".to_string()));
@@ -2142,6 +2189,7 @@ mod tests {
             model_name: Some("Claude Opus 5".to_string()),
             description: None,
             token_limits: None,
+            additional_model_request_fields_schema: None,
         }]);
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
@@ -2216,6 +2264,7 @@ mod tests {
                     max_input_tokens: Some(200_000),
                     max_output_tokens: None,
                 }),
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "claude-opus-5.5".to_string(),
@@ -2225,6 +2274,7 @@ mod tests {
                     max_input_tokens: Some(1_000_000),
                     max_output_tokens: Some(32_000),
                 }),
+                additional_model_request_fields_schema: None,
             },
         ]);
 
@@ -2237,13 +2287,9 @@ mod tests {
         assert_eq!(models[0].context_window, 1_000_000);
     }
 
-    /// 回归锁：`/v1/models` 只能列出白名单内的模型。
-    ///
-    /// 上游动态发现会返回账号可用的全部模型，但本部署只服务白名单里的 5 个
-    /// （Claude 组 2 个 + GPT 组 3 个）。若把白名单外的模型也列出来，客户端会看到
-    /// 「能选但一用就 400」的假选项。
+    /// 回归锁：`/v1/models` 返回动态池全集，不做静态白名单过滤。
     #[test]
-    fn available_models_only_lists_allowlisted() {
+    fn available_models_lists_dynamic_pool() {
         let upstream = vec![
             UpstreamModel {
                 model_id: "claude-opus-5.5".to_string(),
@@ -2253,6 +2299,7 @@ mod tests {
                     max_input_tokens: Some(1_000_000),
                     max_output_tokens: Some(128_000),
                 }),
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "claude-sonnet-5.5".to_string(),
@@ -2262,12 +2309,14 @@ mod tests {
                     max_input_tokens: Some(1_000_000),
                     max_output_tokens: Some(64_000),
                 }),
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "gpt-5.6-sol".to_string(),
                 model_name: Some("GPT 5.6 Sol".to_string()),
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "gpt-5.6-terra".to_string(),
@@ -2277,63 +2326,66 @@ mod tests {
                     max_input_tokens: Some(986_000),
                     max_output_tokens: Some(128_000),
                 }),
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "gpt-5.6-luna".to_string(),
                 model_name: Some("GPT 5.6 Luna".to_string()),
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
-            // 以下都在白名单外，必须被过滤掉
             UpstreamModel {
                 model_id: "claude-opus-4.8".to_string(),
                 model_name: None,
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
-            // 相邻版本号：绝不能被误判成 claude-sonnet-5.5
             UpstreamModel {
                 model_id: "claude-sonnet-4.6".to_string(),
                 model_name: None,
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "gpt-5.6".to_string(),
                 model_name: None,
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
             UpstreamModel {
                 model_id: "deepseek-3.2".to_string(),
                 model_name: None,
                 description: None,
                 token_limits: None,
+                additional_model_request_fields_schema: None,
             },
         ];
 
         let models = aggregate_available_models(upstream);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        // BTreeMap 排序：claude-* 在 gpt-* 之前
         assert_eq!(
             ids,
             vec![
+                "claude-opus-4.8",
                 "claude-opus-5.5",
+                "claude-sonnet-4.6",
                 "claude-sonnet-5.5",
+                "deepseek-3.2",
+                "gpt-5.6",
                 "gpt-5.6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
             ]
         );
-        // sonnet-5 的输出上限是 64k，与 opus-5 的 128k 不同 —— 上游值必须原样透出，
-        // 不能被同族的另一个模型的值污染。
         let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5.5").unwrap();
         assert_eq!(sonnet.max_tokens, 64_000);
-        // 输入窗口同样来自上游 tokenLimits，而不是按族推断的常量。
         assert_eq!(sonnet.context_window, 1_000_000);
         let opus = models.iter().find(|m| m.id == "claude-opus-5.5").unwrap();
         assert_eq!(opus.max_tokens, 128_000);
-        // 上游没给 tokenLimits 的模型回退到按族计算的窗口。
         let luna = models.iter().find(|m| m.id == "gpt-5.6-luna").unwrap();
         assert_eq!(luna.context_window, 986_000);
         let terra = models.iter().find(|m| m.id == "gpt-5.6-terra").unwrap();

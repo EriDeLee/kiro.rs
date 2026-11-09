@@ -63,6 +63,36 @@ impl UpstreamRateLimitError {
     }
 }
 
+/// 请求的 model_id 不在当前分组的模型池内（本地拒绝，未发往上游）。
+///
+/// 与「所有凭据均已禁用」必须分开：凭据本身是健康的，只是没有任何一份已探知的
+/// `ListAvailableModels` 清单包含该 model_id。调用方要映射成 400 并停止重试 ——
+/// 当成上游 5xx 会让客户端反复重发，也掩盖了真正的原因。
+#[derive(Debug, Clone)]
+pub struct ModelNotInPoolError {
+    model: String,
+}
+
+impl std::fmt::Display for ModelNotInPoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model `{}` is not in the current model pool", self.model)
+    }
+}
+
+impl std::error::Error for ModelNotInPoolError {}
+
+impl ModelNotInPoolError {
+    pub(crate) fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
 fn normalize_retry_after(value: String) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -111,5 +141,15 @@ mod tests {
         let upstream = UpstreamRateLimitError::new(Some("42".to_string()));
         assert!(!upstream.is_local());
         assert_eq!(upstream.to_string(), "upstream rate limited");
+    }
+
+    #[test]
+    fn model_not_in_pool_is_a_local_rejection() {
+        let error = ModelNotInPoolError::new("glm-6");
+        assert_eq!(error.model(), "glm-6");
+        assert_eq!(
+            error.to_string(),
+            "model `glm-6` is not in the current model pool"
+        );
     }
 }

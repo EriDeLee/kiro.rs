@@ -189,13 +189,6 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
-    /// 自定义模型映射表。
-    ///
-    /// 每条把一个客户端模型别名映射到 Kiro 后端模型 ID 并附带元数据。默认空数组
-    /// （完全向后兼容）。**当前已忽略**，
-    /// 供 `map_model` / `get_context_window_size` / `/v1/models` 查询。
-    #[serde(default)]
-
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,

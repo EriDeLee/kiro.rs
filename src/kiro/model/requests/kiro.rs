@@ -35,72 +35,17 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
-    /// Additional model request fields (a real Kiro CLI wire field carrying control switches such as `output_config.effort`)
+    /// `additionalModelRequestFields` 原样下发。
     ///
-    /// Real wire sample (captured from real Kiro CLI traffic):
-    /// ```json
-    /// "additionalModelRequestFields": {
-    ///     "output_config": { "effort": "max" }
-    /// }
-    /// ```
-    /// 档位枚举按模型族而异，见 `converter::model_effort_tiers`：
-    /// Claude 族（claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）接受 low/medium/high/xhigh/max，
-    /// GPT 族（gpt-5.6-sol / -terra / -luna）额外接受 none。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
-}
-
-/// Top-level container for the AWS Q CodeWhisperer `additionalModelRequestFields`
-///
-/// Note: in the real wire format the inner `output_config` field is `snake_case`,
-/// unlike the outer `additionalModelRequestFields` (camelCase),
-/// so this struct **must not** inherit `rename_all = "camelCase"`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AdditionalModelRequestFields {
-    /// `thinking` 控制（仅 Claude 族接受：claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）。
+    /// 具体形状由每个模型自己的 `additionalModelRequestFieldsSchema` 决定：
+    /// 实测有 `output_config.effort` 与 `reasoning.effort` 两条路径，未来若上游
+    /// 声明了别的属性，也能按同一份 schema 原样构造。这里用 `Value` 而不是固定
+    /// 结构体，避免把新增字段路径写死。
     ///
-    /// 实测 schema：`type ∈ {adaptive, disabled}`（**没有 `enabled`**）、
-    /// `display ∈ {summarized, omitted}`，`display` 缺省为 `omitted`（吞掉思考文本）。
+    /// 注意内层属性名是 snake_case（`output_config`），外层键是 camelCase
+    /// （`additionalModelRequestFields`）；`Value` 不参与字段改名。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<KiroThinkingConfig>,
-    /// Claude 系的推理档位路径：`output_config.effort`。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_config: Option<KiroOutputConfig>,
-    /// GPT 系的推理档位路径：`reasoning.effort`。
-    ///
-    /// GPT 族的 schema 是 `additionalProperties:false` 且**只有** `reasoning`，
-    /// 向它下发 `output_config` / `max_tokens` / `thinking` 都会 400。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<KiroReasoningConfig>,
-}
-
-/// `thinking` 控制（Claude 族：claude-opus-5.5 / claude-sonnet-5.5 / claude-haiku-5.5）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KiroThinkingConfig {
-    #[serde(rename = "type")]
-    pub thinking_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
-}
-
-/// `reasoning` 控制（GPT 族：gpt-5.6-sol / -terra / -luna）。`effort` 额外支持 `none` 档。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KiroReasoningConfig {
-    pub effort: String,
-}
-
-/// The effort control field recognized by the AWS Q backend
-///
-/// 档位枚举按模型族而异：Claude 族为 low/medium/high/xhigh/max，
-/// GPT 族额外接受 none。不受支持的档位会在 converter 层直接报错，
-/// 不静默回落。
-///
-/// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
-/// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,
-/// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KiroOutputConfig {
-    pub effort: String,
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 #[cfg(test)]
 mod tests {
@@ -137,13 +82,9 @@ mod tests {
         // The wire format requires the outer key to be camelCase
         // (`additionalModelRequestFields`) while the inner key stays snake_case
         // (`output_config`), matching real Kiro CLI traffic.
-        let fields = AdditionalModelRequestFields {
-            thinking: None,
-            reasoning: None,
-            output_config: Some(KiroOutputConfig {
-                effort: "max".to_string(),
-            }),
-        };
+        let fields = serde_json::json!({
+            "output_config": { "effort": "max" }
+        });
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");
         assert!(

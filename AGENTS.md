@@ -17,30 +17,53 @@ Kiro / Amazon Q 后端  ←→  本项目  ←→  @ai-sdk/{anthropic,openai}  �
 
 ## 一、项目目标（硬边界）
 
-只服务 6 个白名单模型。客户端 API 入口与上游模型族必须解耦：
+**模型池永远从上游动态获取，不在本仓库维护静态白名单。** 每个凭据的
+`ListAvailableModels` 返回什么，就把这些模型并入该凭据所属分组的池子；
+`GET /v1/models` 返回当前可用凭据的并集。模型池不是按客户端写死的配置，
+而是上游订阅状态的实时投影：后台按 `model_cache_ttl_secs`（默认 3600 秒，下限
+60 秒）定时重探所有可用凭据，数据面不会长期停留在启动时的旧清单。
+
+客户端 API 入口与上游模型族必须解耦：
 
 | 端点 | 允许的模型 | 客户端推理档位字段 |
 |---|---|---|
-| `POST /v1/messages` | 全部 6 个白名单模型 | `output_config.effort` |
-| `POST /v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` | `reasoning.effort` |
+| `POST /v1/messages` | 动态池里的全部模型 | `output_config.effort` |
+| `POST /v1/responses` | 动态池里除 Claude 外的全部模型 | `reasoning.effort` |
 
-同族内推理字段路径与请求体形状完全一致，扩充模型只是多几个 id，对本项目无新增成本；
-跨族则根本不同。字段路径、上下文窗口、effort 枚举一律按**族**分流
-（`allowlist::family_for_model`），禁止用 API 入口判断上游字段，也禁止再逐个模型
-`eq_ignore_ascii_case` —— 那种写法
-在加模型时必然漏改，漏改的后果是静默走错字段路径。
+上游 `additionalModelRequestFields` 的字段路径、effort 枚举、`thinking` 枚举
+一律取自该模型自己的 `additionalModelRequestFieldsSchema`（`model::catalog`）。
+禁止写死模型名，禁止按 API 入口判断上游字段，也禁止用相邻版本或同族枚举推断。
+schema 键缺失时才按 `claude-` / `gpt-` 前缀兜底；schema 显式 `null` 表示上游
+明确拒绝附加字段，不得再猜。字段路径即使是未来新增的（不叫 `output_config`
+也不叫 `reasoning`），也按 schema 里声明的属性名原样下发。
 
-Messages 入口收到 GPT 的 `output_config.effort` 后，converter 必须按 GPT 模型族将其转换为
-上游 `reasoning.effort`；Responses 则先把 `reasoning.effort` 归一到同一内部请求再复用执行链路。
+**free 优先路由。** 凭据按 `subscriptionTitle` 分为 `free`（含 `FREE`）、
+`paid`、`unknown`。同一个模型同时存在于 free 和 paid 池时，只要还有 free 候选
+（未禁用、未冷却、额度未耗尽、RPM 未满、清单确认支持该模型），就绝不使用 paid；
+free 额度耗尽（`getUsageLimits` 快照 `currentUsage >= usageLimit`，或流式端点
+返回 402 `QUOTA_EXHAUSTED`）才落到 paid。free 因其它原因暂不可用（禁用、429
+冷却、RPM 打满）也允许用 paid。unknown 层级最后用。free 额度到
+`nextDateReset` 自动恢复；付费额度耗尽仍保持禁用，等人工处理。
+
+Messages 入口收到非 Claude 模型的 `output_config.effort` 后，converter 必须按该模型
+schema 声明的路径落到 `reasoning.effort` 或其它声明路径；Responses 则先把
+`reasoning.effort` 归一到同一内部请求再复用执行链路。
 两个入口必须以独立 `api_endpoint` 贯穿 CLI 日志与 Trace，禁止根据模型名反推入口。
+
+动态池解析失败（`ListAvailableModels` 403 / 5xx / 超时 / 冷启动）不得阻断数据面：
+此时还没有任何清单，格式合法的模型 ID 按原样放行，由上游判定。一旦某个分组的
+凭据已经拿到清单，**池外模型（没有任何一份清单包含它的 model_id）一律 400**，
+并提示调用方查 `GET /v1/models`；空串、超长、控制字符同样 400。池内集合是上游
+清单的实时投影，拒绝池外模型时不得退回任何硬编码名单。
 
 配套端点：`GET /v1/models`、`POST /v1/messages/count_tokens`。**路由总数 4 条**（模型数变化不影响路由数），新增端点需要明确理由。
 
 绝对禁止：
 
 - 用 `/v1/responses` 请求 Claude 模型 → 400（Claude 没有经过实测的 Responses 输出语义）
-- 白名单外的任何模型 → 一律 400
-- 为兼容而生的第二条路径（legacy 端点、模糊模型匹配、自定义模型表）
+- 冷启动/发现失败、还没有任何清单时，把「池里没发现」当成「模型不存在」直接 400
+- 池已探知后仍把池外模型放给上游（此时按清单 400 才是预期行为）
+- 为兼容而生的第二条路径（legacy 端点、无约束的模糊模型匹配、自定义模型表）
 
 Admin 面板（`/api/admin` + `/admin` UI，57 条路由 / 70 个方法端点）保留。四条认证路径（`idc` / `social` / `external_idp` / `api_key`）保留——Admin 的 9 个 OAuth 登录端点依赖它们。
 
@@ -284,7 +307,7 @@ Markdown）打成**一条**请求发给本机代理上的 `claude-opus-5`（`out
 2026-08-11 首次运行：139 个文件 / 1.70 MB / 47123 行 → 输入 745127 token、输出 23027
 token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与 28 条 B 类（死代码）。
 抽查 15 条全部属实，无捏造；它对「确定 / 疑似」的分级也可靠（把有明确 400 提示的
-白名单拦截、协议必填但值由代理决定的字段都正确归入疑似）。
+入口策略拦截、协议必填但值由代理决定的字段都正确归入疑似）。
 
 **模型的每一条都必须逐条核对到代码再采信。** 首轮抽查中唯一一次"疑似误报"，
 最后查明是核对者自己的 grep 正则写错，而非模型虚构。
@@ -296,7 +319,7 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 | 批 | 覆盖 | 关键判据 |
 |---|---|---|
-| 1 | 白名单与入口策略 | 白名单内 5 个模型走 `/v1/messages` 全部 200；GPT 组 3 个走 `/v1/responses` 全部 200；Claude 组走 `/v1/responses` 全部 400；白名单外模型在两端点全 400（含相邻版本 `claude-sonnet-4.6`、`claude-opus-4.8`）；`-thinking`/`-latest`/日期戳别名 200 |
+| 1 | 动态池与入口策略 | `/v1/models` 返回当前可用凭据并集；池内 Claude / GPT / 其它族走 `/v1/messages` 全部 200；Claude 走 `/v1/responses` 400；非 Claude 走 `/v1/responses` 200；池外模型 400（冷启动尚未拿到任何清单时按格式放行，由上游判定）；空串/超长/控制字符 400；`-thinking`/`-latest`/日期戳别名命中池内真实 ID |
 | 2 | 已移除端点 absent | `/cc/v1/*`、`/v1/chat/completions` 全 404 |
 | 3 | 推理档位全矩阵 | Claude 组五档全 200、`none`/非法值 400；GPT 组六档全 200、非法 400 |
 | 4 | thinking 类型 | `enabled`→归一 `adaptive`；`disabled`+`effort=max`→整个字段 `<absent>`（Claude 组两个模型都要验） |
@@ -306,7 +329,7 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 | 8 | 安全与可观测 | 日志无明文 Key / Bearer；usage 无 cache 字段；未知事件告警 0；CLI 与 Trace 对 GPT 请求均能区分 `messages` / `responses` 入口 |
 | 9 | graceful shutdown | SIGTERM → 落盘计数与日志吻合 |
 | 10 | 全局代理现取 | 见 §3.8 反向判据 |
-| 11 | 多模型白名单 | 5 个模型 × Messages 200；GPT 族 × Responses 200；Claude 族 × Responses 400；同族 effort 枚举一致；白名单外 11 个模型两端点全 400 |
+| 11 | 动态模型池与 free 优先 | 多凭据模型并集去重；模型清单刷新后池同步；free/paid 同有某模型时 free 命中；free 额度耗尽（快照或 402）后 paid 命中；free 到重置时间自动恢复；paid-only / free-only 模型不被错路由 |
 
 配置项类改动（如 `extractThinking`、`traceEnabled`）需要**单独起实例**，它们只在启动时读取。
 测试客户端行为时不必安装该客户端 —— 从其源码读出真实的工具 id / 参数形状后手工
@@ -316,8 +339,9 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 只验一个方向会漏。两个方向都要查：
 
-1. **我方改造是否被回退** —— 逐项确认核心改动仍在（路由数、白名单、签名回传、
-   工具 schema 透传…）。git 能自动合并的代码，语义上可能已被上游覆盖
+1. **我方改造是否被回退** —— 逐项确认核心改动仍在（路由数、动态模型池、
+   schema 驱动字段、free 优先、签名回传、工具 schema 透传…）。git 能自动合并
+   的代码，语义上可能已被上游覆盖
 2. **上游功能是否完整吸收** —— 确认新配置项、新逻辑真的存在。最有力的证据是
    **测试数变化**（本轮 518 → 542，说明上游 24 个新测试全部纳入并通过）
 3. **已删符号是否复活** —— 上游改动可能把删掉的字段/函数带回来
@@ -365,9 +389,14 @@ token、耗时 566 秒、15.7 credits，产出 32 条 A 类（违反透传）与
 
 **推理档位 schema**（2026-07-26 实测 `ListAvailableModels`，2026-07-29 复测补齐 sonnet-5 / terra / luna）：
 
-推理字段路径与 effort 枚举**按模型族一致**，同族内各模型无差异；只有窗口大小逐模型不同。
-这一条不是从 schema 推断的，而是 2026-07-29 端到端实测确认：GPT 族三个模型 `effort=none`
-全部 200、Claude 族两个模型 `effort=none` 全部 400、五个模型 `effort=bogus` 全部 400。
+推理字段路径与 effort 枚举**逐模型不同**，唯一权威是该模型的
+`additionalModelRequestFieldsSchema`；不能按族、按相邻版本或按旧记录推断。
+schema 键缺失时才按 `claude-` / `gpt-` 前缀兜底；schema 显式为 `null`
+（实测 `claude-sonnet-4.5`）表示该模型不接受附加字段，再猜就会 400。
+2026-07-29 端到端实测的旧结论仍然成立：GPT 族三个模型 `effort=none` 全部 200、
+Claude 族两个模型 `effort=none` 全部 400、五个模型 `effort=bogus` 全部 400 ——
+但原因是它们各自 schema 的枚举不同，不是「族内永远一致」。`thinking.type`
+也逐模型不同，见下。
 
 - **Claude 族**（`claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5`，2026-10-31 实测 schema）：`output_config.effort ∈ {low,medium,high,xhigh,max}`（default 依次 medium / high / medium，**无 `none`**）；`thinking.display ∈ {summarized, omitted}`。`thinking.type` **逐模型不同**：opus-5.5 只有 `{adaptive}`、sonnet-5.5 是 `{adaptive, between_tools}`、haiku-5.5 是 `{adaptive, disabled}` —— 「同族枚举一致」在这里不成立，新增模型必须逐个读 schema。
 - **GPT 族**（`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`）：**只有** `reasoning`，`additionalProperties: false`。2026-10-31 的 schema 只声明 `reasoning.effort ∈ {none,low,medium,high,xhigh,max}`（default `high`）；2026-07 记录的 `reasoning.mode` 已不在该 schema 里，不要下发。下发 `output_config` / `max_tokens` / `thinking` 会 400 `REQUEST_BODY_INVALID`
@@ -641,6 +670,10 @@ system 约 5k（本机全局 `AGENTS.md` 11.8KB ≈ 3.4k）、工具约 2–3k�
 
 ## 七、提交约定
 
+- **版本号统一使用北京时间精确到分钟的 `vYYYYMMDDHHMM`**（如 `v202611082338`）。
+  发布标签、CHANGELOG 标题、Docker tag、Release 标题都用这个字符串。
+  Cargo / npm 不接受裸 `v...`，映射为 semver build metadata
+  `YYYY.M.D+HHMM`（如 `2026.11.8+2338`）；两者由发布 workflow 校验一致。
 - Commit message 用中文，说明**为什么**而不只是改了什么；涉及实测结论时附上关键数据（字段值、长度、状态码）
 - 破坏性变更用 `feat!:` / `fix!:` / `refactor!:` 前缀
 - 只在被明确要求时提交；只推送到指定分支

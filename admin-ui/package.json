@@ -1,6 +1,6 @@
 {
   "name": "kiro-admin-ui",
-  "version": "0.7.6",
+  "version": "2026.11.8+2338",
   "type": "module",
   "scripts": {
     "dev": "vite",

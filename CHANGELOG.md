@@ -1,10 +1,13 @@
 # Changelog
 
 All notable changes to this project are documented in this file. The format
-loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
-project adheres to [Semantic Versioning](https://semver.org/).
+loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+发布版本统一使用北京时间精确到分钟的 `vYYYYMMDDHHMM`（如 `v202611082338`）；
+Cargo / npm 使用对应的 semver build metadata（如 `2026.11.8+2338`）。
 
 ## [Unreleased]
+
+## [v202611082338] - 2026-11-08
 
 ### Added
 
@@ -12,12 +15,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **模型池改为上游动态全集，并按 free → 付费顺序路由（破坏性）。** 删除 6 模型硬白名单：
+  `/v1/messages` 接受动态池全部模型，`/v1/responses` 只拒绝 Claude；`GET /v1/models`
+  返回当前可用凭据的并集。池已探知后，池外模型返回 400（提示查 `/v1/models`）；
+  只有冷启动/发现失败、还没有任何清单时，格式合法的 ID 才原样放行由上游判定。
+  **升级后，之前被白名单拒掉、但确实在账号清单里的模型会开始可用**，是否可用由账号
+  订阅与上游清单决定。
+  - 推理字段路径、effort 枚举、`thinking` 枚举逐模型读取
+    `additionalModelRequestFieldsSchema`；schema 显式 `null` 是上游明确拒绝，键缺失才按
+    `claude-` / `gpt-` 前缀兜底。未来新增字段路径无需改代码。
+  - 凭据按 `subscriptionTitle` 分 free / paid / unknown。同一模型同时在两边时 free 优先，
+    free 额度耗尽（`getUsageLimits` 快照 `currentUsage >= usageLimit`，或 402
+    `QUOTA_EXHAUSTED`）才落到 paid；free 因禁用/429 冷却/RPM 打满等暂不可用时也允许用
+    paid；unknown 最后。
+  - free 额度到 `nextDateReset` 自动恢复；付费额度耗尽仍保持禁用等人工。Admin 的余额
+    刷新现在也会刷新 `QuotaExceeded` 凭据，用于拿到新快照后恢复 free。
+  - 模型清单按 `model_cache_ttl_secs`（默认 3600 秒，下限 60 秒）在后台定时重探所有
+    可用凭据，上游新增/收缩模型不需要重启，池子会自己跟上。
+  - `AGENTS.md` §1 / §4.1 与 `README.md` 同步改写；测试数 569 → 582。
+- **模型池收尾修正。** 全局代理变更只重探当前可用凭据（不再打已禁用/封禁账号）；
+  schema 声明了 `effort` 但没有 `enum` 时按自由字符串原样下发客户端档位，不再静默丢弃；
+  free 额度自动恢复不再清零 `total_failure_count`（该字段只应在手动重置时归零）；
+  `tier_from_title` 与 Admin 展示判据的差异写进注释，两处过期注释同步删除。
 - **概览页去掉粒度选择器与「应用」按钮：粒度由区间唯一决定，切换即生效。** `24h`→按小时，`7d` / `30d` / 日历自定义→按天，`12m`→按周。此前粒度是独立下拉框 + 一个「应用」按钮，两者组合能产出静默错误的视图：小时桶只有 31 天（`HOUR_BUCKETS = 24 * 31`），用小时粒度查更长区间时后端只返回最近 31 天的点，**卡片总额跟着变小且不报错**。现在小时只出现在 `24h` 一处，那条路径不再存在。日期改成即时生效后「应用」按钮不再做任何事，按 §2.2 删除；原先靠它置灰挡住的非法日期（结束早于开始）改为不发查询 + 在日期框下写明「图表仍显示上一次的区间」，不做无声空操作。自定义区间超过 400 天（后端 `STATS_WINDOW_DAYS`）时同样给提示，避免把「没有桶」误读成「那段没有用量」。
 - **趋势图输出序列改挂右轴，X 轴首末标签改锚点。** 输入与输出量级差约 800 倍（实测周点 24 亿 vs 300 万），共用一个线性轴时输出永远是压在 0 上的直线。X 轴此前把每个标签居中在数据点上，最左最右各有一半落在绘图区外被裁（末尾的 `2026-08-15` 显示成 `2026-0`），改为首个标签左对齐、末个右对齐，与标签宽度无关。左轴 `margin.left` 从 `-12` 改回 `0` —— 刻度文字右对齐，负边距会把最宽的那类标签（如 `600M`，比带小数点的 `1.5B` 宽）挤出容器裁掉一个字。
 - **便携运行：数据文件统一落可执行文件同级的 `data/`。** 此前依赖进程工作目录，从不同位置启动同一个二进制会读到不同的 `credentials.json`。同时把 SQLite 临时文件留在内存（`temp_store=MEMORY`），并给 `rust-embed` 开 `debug-embed`，使 debug 构建不再依赖编译期的绝对路径。
   - **破坏性：默认监听地址从 `0.0.0.0` 收紧为 `127.0.0.1`。** 容器部署或反向代理后端若依赖外部直连，必须显式配置 `host=0.0.0.0`，否则升级后从外部访问不到。
 - **Admin 面板主题改为自动跟随系统。** 移除手动的日/夜切换按钮，以及贯穿 `App` → `Dashboard` → `HeaderActions` 三层的 `darkMode` / `onToggleDarkMode` 传参；改为在入口用 `matchMedia('(prefers-color-scheme: dark)')` 直接套用并监听 `change` 事件跟随切换，同时同步 `color-scheme` 让表单控件与滚动条一起变色。原实现的初始值读自 `documentElement` 上已有的 class，与系统设置无关 —— 暗色系统下打开面板仍是亮色，点一下才对。
-- `/v1/messages` 现在接受全部 6 个白名单模型；GPT 请求仍按模型族转换为 Kiro 的 `reasoning.effort`。`/v1/responses` 继续作为 GPT 专用 OpenAI 线格式适配器。
 - CLI 请求日志新增稳定的 `api_endpoint` / `api_path` 字段；Trace 数据库、Admin API 与 Web UI 请求日志新增接口字段及筛选器。升级前的历史 Trace 迁移为 `unknown`，不根据模型名猜测入口。
 - 按 2026-08-10 复测将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的输入上下文统一从 272k 修正为 372k，修正 contextUsage 百分比到绝对 token 的换算。
 - **Admin 上游失败不再一律显示「上游服务请求失败」。** 余额与模型列表查询的失败现在按已识别的原因给出具体文案：`账号被封禁`、`额度已用尽`、`Token 已失效`、`上游拒绝访问`（403 权限不足）、`上游服务异常`（5xx）。前三条复用数据面的三个判据（同一语义不再有两套字符串），后两条取 `token_manager` 自己按状态码给出的前缀。外发的只有这几个固定字面量，上游原始报文仍然只进日志 —— 原有那条「不泄露 AWS 账号 ID / request-id」的断言未放宽，新增 `upstream_rejected_exposes_only_the_public_reason` 一并锁住。

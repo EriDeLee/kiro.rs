@@ -835,7 +835,9 @@ impl AdminService {
         let mut failure = 0_usize;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            // QuotaExceeded 也要刷新：free 账号到重置时间后靠这次查询拿到新快照
+            // 并自动恢复；其它禁用原因不消耗上游。
+            if entry.disabled && entry.disabled_reason.as_deref() != Some("QuotaExceeded") {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
